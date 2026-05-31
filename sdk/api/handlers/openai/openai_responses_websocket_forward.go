@@ -22,11 +22,12 @@ import (
 )
 
 type responsesWebsocketForwardOptions struct {
-	preserveCompletionOutput func() bool
-	duplexStream             func() bool
-	toolCacheTurn            *responsesWebsocketToolCacheTurn
-	suppressError            func(*interfaces.ErrorMessage) bool
-	keepAliveInterval        *time.Duration
+	duplexStream                     func() bool
+	preserveCompletionOutput         func() bool
+	toolCacheTurn                    *responsesWebsocketToolCacheTurn
+	suppressError                    func(*interfaces.ErrorMessage) bool
+	suppressPreviousResponseNotFound bool
+	keepAliveInterval                *time.Duration
 }
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
@@ -46,6 +47,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	toolCacheTurn := opts.toolCacheTurn
 	completed := false
 	responseStarted := false
+	forwardedPayload := false
 	completedOutput := []byte("[]")
 	completedResponseID := ""
 	outputItemsByIndex := make(map[int64][]byte)
@@ -91,6 +93,10 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, nil
 			}
 
+			if opts.suppressPreviousResponseNotFound && !forwardedPayload && shouldRetryResponsesWebsocketTranscriptReplay(errMsg) {
+				cancel(errMsg.Error)
+				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
+			}
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			if opts.suppressError != nil && opts.suppressError(errMsg) {
 				cancel(errMsg.Error)
@@ -177,6 +183,10 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				preserveErrorEvent := responseStarted && opts.duplexStream != nil && opts.duplexStream()
 				if eventType == wsEventTypeError && !preserveErrorEvent {
 					payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
+					if opts.suppressPreviousResponseNotFound && !forwardedPayload && shouldRetryResponsesWebsocketTranscriptReplay(payloadErrMsg) {
+						cancel(payloadErrMsg.Error)
+						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, nil
+					}
 					if h != nil {
 						h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)
 					}
@@ -228,6 +238,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					cancel(errWrite)
 					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
 				}
+				forwardedPayload = true
 			}
 		}
 	}
@@ -337,6 +348,24 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 		}
 	}
 	return false
+}
+
+func shouldRetryResponsesWebsocketTranscriptReplay(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil {
+		return false
+	}
+	status := errMsg.StatusCode
+	if status <= 0 {
+		if se, ok := errMsg.Error.(interface{ StatusCode() int }); ok && se != nil {
+			status = se.StatusCode()
+		}
+	}
+	if status > 0 && status != http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(errMsg.Error.Error()))
+	return strings.Contains(lower, "previous_response_not_found") ||
+		(strings.Contains(lower, "previous_response") || strings.Contains(lower, "previous response")) && strings.Contains(lower, "not found")
 }
 
 func collectResponsesWebsocketOutputItem(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {

@@ -194,11 +194,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				}
 				return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
+				e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 				return resp, errSend
 			}
+			e.dropUpstreamConn(sess, conn, "send_error", errSend, false)
+			sess.clearActive(conn, readCh)
 
 			// Retry once with a fresh websocket connection. This is mainly to handle
 			// upstream closing the socket between sequential requests within the same
@@ -283,7 +285,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
 			if sess != nil {
-				e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+				if isCodexWebsocketPreviousResponseNotFound(payload) {
+					e.dropUpstreamConn(sess, conn, "previous_response_not_found", wsErr, false)
+				} else {
+					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+				}
 			}
 			if errClearReplay := clearCodexReasoningReplayOnWebsocketError(ctx, replayScope, payload); errClearReplay != nil {
 				return resp, errClearReplay

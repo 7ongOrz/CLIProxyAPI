@@ -292,6 +292,43 @@ func writeResponsesWebsocketPayload(writer *responsesWebsocketWriter, wsTimeline
 	return writer.conn.WriteMessage(websocket.TextMessage, payload)
 }
 
+func startResponsesWebsocketHeartbeat(conn *websocket.Conn, done <-chan struct{}, sessionID string) func(bool) {
+	return startResponsesWebsocketHeartbeatWithInterval(conn, done, sessionID, wsHeartbeatInterval)
+}
+
+func startResponsesWebsocketHeartbeatWithInterval(conn *websocket.Conn, done <-chan struct{}, sessionID string, interval time.Duration) func(bool) {
+	if conn == nil || interval <= 0 {
+		return func(bool) {}
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if errWrite := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Time{}); errWrite != nil {
+					log.Debugf("responses websocket: heartbeat ping failed id=%s error=%v", strings.TrimSpace(sessionID), errWrite)
+					return
+				}
+			}
+		}
+	}()
+	return func(bool) {}
+}
+
+func closeResponsesWebsocketWithFrame(conn *websocket.Conn, code int, text string) {
+	if conn == nil {
+		return
+	}
+	payload := websocket.FormatCloseMessage(code, text)
+	if errWrite := conn.WriteControl(websocket.CloseMessage, payload, time.Time{}); errWrite != nil {
+		log.Debugf("responses websocket: write close frame failed: %v", errWrite)
+	}
+	_ = conn.Close()
+}
+
 func appendWebsocketTimelineDisconnect(timeline websocketTimelineAppender, err error, timestamp time.Time) {
 	if err == nil {
 		return

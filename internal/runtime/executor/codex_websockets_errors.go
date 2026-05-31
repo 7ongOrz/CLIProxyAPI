@@ -67,6 +67,17 @@ func clearCodexReasoningReplayOnWebsocketError(ctx context.Context, scope codexR
 	return clearCodexReasoningReplayOnInvalidSignature(ctx, scope, status, buildCodexWebsocketErrorPayload(payload, status))
 }
 
+func isCodexWebsocketPreviousResponseNotFound(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(string(payload)))
+	upstreamCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "error.code").String()))
+	return upstreamCode == "previous_response_not_found" ||
+		strings.Contains(lower, "previous_response_not_found") ||
+		(strings.Contains(lower, "previous_response") || strings.Contains(lower, "previous response")) && strings.Contains(lower, "not found")
+}
+
 func buildCodexWebsocketErrorPayload(payload []byte, status int) []byte {
 	out := []byte(`{}`)
 	out, _ = sjson.SetBytes(out, "status", status)

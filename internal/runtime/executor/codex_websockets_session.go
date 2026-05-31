@@ -70,6 +70,7 @@ type codexWebsocketSession struct {
 
 	readerConn *websocket.Conn
 
+	upstreamGeneration        uint64
 	upstreamDisconnectOnce    sync.Once
 	upstreamDisconnectCh      chan error
 	upstreamDisconnectErrMu   sync.RWMutex
@@ -455,6 +456,27 @@ func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-cha
 	return sess.upstreamDisconnectCh
 }
 
+func (e *CodexWebsocketsExecutor) UpstreamGeneration(sessionID string) uint64 {
+	sessionID = strings.TrimSpace(sessionID)
+	if e == nil || sessionID == "" {
+		return 0
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sess := store.sessions[sessionID]
+	store.mu.Unlock()
+	if sess == nil {
+		return 0
+	}
+	sess.connMu.Lock()
+	generation := sess.upstreamGeneration
+	sess.connMu.Unlock()
+	return generation
+}
+
 func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
 	if sess == nil {
 		return e.dialCodexWebsocket(ctx, auth, wsURL, headers)
@@ -524,20 +546,36 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
-			invalidate := func() {
-				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
-			}
-			invalidated := false
+			mappedErr := mapCodexWebsocketReadError(errRead)
 			ch, done := sess.activeForConn(conn)
+			if !shouldRetryCodexWebsocketSend(mappedErr) {
+				invalidate := func() {
+					e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+				}
+				invalidated := false
+				if ch != nil {
+					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+					if sess.clearActive(conn, ch) {
+						close(ch)
+					}
+				}
+				if !invalidated {
+					invalidate()
+				}
+				return
+			}
+
 			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+				select {
+				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
+				case <-done:
+				default:
+				}
 				if sess.clearActive(conn, ch) {
 					close(ch)
 				}
 			}
-			if !invalidated {
-				invalidate()
-			}
+			e.dropUpstreamConn(sess, conn, "upstream_disconnected", errRead, false)
 			return
 		}
 
@@ -575,14 +613,14 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 }
 
 func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, true)
+	e.dropUpstreamConn(sess, conn, reason, err, true)
 }
 
 func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithoutDisconnectNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, false)
+	e.dropUpstreamConn(sess, conn, reason, err, false)
 }
 
-func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notify bool) {
+func (e *CodexWebsocketsExecutor) dropUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notifyDownstream bool) {
 	if sess == nil || conn == nil {
 		return
 	}
@@ -605,10 +643,13 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 	if sess.readerConn == conn {
 		sess.readerConn = nil
 	}
+	if !notifyDownstream {
+		sess.upstreamGeneration++
+	}
 	sess.connMu.Unlock()
 
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
-	if notify {
+	if notifyDownstream {
 		sess.notifyUpstreamDisconnect(err)
 	}
 	if closer != nil {

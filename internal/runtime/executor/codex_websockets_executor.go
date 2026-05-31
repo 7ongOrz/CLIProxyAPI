@@ -118,6 +118,13 @@ func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan erro
 	return e.wsExec.UpstreamDisconnectChan(sessionID)
 }
 
+func (e *CodexAutoExecutor) UpstreamGeneration(sessionID string) uint64 {
+	if e == nil || e.wsExec == nil {
+		return 0
+	}
+	return e.wsExec.UpstreamGeneration(sessionID)
+}
+
 func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	if auth == nil {
 		return false

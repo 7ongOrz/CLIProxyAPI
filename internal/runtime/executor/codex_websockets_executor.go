@@ -106,6 +106,7 @@ type codexWebsocketSession struct {
 
 	readerConn *websocket.Conn
 
+	upstreamGeneration        uint64
 	upstreamDisconnectOnce    sync.Once
 	upstreamDisconnectCh      chan error
 	upstreamDisconnectErrMu   sync.RWMutex
@@ -618,11 +619,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				}
 				return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
+				e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 				return resp, errSend
 			}
+			e.dropUpstreamConn(sess, conn, "send_error", errSend, false)
+			sess.clearActive(conn, readCh)
 
 			// Retry once with a fresh websocket connection. This is mainly to handle
 			// upstream closing the socket between sequential requests within the same
@@ -706,7 +709,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
 			if sess != nil {
-				e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+				if isCodexWebsocketPreviousResponseNotFound(payload) {
+					e.dropUpstreamConn(sess, conn, "previous_response_not_found", wsErr, false)
+				} else {
+					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+				}
 			}
 			if errClearReplay := clearCodexReasoningReplayOnWebsocketError(ctx, replayScope, payload); errClearReplay != nil {
 				return resp, errClearReplay
@@ -923,12 +930,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
+				e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
 				return nil, errSend
 			}
+			e.dropUpstreamConn(sess, conn, "send_error", errSend, false)
+			sess.clearActive(conn, readCh)
 
 			// Retry once with a new websocket connection for the same execution session.
 			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
@@ -1067,7 +1076,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
 				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+					if isCodexWebsocketPreviousResponseNotFound(payload) {
+						e.dropUpstreamConn(sess, conn, "previous_response_not_found", wsErr, false)
+					} else {
+						e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+					}
 				}
 				if errClearReplay := clearCodexReasoningReplayOnWebsocketError(ctx, replayScope, payload); errClearReplay != nil {
 					terminateErr = errClearReplay
@@ -1718,6 +1731,17 @@ func clearCodexReasoningReplayOnWebsocketError(ctx context.Context, scope codexR
 	return clearCodexReasoningReplayOnInvalidSignature(ctx, scope, status, buildCodexWebsocketErrorPayload(payload, status))
 }
 
+func isCodexWebsocketPreviousResponseNotFound(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(string(payload)))
+	upstreamCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "error.code").String()))
+	return upstreamCode == "previous_response_not_found" ||
+		strings.Contains(lower, "previous_response_not_found") ||
+		(strings.Contains(lower, "previous_response") || strings.Contains(lower, "previous response")) && strings.Contains(lower, "not found")
+}
+
 func buildCodexWebsocketErrorPayload(payload []byte, status int) []byte {
 	out := []byte(`{}`)
 	out, _ = sjson.SetBytes(out, "status", status)
@@ -1903,6 +1927,27 @@ func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-cha
 	return sess.upstreamDisconnectCh
 }
 
+func (e *CodexWebsocketsExecutor) UpstreamGeneration(sessionID string) uint64 {
+	sessionID = strings.TrimSpace(sessionID)
+	if e == nil || sessionID == "" {
+		return 0
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sess := store.sessions[sessionID]
+	store.mu.Unlock()
+	if sess == nil {
+		return 0
+	}
+	sess.connMu.Lock()
+	generation := sess.upstreamGeneration
+	sess.connMu.Unlock()
+	return generation
+}
+
 func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
 	if sess == nil {
 		return e.dialCodexWebsocket(ctx, auth, wsURL, headers)
@@ -1972,20 +2017,36 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
-			invalidate := func() {
-				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
-			}
-			invalidated := false
+			mappedErr := mapCodexWebsocketReadError(errRead)
 			ch, done := sess.activeForConn(conn)
+			if !shouldRetryCodexWebsocketSend(mappedErr) {
+				invalidate := func() {
+					e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+				}
+				invalidated := false
+				if ch != nil {
+					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+					if sess.clearActive(conn, ch) {
+						close(ch)
+					}
+				}
+				if !invalidated {
+					invalidate()
+				}
+				return
+			}
+
 			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+				select {
+				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
+				case <-done:
+				default:
+				}
 				if sess.clearActive(conn, ch) {
 					close(ch)
 				}
 			}
-			if !invalidated {
-				invalidate()
-			}
+			e.dropUpstreamConn(sess, conn, "upstream_disconnected", errRead, false)
 			return
 		}
 
@@ -2010,7 +2071,6 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			}
 			continue
 		}
-
 		ch, done := sess.activeForConn(conn)
 		if ch == nil {
 			continue
@@ -2023,14 +2083,14 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 }
 
 func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, true)
+	e.dropUpstreamConn(sess, conn, reason, err, true)
 }
 
 func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithoutDisconnectNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, false)
+	e.dropUpstreamConn(sess, conn, reason, err, false)
 }
 
-func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notify bool) {
+func (e *CodexWebsocketsExecutor) dropUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notifyDownstream bool) {
 	if sess == nil || conn == nil {
 		return
 	}
@@ -2053,10 +2113,13 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 	if sess.readerConn == conn {
 		sess.readerConn = nil
 	}
+	if !notifyDownstream {
+		sess.upstreamGeneration++
+	}
 	sess.connMu.Unlock()
 
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
-	if notify {
+	if notifyDownstream {
 		sess.notifyUpstreamDisconnect(err)
 	}
 	if closer != nil {
@@ -2320,6 +2383,13 @@ func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan erro
 		return nil
 	}
 	return e.wsExec.UpstreamDisconnectChan(sessionID)
+}
+
+func (e *CodexAutoExecutor) UpstreamGeneration(sessionID string) uint64 {
+	if e == nil || e.wsExec == nil {
+		return 0
+	}
+	return e.wsExec.UpstreamGeneration(sessionID)
 }
 
 func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {

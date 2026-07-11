@@ -27,16 +27,21 @@ func TestResponsesSteeringErrorRecoveryIntegration(t *testing.T) {
 	for _, tc := range []struct {
 		name                            string
 		enabled, initial, upstreamClose bool
+		eventType                       string
 	}{
-		{"later_error_corrected_create", true, false, false},
-		{"initial_error_remains_terminal", true, true, false},
-		{"disabled_error_remains_terminal", false, false, false},
-		{"later_error_then_upstream_close", true, false, true},
+		{"later_error_corrected_create", true, false, false, "error"},
+		{"initial_error_remains_terminal", true, true, false, "error"},
+		{"disabled_error_remains_terminal", false, false, false, "error"},
+		{"later_error_then_upstream_close", true, false, true, "error"},
+		{"later_failed_corrected_create", true, false, false, "response.failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var connections, frames atomic.Int32
 			done := make(chan struct{})
 			rejection := []byte(`{"type":"error","status":400,"event_id":"rejected-create","error":{"type":"invalid_request_error","message":"Correct the request"}}`)
+			if tc.eventType == "response.failed" {
+				rejection = []byte(`{"type":"response.failed","response":{"id":"rejected-create","error":{"type":"invalid_request_error","message":"Correct the request"}}}`)
+			}
 			recoverable := tc.enabled && !tc.initial && !tc.upstreamClose
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer close(done)
@@ -134,7 +139,7 @@ func TestResponsesSteeringErrorRecoveryIntegration(t *testing.T) {
 						completed = gjson.GetBytes(p, "response.output.0.content.0.text").String() == "RECOVERED"
 						_ = c.Close()
 					}
-				case "error":
+				case "error", "response.failed":
 					errorsSeen++
 					if tc.enabled && !tc.initial && !bytes.Equal(p, rejection) {
 						t.Errorf("recoverable error payload changed: %s", p)

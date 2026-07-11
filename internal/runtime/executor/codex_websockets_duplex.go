@@ -440,8 +440,32 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				outputItems = make(map[int64][]byte)
 				outputFallback = nil
 			}
-			observeCodexTokenEvent(reporter, payload)
-			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
+			eventPrepared, eventReporter := current, reporter
+			failureEvent := !firstResponse && (eventType == "response.failed" || eventType == "error")
+			ambiguousFailure := false
+			if failureEvent {
+				failedID := gjson.GetBytes(payload, "response.id").String()
+				if failedID == "" {
+					failedID = gjson.GetBytes(payload, "response_id").String()
+				}
+				metadataMu.Lock()
+				// Resolve request ownership before logging, accounting, and identity
+				// restoration. A rejection before response.created owns the oldest pending create;
+				// an active response failure retains its current request settings.
+				currentFailure := failedID != "" && failedID == responseID
+				ambiguousFailure = failedID == "" && ((len(pending) > 0 && responseActive) || len(unacknowledgedSteers) > 0)
+				if len(pending) > 0 && !currentFailure && !ambiguousFailure {
+					eventPrepared, pending = pending[0], pending[1:]
+					eventReporter = helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
+					eventReporter.SetTranslatedReasoningEffort(eventPrepared.clientBody, eventPrepared.to.String())
+				} else if !ambiguousFailure {
+					responseActive = false
+					automaticActive = false
+				}
+				metadataMu.Unlock()
+			}
+			observeCodexTokenEvent(eventReporter, payload)
+			appendCodexWebsocketResponse(ctx, e.cfg, payload, eventPrepared.identityState)
 			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
 			// Steering acknowledgements, pending notifications and failures are opaque:
 			// preserve their IDs, input, sequence numbers and event types byte-for-byte.
@@ -483,51 +507,27 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				}
 				continue
 			}
-			if !firstResponse && (eventType == "error" || eventType == "response.failed") {
+			if failureEvent {
 				var credentialErr error
 				if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
-					credentialErr = wsErr
+					credentialErr = withCodexWebsocketIdentityClientError(payload, eventPrepared.identityState, wsErr)
 				} else if streamErr, _, ok := codexTerminalFailureErrWithCooling(payload, e.modelLevelCooling()); ok {
-					credentialErr = streamErr
+					credentialErr = withCodexIdentityClientError(streamErr, eventPrepared.identityState)
 				}
 				var status interface{ StatusCode() int }
 				if errors.As(credentialErr, &status) && (status.StatusCode() == http.StatusUnauthorized || status.StatusCode() == http.StatusForbidden || status.StatusCode() == http.StatusTooManyRequests) {
 					// Account health is independent of which queued request failed.
 					// The conductor records the original classification without replaying
 					// this already-started stream on another credential.
-					reporter.PublishFailure(ctx, credentialErr)
-					if send(cliproxyexecutor.StreamChunk{Payload: payload}) {
+					eventReporter.PublishFailure(ctx, credentialErr)
+					if send(cliproxyexecutor.StreamChunk{Payload: applyCodexIdentityExposeResponsePayload(payload, eventPrepared.identityState)}) {
 						send(cliproxyexecutor.StreamChunk{Err: credentialErr})
 					}
 					return
 				}
-			}
-			eventPrepared, eventReporter := current, reporter
-			if !firstResponse && (eventType == "response.failed" || eventType == "error") {
-				failedID := gjson.GetBytes(payload, "response.id").String()
-				if failedID == "" {
-					failedID = gjson.GetBytes(payload, "response_id").String()
-				}
-				metadataMu.Lock()
-				// A failure for the running response must not consume a queued create.
-				// A rejection before response.created instead owns the oldest pending
-				// create, including its identity mapping and reasoning replay scope.
-				currentFailure := failedID != "" && failedID == responseID
-				ambiguous := failedID == "" && ((len(pending) > 0 && responseActive) || len(unacknowledgedSteers) > 0)
-				if len(pending) > 0 && !currentFailure && !ambiguous {
-					eventPrepared, pending = pending[0], pending[1:]
-					eventReporter = helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
-					eventReporter.SetTranslatedReasoningEffort(eventPrepared.clientBody, eventPrepared.to.String())
-				} else if !ambiguous {
-					responseActive = false
-					automaticActive = false
-				}
-				metadataMu.Unlock()
-				wakeWriter()
-				if ambiguous {
-					// Without a response ID, assigning this failure could corrupt
-					// either request. Preserve the event and fail the socket without
-					// guessing a scope, replaying input, or cooling the credential.
+				if ambiguousFailure {
+					// Ambiguous request failures end the socket with their original
+					// event. Credential failures above retain account-level handling.
 					connectionErr := &codexDuplexConnectionError{cause: fmt.Errorf("cannot associate websocket failure with a response or pending create")}
 					reporter.PublishFailure(ctx, connectionErr)
 					if send(cliproxyexecutor.StreamChunk{Payload: payload}) {
@@ -535,8 +535,8 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					}
 					return
 				}
+				wakeWriter()
 			}
-			payload = applyCodexIdentityConfuseResponsePayload(payload, eventPrepared.identityState)
 			restoreMultiAgent := !eventPrepared.multiAgentV2Conflict && (eventPrepared.optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 			payload = helps.RestoreCodexMultiAgentV2Response(payload, restoreMultiAgent)
 			// Parse and invalidate replay for every rejected request, using the
@@ -544,10 +544,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			// enter conductor bootstrap retry; later failures stay on this socket.
 			var terminalErr, replayErr error
 			if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
-				terminalErr = wsErr
+				terminalErr = withCodexWebsocketIdentityClientError(payload, eventPrepared.identityState, wsErr)
 				replayErr = clearCodexReasoningReplayOnWebsocketError(ctx, eventPrepared.replayScope, payload)
 			} else if streamErr, body, ok := codexTerminalFailureErrWithCooling(payload, e.modelLevelCooling()); ok {
-				terminalErr = streamErr
+				terminalErr = withCodexIdentityClientError(streamErr, eventPrepared.identityState)
 				replayErr = clearCodexReasoningReplayOnInvalidSignature(ctx, eventPrepared.replayScope, streamErr.StatusCode(), body)
 			}
 			if replayErr != nil {

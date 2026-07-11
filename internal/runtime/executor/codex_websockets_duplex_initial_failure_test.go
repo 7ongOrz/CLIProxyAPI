@@ -17,6 +17,7 @@ import (
 	core "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	translator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestCodexDuplexInitialFailure(t *testing.T) {
@@ -43,11 +44,21 @@ func TestCodexDuplexInitialFailure(t *testing.T) {
 					defer func() { _ = c.Close() }()
 					// Bound a broken test without making server closure drive client recovery.
 					_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
-					if _, _, err = c.ReadMessage(); err != nil {
+					_, requestPayload, err := c.ReadMessage()
+					if err != nil {
 						t.Error(err)
 						return
 					}
-					payloads := []string{tc.payload}
+					key := gjson.GetBytes(requestPayload, "prompt_cache_key").String()
+					if key == "" || key == "client-key" {
+						t.Errorf("upstream prompt cache key = %q, want confused identity", key)
+					}
+					messagePath := "error.message"
+					if gjson.Get(tc.payload, "type").String() == "response.failed" {
+						messagePath = "response.error.message"
+					}
+					failure, _ := sjson.Set(tc.payload, messagePath, key)
+					payloads := []string{failure}
 					if r.Header.Get("Authorization") == "Bearer bad-key" {
 						rejected.Add(1)
 					} else {
@@ -73,13 +84,15 @@ func TestCodexDuplexInitialFailure(t *testing.T) {
 				cfg := &config.Config{}
 				cfg.Codex.ResponseSteering = true
 				cfg.CodexResponseSteering = true
+				cfg.Codex.IdentityConfuse = true
+				cfg.Routing.SessionAffinity = true
 				exec := NewCodexWebsocketsExecutor(cfg)
 				exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 				model := "duplex-initial-failure-model"
 				bad := &auth.Auth{ID: "duplex-initial-bad", Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{
 					"api_key": "bad-key", "base_url": upstream.URL, "websockets": "true", "priority": "4",
 				}}
-				req := core.Request{Model: model, Payload: []byte(`{"model":"duplex-initial-failure-model","input":[]}`)}
+				req := core.Request{Model: model, Payload: []byte(`{"model":"duplex-initial-failure-model","prompt_cache_key":"client-key","input":[]}`)}
 				opts := core.Options{SourceFormat: translator.FromString("codex"), Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}}
 				if !failover {
 					result, err := exec.ExecuteStream(ctx, bad, req, opts)
@@ -93,6 +106,13 @@ func TestCodexDuplexInitialFailure(t *testing.T) {
 					var status interface{ StatusCode() int }
 					if !errors.As(chunk.Err, &status) || status.StatusCode() != tc.status {
 						t.Fatalf("status lost: %v", chunk.Err)
+					}
+					var clientError interface{ ClientError() error }
+					if !errors.As(chunk.Err, &clientError) || gjson.Get(clientError.ClientError().Error(), "error.message").String() != "client-key" {
+						t.Fatalf("client identity was not restored: %v", chunk.Err)
+					}
+					if gjson.Get(chunk.Err.Error(), "error.message").String() == "client-key" {
+						t.Fatal("accounting error contains the client identity")
 					}
 					var scoped interface{ IsRequestScoped() bool }
 					if errors.As(chunk.Err, &scoped) && scoped.IsRequestScoped() {

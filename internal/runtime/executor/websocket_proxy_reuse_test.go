@@ -1,9 +1,12 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestWebsocketSessionIsolatesReusableConnectionByProxy(t *testing.T) {
@@ -36,5 +39,36 @@ func TestWebsocketSessionIsolatesReusableConnectionByProxy(t *testing.T) {
 	}
 	if sess.conn != nil {
 		t.Fatal("detached websocket remained attached")
+	}
+}
+
+func TestCodexWebsocketProxyChangeAdvancesGeneration(t *testing.T) {
+	server, closed := newWebsocketTargetServer(t)
+	defer server.Close()
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	sess := exec.getOrCreateSession(t.Name())
+	defer exec.CloseExecutionSession(sess.sessionID)
+	auth := &cliproxyauth.Auth{ID: "auth-a"}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	ensureConn := codexEnsureUpstreamConnAdapter(exec)
+	original := ensureWebsocketTargetConn(t, ensureConn, auth, sess, auth.ID, wsURL)
+
+	auth.ProxyURL = "direct"
+	replacement := ensureWebsocketTargetConn(t, ensureConn, auth, sess, auth.ID, wsURL)
+	if replacement == original {
+		t.Fatal("proxy change reused the original connection")
+	}
+	if got := exec.UpstreamGeneration(sess.sessionID); got != 1 {
+		t.Fatalf("generation after proxy change = %d, want 1", got)
+	}
+	if got := <-closed; got != auth.ID {
+		t.Fatalf("closed connection auth = %q, want %q", got, auth.ID)
+	}
+	if got := ensureWebsocketTargetConn(t, ensureConn, auth, sess, auth.ID, wsURL); got != replacement {
+		t.Fatal("matching proxy should reuse the replacement connection")
+	}
+	if got := exec.UpstreamGeneration(sess.sessionID); got != 1 {
+		t.Fatalf("generation after reuse = %d, want 1", got)
 	}
 }

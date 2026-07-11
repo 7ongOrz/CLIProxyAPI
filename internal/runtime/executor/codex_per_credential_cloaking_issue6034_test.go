@@ -206,6 +206,45 @@ func TestCodexPerCredentialDisableCloaking_WebSocket_ExplicitFalseOverridesGloba
 	}
 }
 
+func TestCodexPerCredentialDisableCloaking_WebSocketSessionIdentity(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{SessionAffinity: true},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{
+		ID: "cloaking-session-test", Provider: "codex",
+		Attributes: map[string]string{cliproxyauth.AttributeCodexDisableCloaking: "true"},
+	}
+	const userAgent = "codex_cli_rs/0.155.1 (Mac OS; arm64)"
+	for _, sessionID := range []string{"", "client-session"} {
+		t.Run("session="+sessionID, func(t *testing.T) {
+			clientHeaders := http.Header{"User-Agent": {userAgent}}
+			if sessionID != "" {
+				clientHeaders.Set("Session_id", sessionID)
+			}
+			headers := applyCodexWebsocketHeaders(context.Background(), nil, auth, "token", cfg, true, clientHeaders)
+			if got := headers.Get("Session-Id"); got != sessionID {
+				t.Fatalf("Session-Id = %q, want %q", got, sessionID)
+			}
+			body, identityState := applyCodexIdentityConfuseBody(cfg, auth, nil, []byte(`{}`))
+			finalizeCodexWebsocketHeaders(headers, body, "", &identityState)
+			wantSession := ""
+			if sessionID != "" {
+				wantSession = codexIdentityConfuseUUID(auth.ID, "session", sessionID)
+			}
+			if got := headers.Get("Session-Id"); got != wantSession {
+				t.Errorf("final Session-Id = %q, want %q", got, wantSession)
+			}
+			if got := headerValueCaseInsensitive(headers, "session_id"); got != "" {
+				t.Errorf("legacy session_id = %q, want empty", got)
+			}
+			if got := headers.Get("User-Agent"); got != userAgent {
+				t.Errorf("User-Agent = %q, want %q", got, userAgent)
+			}
+		})
+	}
+}
+
 func TestCodexPerCredentialDisableCloaking_OAuthUnaffectedByAPIKeyOverride(t *testing.T) {
 	cfg := &config.Config{
 		Codex: config.CodexConfig{

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,6 +21,51 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestXAIWebsocketRequestDoesNotSetCodexReadDeadline(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErr <- errUpgrade
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _, errRead := conn.ReadMessage()
+		serverErr <- errRead
+	}))
+	defer server.Close()
+
+	var trackedConn *websocketReadDeadlineConn
+	dialer := websocket.Dialer{
+		NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, errDial := (&net.Dialer{}).DialContext(ctx, network, address)
+			if errDial != nil {
+				return nil, errDial
+			}
+			trackedConn = &websocketReadDeadlineConn{Conn: conn}
+			return trackedConn, nil
+		},
+	}
+	conn, _, errDial := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_, deadlineCallsBefore := trackedConn.readDeadline()
+	if errWrite := writeXAIWebsocketMessage(&codexWebsocketSession{}, conn, []byte(`{"type":"response.create"}`)); errWrite != nil {
+		t.Fatalf("write websocket request: %v", errWrite)
+	}
+	_, deadlineCallsAfter := trackedConn.readDeadline()
+	if deadlineCallsAfter != deadlineCallsBefore {
+		t.Fatalf("read deadline calls = %d, want unchanged at %d", deadlineCallsAfter, deadlineCallsBefore)
+	}
+	if errRead := <-serverErr; errRead != nil {
+		t.Fatalf("read websocket request: %v", errRead)
+	}
+}
 
 func TestXAIWebsocketsEnabledForConfigAPIKey(t *testing.T) {
 	auth := &cliproxyauth.Auth{
@@ -63,6 +109,97 @@ func TestXAIAutoExecutorRequiredUpstreamWebsocketRejectsHTTPFallback(t *testing.
 	requestScoped, ok := errExecute.(cliproxyexecutor.RequestScopedError)
 	if !ok || !requestScoped.IsRequestScoped() {
 		t.Fatalf("ExecuteStream() error = %T, want request-scoped replay signal", errExecute)
+	}
+}
+
+func TestXAIWebsocketsExecuteStreamStopsAtTerminalResponse(t *testing.T) {
+	tests := []struct {
+		name       string
+		terminal   string
+		wantStatus int
+	}{
+		{
+			name:     "incomplete",
+			terminal: `{"type":"response.incomplete","response":{"id":"resp-1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":8,"output_tokens":1,"total_tokens":9}}}`,
+		},
+		{
+			name:       "failed",
+			terminal:   `{"type":"response.failed","response":{"id":"resp-1","status":"failed","error":{"type":"authentication_error","code":"invalid_api_key","message":"invalid token"}}}`,
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+				if errUpgrade != nil {
+					t.Errorf("upgrade websocket: %v", errUpgrade)
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				if _, _, errRead := conn.ReadMessage(); errRead != nil {
+					return
+				}
+				outputItem := []byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}}`)
+				if errWrite := conn.WriteMessage(websocket.TextMessage, outputItem); errWrite != nil {
+					return
+				}
+				if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(tt.terminal)); errWrite != nil {
+					return
+				}
+				<-release
+			}))
+			defer server.Close()
+			defer close(release)
+
+			exec := NewXAIWebsocketsExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "xai-token"}}
+			ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+			result, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+				Model:   "grok-4.5",
+				Payload: []byte(`{"model":"grok-4.5","input":[{"type":"message","role":"user","content":"hello"}]}`),
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse})
+			if errExecute != nil {
+				t.Fatalf("ExecuteStream() error = %v", errExecute)
+			}
+
+			streamDone := make(chan []cliproxyexecutor.StreamChunk, 1)
+			go func() {
+				var chunks []cliproxyexecutor.StreamChunk
+				for chunk := range result.Chunks {
+					chunks = append(chunks, chunk)
+				}
+				streamDone <- chunks
+			}()
+			var chunks []cliproxyexecutor.StreamChunk
+			select {
+			case chunks = <-streamDone:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("stream remained open after response.%s", tt.name)
+			}
+			if len(chunks) != 2 {
+				t.Fatalf("stream chunks = %d, want output item and terminal", len(chunks))
+			}
+			terminal := chunks[1]
+			if got := gjson.GetBytes(terminal.Payload, "type").String(); got != "response."+tt.name {
+				t.Fatalf("terminal type = %q, want response.%s: %s", got, tt.name, terminal.Payload)
+			}
+			if tt.wantStatus == 0 {
+				if terminal.Err != nil || terminal.ResultErr != nil {
+					t.Fatalf("incomplete terminal errors = err:%v result_err:%v", terminal.Err, terminal.ResultErr)
+				}
+				if got := gjson.GetBytes(terminal.Payload, "response.output.#").Int(); got != 1 {
+					t.Fatalf("incomplete output len = %d, want 1: %s", got, terminal.Payload)
+				}
+				return
+			}
+			if terminal.ResultErr == nil || statusCodeFromTestError(t, terminal.ResultErr) != tt.wantStatus {
+				t.Fatalf("failed terminal result error = %T %v, want status %d", terminal.ResultErr, terminal.ResultErr, tt.wantStatus)
+			}
+		})
 	}
 }
 

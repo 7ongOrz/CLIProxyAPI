@@ -283,6 +283,15 @@ attemptLoop:
 						}
 					}
 				}
+				if errScan := scanner.Err(); errScan != nil {
+					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+					reporter.PublishFailure(ctx, errScan)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				tail := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("[DONE]"), &param, claudeInputTokens)
 				for i := range tail {
 					select {
@@ -291,19 +300,10 @@ attemptLoop:
 						return
 					}
 				}
-				if errScan := scanner.Err(); errScan != nil {
-					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					reporter.PublishFailure(ctx, errScan)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-					case <-ctx.Done():
-					}
-				} else {
-					if replayAccumulator != nil {
-						replayAccumulator.Commit(ctx)
-					}
-					reporter.EnsurePublished(ctx)
+				if replayAccumulator != nil {
+					replayAccumulator.Commit(ctx)
 				}
+				reporter.EnsurePublished(ctx)
 			}(httpResp)
 			return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 		}

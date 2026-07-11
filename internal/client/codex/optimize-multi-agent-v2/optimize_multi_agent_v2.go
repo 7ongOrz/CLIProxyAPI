@@ -122,7 +122,35 @@ func OptimizeCodexMultiAgentV2Request(ctx context.Context, headers http.Header, 
 	if len(toolPaths) == 0 || hasCodexOptimizedCollaborationConflict(updated) {
 		return updated, false
 	}
-	return optimizeCodexCollaborationNamespace(updated, toolPaths)
+	updated, optimized := optimizeCodexCollaborationNamespace(updated, toolPaths)
+	if !optimized {
+		return updated, false
+	}
+	return optimizeCodexCollaborationHistory(updated), true
+}
+
+func optimizeCodexCollaborationHistory(payload []byte) []byte {
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return payload
+	}
+
+	updated := payload
+	for index, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType != "function_call" && itemType != "custom_tool_call" {
+			continue
+		}
+		itemPath := fmt.Sprintf("input.%d", index)
+		if strings.TrimSpace(item.Get("namespace").String()) == codexCollaborationNamespace {
+			updated, _ = sjson.SetBytes(updated, itemPath+".namespace", codexOptimizedCollaborationNamespace)
+		}
+		name := strings.TrimSpace(item.Get("name").String())
+		if strings.HasPrefix(name, codexCollaborationNamespace+"__") {
+			updated, _ = sjson.SetBytes(updated, itemPath+".name", codexOptimizedCollaborationNamePrefix+strings.TrimPrefix(name, codexCollaborationNamespace+"__"))
+		}
+	}
+	return updated
 }
 
 func codexMultiAgentV2Enabled(ctx context.Context, headers http.Header, cfg *config.Config) bool {
@@ -682,7 +710,53 @@ func optimizeCodexCollaborationNamespace(payload []byte, toolPaths []string) ([]
 		}
 		optimized = true
 	}
+	if optimized {
+		var errMetadata error
+		updated, errMetadata = optimizeCodexCollaborationToolMetadata(updated)
+		if errMetadata != nil {
+			return payload, false
+		}
+	}
 	return updated, optimized
+}
+
+func optimizeCodexCollaborationToolMetadata(payload []byte) ([]byte, error) {
+	turnMetadataResult := gjson.GetBytes(payload, "client_metadata.x-codex-turn-metadata")
+	if turnMetadataResult.Type != gjson.String {
+		return payload, nil
+	}
+	turnMetadata := turnMetadataResult.String()
+	namespacePath := "tool_namespaces_info." + codexCollaborationNamespace
+	namespace := gjson.Get(turnMetadata, namespacePath)
+	if !namespace.IsObject() {
+		return payload, nil
+	}
+
+	updatedNamespace, errSet := sjson.Set(namespace.Raw, "name", codexOptimizedCollaborationNamespace)
+	if errSet != nil {
+		return payload, errSet
+	}
+	for functionName, function := range namespace.Get("functions").Map() {
+		codeModeName := strings.TrimSpace(function.Get("code_mode_name").String())
+		if !strings.HasPrefix(codeModeName, codexCollaborationNamespace+"__") {
+			continue
+		}
+		codeModePath := "functions." + functionName + ".code_mode_name"
+		updatedNamespace, errSet = sjson.Set(updatedNamespace, codeModePath, codexOptimizedCollaborationNamePrefix+strings.TrimPrefix(codeModeName, codexCollaborationNamespace+"__"))
+		if errSet != nil {
+			return payload, errSet
+		}
+	}
+
+	updatedMetadata, errDelete := sjson.Delete(turnMetadata, namespacePath)
+	if errDelete != nil {
+		return payload, errDelete
+	}
+	updatedMetadata, errSet = sjson.SetRaw(updatedMetadata, "tool_namespaces_info."+codexOptimizedCollaborationNamespace, updatedNamespace)
+	if errSet != nil {
+		return payload, errSet
+	}
+	return sjson.SetBytes(payload, "client_metadata.x-codex-turn-metadata", updatedMetadata)
 }
 
 // RestoreCodexMultiAgentV2Response restores optimized collaboration namespace

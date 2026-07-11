@@ -65,7 +65,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+	body, responsesLite := normalizeCodexResponsesLiteRequest(body, opts.Headers)
+	if !responsesLite && (e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff) {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
@@ -84,8 +85,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
-	applyModelHeaderOverrides(httpReq.Header, baseModel)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	finalizeCodexHTTPHeaders(httpReq.Header, upstreamBody, baseModel, auth, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -121,13 +121,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 			return nil, readErr
 		}
-		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
 		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
 			return nil, errClearReplay
 		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data)
+		loggedBody := applyCodexIdentityConfuseResponseLog(data, identityState)
+		helps.AppendAPIResponseChunk(ctx, e.cfg, loggedBody)
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), loggedBody))
+		err = withCodexIdentityClientError(newCodexStatusErr(httpResp.StatusCode, data), identityState)
 		return nil, err
 	}
 
@@ -157,8 +157,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	if buffering {
 		for scanner.Scan() {
-			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			line := scanner.Bytes()
+			appendCodexAPIResponseLog(ctx, e.cfg, line, identityState)
 			translatedLine := bytes.Clone(line)
 			isHandshake := false
 			terminalSuccess := false
@@ -183,9 +183,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						// transparently retry on another credential, and report the status the
 						// upstream refused to put on the wire.
 						helps.LogWithRequestID(ctx).Debugf("codex executor: bootstrap overload rejection after %d buffered handshake events, failing over", len(bufferedChunks))
-						return nil, newCodexBootstrapOverloadErr(terminalBody)
+						return nil, withCodexIdentityClientError(newCodexBootstrapOverloadErr(terminalBody), identityState)
 					}
-					bootstrapTerminalErr = streamErr
+					bootstrapTerminalErr = withCodexIdentityClientError(streamErr, identityState)
 					break
 				}
 				if isCodexHandshakeMetadataEvent(eventType) {
@@ -282,8 +282,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}()
 		for scanner.Scan() {
-			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			line := scanner.Bytes()
+			appendCodexAPIResponseLog(ctx, e.cfg, line, identityState)
 			translatedLine := bytes.Clone(line)
 			terminalSuccess := false
 
@@ -305,7 +305,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 					reporter.PublishFailure(ctx, streamErr)
 					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+					case out <- cliproxyexecutor.StreamChunk{Err: withCodexIdentityClientError(streamErr, identityState)}:
 					case <-ctx.Done():
 					}
 					return

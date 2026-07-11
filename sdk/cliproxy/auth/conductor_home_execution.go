@@ -265,6 +265,13 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			applyRequestScopedActionToResult(action, okAction, &result)
 			m.reportHomeResult(execCtx, result, preparedAuth)
 			lastErr = errExecute
+			if cliproxyexecutor.DownstreamWebsocket(ctx) && selection.Retained() && isRequestScopedError(errExecute) {
+				releaseAttempt()
+				if !m.retainHomeWebsocketSelection(ctx, opts, routeModel, selection) {
+					selection.End("request_replay_retain_failed")
+				}
+				return cliproxyexecutor.Response{}, errExecute
+			}
 			if okAction {
 				if isRequestScopedStop(action, okAction) {
 					releaseAttempt()

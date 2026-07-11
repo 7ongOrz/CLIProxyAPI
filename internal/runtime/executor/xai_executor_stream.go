@@ -148,6 +148,9 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 					if !emitTranslatedLine(append([]byte("data: "), eventData...)) {
 						return
 					}
+					if normalizedEventName == "response.completed" {
+						return
+					}
 				}
 				continue
 			}

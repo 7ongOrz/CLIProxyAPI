@@ -583,7 +583,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		readCh = sess.activate(conn)
 	}
 
-	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
+	if errSend := writeXAIWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapXAIWebsocketWriteError(sess, conn, errSend)
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
@@ -639,7 +639,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			logXAIWebsocketRequest(executionSessionID, authID, wsURL, wsReqBodyRetry)
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 			reporter.StartResponseTTFT()
-			if errSendRetry := writeCodexWebsocketMessage(sess, conn, wsReqBodyRetry); errSendRetry != nil {
+			if errSendRetry := writeXAIWebsocketMessage(sess, conn, wsReqBodyRetry); errSendRetry != nil {
 				errSendRetry = mapXAIWebsocketWriteError(sess, connRetry, errSendRetry)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
@@ -1089,6 +1089,16 @@ func (e *XAIWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan 
 	return sess.upstreamDisconnectCh
 }
 
+func (e *XAIWebsocketsExecutor) UpstreamDisconnectGeneration(sessionID string) uint64 {
+	sess := e.getOrCreateSession(sessionID)
+	if sess == nil {
+		return 0
+	}
+	sess.connMu.Lock()
+	defer sess.connMu.Unlock()
+	return sess.upstreamDisconnectGeneration
+}
+
 func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
 	if sess == nil {
 		return e.dialXAIWebsocket(ctx, auth, wsURL, headers)
@@ -1169,6 +1179,18 @@ func configureXAIWebsocketConn(sess *codexWebsocketSession, conn *websocket.Conn
 
 func mapXAIWebsocketReadError(err error) error {
 	return mapCodexWebsocketReadError(err)
+}
+
+func writeXAIWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
+	if conn == nil {
+		return fmt.Errorf("xai websockets executor: websocket conn is nil")
+	}
+	if sess == nil {
+		return conn.WriteMessage(websocket.TextMessage, payload)
+	}
+	sess.writeMu.Lock()
+	defer sess.writeMu.Unlock()
+	return conn.WriteMessage(websocket.TextMessage, payload)
 }
 
 func mapXAIWebsocketWriteError(sess *codexWebsocketSession, conn *websocket.Conn, err error) error {
@@ -1303,12 +1325,13 @@ func (e *XAIWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebs
 	if sess.readerConn == conn {
 		sess.readerConn = nil
 	}
+	if notify {
+		sess.upstreamDisconnectGeneration++
+		sess.queueUpstreamDisconnectLocked(err, sess.upstreamDisconnectGeneration)
+	}
 	sess.connMu.Unlock()
 
 	logXAIWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
-	if notify {
-		sess.notifyUpstreamDisconnect(err)
-	}
 	if closer != nil {
 		if errClose := closer.Close(); errClose != nil {
 			log.Errorf("xai websockets executor: close websocket error: %v", errClose)
@@ -1664,6 +1687,13 @@ func (e *XAIAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan error 
 		return nil
 	}
 	return e.wsExec.UpstreamDisconnectChan(sessionID)
+}
+
+func (e *XAIAutoExecutor) UpstreamDisconnectGeneration(sessionID string) uint64 {
+	if e == nil || e.wsExec == nil {
+		return 0
+	}
+	return e.wsExec.UpstreamDisconnectGeneration(sessionID)
 }
 
 func xaiWebsocketsEnabled(auth *cliproxyauth.Auth) bool {

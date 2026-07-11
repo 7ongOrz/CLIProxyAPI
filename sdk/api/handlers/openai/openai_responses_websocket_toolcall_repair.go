@@ -37,6 +37,7 @@ type websocketToolOutputSession struct {
 
 type responsesWebsocketToolCacheTurn struct {
 	sessionKey  string
+	reset       bool
 	outputs     map[string]json.RawMessage
 	outputOrder []string
 	calls       map[string]json.RawMessage
@@ -244,6 +245,11 @@ func newResponsesWebsocketToolCacheTurn(sessionKey string) *responsesWebsocketTo
 	}
 }
 
+func (t *responsesWebsocketToolCacheTurn) resetOnCommit() {
+	if t != nil {
+		t.reset = true
+	}
+}
 func (t *responsesWebsocketToolCacheTurn) recordResponse(payload []byte) {
 	if t == nil || len(payload) == 0 {
 		return
@@ -315,14 +321,33 @@ func (t *responsesWebsocketToolCacheTurn) commit() {
 	defaultWebsocketToolCacheTransactionMu.Lock()
 	defer defaultWebsocketToolCacheTransactionMu.Unlock()
 	if defaultWebsocketToolOutputCache != nil {
+		if t.reset {
+			defaultWebsocketToolOutputCache.deleteSession(t.sessionKey)
+		}
 		for _, callID := range t.outputOrder {
 			defaultWebsocketToolOutputCache.record(t.sessionKey, callID, t.outputs[callID])
 		}
 	}
 	if defaultWebsocketToolCallCache != nil {
+		if t.reset {
+			defaultWebsocketToolCallCache.deleteSession(t.sessionKey)
+		}
 		for _, callID := range t.callOrder {
 			defaultWebsocketToolCallCache.record(t.sessionKey, callID, t.calls[callID])
 		}
+	}
+}
+
+func resetResponsesWebsocketToolCaches(sessionKey string) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return
+	}
+	if defaultWebsocketToolOutputCache != nil {
+		defaultWebsocketToolOutputCache.deleteSession(sessionKey)
+	}
+	if defaultWebsocketToolCallCache != nil {
+		defaultWebsocketToolCallCache.deleteSession(sessionKey)
 	}
 }
 
@@ -336,13 +361,22 @@ func repairResponsesWebsocketToolCallsWithoutRecording(sessionKey string, payloa
 	return repairResponsesWebsocketToolCallsWithCachesMode(defaultWebsocketToolOutputCache, defaultWebsocketToolCallCache, sessionKey, payload, false, nil)
 }
 
-func prepareResponsesWebsocketFallbackTurn(sessionKey string, payload []byte) ([]byte, *responsesWebsocketToolCacheTurn) {
+func prepareResponsesWebsocketFallbackTurn(sessionKey string, payload []byte, reset bool) ([]byte, *responsesWebsocketToolCacheTurn) {
 	turn := newResponsesWebsocketToolCacheTurn(sessionKey)
+	if reset {
+		turn.resetOnCommit()
+	}
 	defaultWebsocketToolCacheTransactionMu.RLock()
 	defer defaultWebsocketToolCacheTransactionMu.RUnlock()
+	outputCache := defaultWebsocketToolOutputCache
+	callCache := defaultWebsocketToolCallCache
+	if reset {
+		outputCache = nil
+		callCache = nil
+	}
 	payload = repairResponsesWebsocketToolCallsWithCachesMode(
-		defaultWebsocketToolOutputCache,
-		defaultWebsocketToolCallCache,
+		outputCache,
+		callCache,
 		sessionKey,
 		payload,
 		false,
@@ -496,17 +530,19 @@ func repairResponsesToolCallItems(
 	turn *responsesWebsocketToolCacheTurn,
 	repairEnabled bool,
 ) ([]responsesWebsocketInputItem, error) {
+	for _, item := range items {
+		if turn != nil {
+			turn.recordInputItem(item)
+		}
+	}
 	if !repairEnabled {
-		return dedupeResponsesWebsocketInputItems(items), nil
+		return dedupeResponsesWebsocketInputItems(items)
 	}
 
 	// First pass: record tool outputs and remember which call_ids have outputs in this payload.
 	outputPresent := make(map[string]struct{}, len(items))
 	callPresent := make(map[string]struct{}, len(items))
 	for _, item := range items {
-		if turn != nil {
-			turn.recordInputItem(item)
-		}
 		switch {
 		case isResponsesToolCallOutputType(item.itemType):
 			if item.callID == "" {
@@ -598,7 +634,7 @@ func repairResponsesToolCallItems(
 		// Drop orphaned function_call items; upstream rejects transcripts with missing outputs.
 	}
 
-	return dedupeResponsesWebsocketInputItems(filtered), nil
+	return dedupeResponsesWebsocketInputItems(filtered)
 }
 
 func responsesWebsocketInputItemsEqualRaw(items []responsesWebsocketInputItem, rawItems []json.RawMessage) bool {

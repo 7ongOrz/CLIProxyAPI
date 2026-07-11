@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -34,6 +35,28 @@ type modelExecutionStatusHeaderError struct {
 	statusCode int
 	message    string
 	headers    http.Header
+}
+
+type modelExecutionClientError struct {
+	statusCode     int
+	internal       string
+	client         string
+	internalHeader http.Header
+	clientHeader   http.Header
+}
+
+func (e modelExecutionClientError) Error() string { return e.internal }
+
+func (e modelExecutionClientError) StatusCode() int { return e.statusCode }
+
+func (e modelExecutionClientError) Headers() http.Header { return e.internalHeader }
+
+func (e modelExecutionClientError) ClientError() error {
+	return modelExecutionStatusHeaderError{
+		statusCode: e.statusCode,
+		message:    e.client,
+		headers:    e.clientHeader,
+	}
 }
 
 type modelExecutionSkipHost struct {
@@ -101,6 +124,34 @@ func (e modelExecutionStatusHeaderError) StatusCode() int {
 
 func (e modelExecutionStatusHeaderError) Headers() http.Header {
 	return e.headers
+}
+
+func TestExecutionErrorMessageUsesClientErrorAtHandlerBoundary(t *testing.T) {
+	errInternal := modelExecutionClientError{
+		statusCode:     http.StatusTooManyRequests,
+		internal:       "rate limited for confused identity",
+		client:         "rate limited for original identity",
+		internalHeader: http.Header{"X-Client-Request-Id": {"confused-request-id"}},
+		clientHeader:   http.Header{"X-Client-Request-Id": {"original-request-id"}},
+	}
+
+	errMsg := executionErrorMessage(errInternal)
+	if errMsg.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusTooManyRequests)
+	}
+	if errMsg.Error == nil || errMsg.Error.Error() != errInternal.client {
+		t.Fatalf("client error = %v, want %q", errMsg.Error, errInternal.client)
+	}
+	if errInternal.Error() != errInternal.internal {
+		t.Fatalf("internal error = %q, want %q", errInternal.Error(), errInternal.internal)
+	}
+	if got := errMsg.Addon.Get("X-Client-Request-Id"); got != "original-request-id" {
+		t.Fatalf("client error header = %q, want original-request-id", got)
+	}
+	var exposedErr modelExecutionStatusHeaderError
+	if !errors.As(errMsg.Error, &exposedErr) || exposedErr.message != errInternal.client {
+		t.Fatalf("client error unwrap = %#v, want %q", exposedErr, errInternal.client)
+	}
 }
 
 func (e *modelExecutionCaptureExecutor) Identifier() string {

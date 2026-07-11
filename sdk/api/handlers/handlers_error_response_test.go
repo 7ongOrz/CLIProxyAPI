@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
@@ -42,6 +43,87 @@ func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
 	}
 	if got := recorder.Header().Get("X-Request-Id"); got != "" {
 		t.Fatalf("X-Request-Id should be empty when passthrough is disabled, got %q", got)
+	}
+}
+
+func TestWriteErrorResponsePreservesCapturedUpstreamResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	upstreamResponse := []byte(`{"error":{"message":"confused upstream identity"}}`)
+	c.Set("API_RESPONSE", upstreamResponse)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      errors.New("original client identity"),
+	})
+
+	got, exists := c.Get("API_RESPONSE")
+	if !exists {
+		t.Fatal("API_RESPONSE was removed")
+	}
+	gotResponse, ok := got.([]byte)
+	if !ok || string(gotResponse) != string(upstreamResponse) {
+		t.Fatalf("API_RESPONSE = %q, want %q", gotResponse, upstreamResponse)
+	}
+	if strings.Contains(string(gotResponse), "original client identity") {
+		t.Fatalf("API_RESPONSE mixed in downstream error: %s", gotResponse)
+	}
+	if !strings.Contains(recorder.Body.String(), "original client identity") {
+		t.Fatalf("client response = %s, want original client identity", recorder.Body.String())
+	}
+}
+
+func TestWriteErrorResponsePreservesFileBackedUpstreamResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+	c.Set(logging.APIResponseCapturedContextKey, true)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      errors.New("original client identity"),
+	})
+
+	if got, exists := c.Get("API_RESPONSE"); exists {
+		t.Fatalf("API_RESPONSE = %q, want file-backed upstream response only", got)
+	}
+	if !strings.Contains(recorder.Body.String(), "original client identity") {
+		t.Fatalf("client response = %s, want original client identity", recorder.Body.String())
+	}
+}
+
+func TestLoggingAPIResponseErrorUsesInternalErrorView(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{RequestLog: true}, nil)
+	errInternal := modelExecutionClientError{
+		statusCode: http.StatusBadRequest,
+		internal:   "rejected confused upstream identity",
+		client:     "rejected original client identity",
+	}
+	errMsg := executionErrorMessage(errInternal)
+
+	handler.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+
+	value, exists := c.Get("API_RESPONSE_ERROR")
+	if !exists {
+		t.Fatal("API_RESPONSE_ERROR was not recorded")
+	}
+	logged, ok := value.([]*interfaces.ErrorMessage)
+	if !ok || len(logged) != 1 || logged[0] == nil || logged[0].Error == nil {
+		t.Fatalf("API_RESPONSE_ERROR = %#v", value)
+	}
+	if got := logged[0].Error.Error(); got != errInternal.internal {
+		t.Fatalf("logged error = %q, want %q", got, errInternal.internal)
+	}
+	if got := errMsg.Error.Error(); got != errInternal.client {
+		t.Fatalf("client error = %q, want %q", got, errInternal.client)
 	}
 }
 

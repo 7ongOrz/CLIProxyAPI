@@ -111,6 +111,15 @@ func preparedModelRouteFromContext(ctx context.Context, skipRouterPluginID strin
 	return decision, ok
 }
 
+// PreparedStreamModelRouteProvider returns the built-in provider selected by PrepareStreamModelRoute.
+func PreparedStreamModelRouteProvider(ctx context.Context) string {
+	decision, ok := preparedModelRouteFromContext(ctx, "")
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(decision.Provider))
+}
+
 // WithExecutionSessionID returns a child context tagged with a long-lived execution session ID.
 func WithExecutionSessionID(ctx context.Context, sessionID string) context.Context {
 	sessionID = strings.TrimSpace(sessionID)

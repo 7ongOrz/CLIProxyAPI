@@ -110,12 +110,41 @@ func inputContainsFullTranscript(input gjson.Result) bool {
 		return false
 	}
 	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
+		if isResponsesWebsocketCompactionReplayItemType(item.Get("type").String()) {
 			return true
 		}
 	}
 	return false
+}
+
+func inputContainsCompactionTrigger(input gjson.Result) bool {
+	if !input.IsArray() {
+		return false
+	}
+	for _, item := range input.Array() {
+		if strings.TrimSpace(item.Get("type").String()) == "compaction_trigger" {
+			return true
+		}
+	}
+	return false
+}
+
+func isResponsesWebsocketCompactionItemType(t string) bool {
+	switch strings.TrimSpace(t) {
+	case "compaction", "compaction_summary", "compaction_trigger", "context_compaction":
+		return true
+	default:
+		return false
+	}
+}
+
+func isResponsesWebsocketCompactionReplayItemType(t string) bool {
+	switch strings.TrimSpace(t) {
+	case "compaction", "compaction_summary", "context_compaction":
+		return true
+	default:
+		return false
+	}
 }
 
 func inputWithoutCompactionItems(input gjson.Result) string {
@@ -124,8 +153,7 @@ func inputWithoutCompactionItems(input gjson.Result) string {
 	}
 	filtered := make([]string, 0, len(input.Array()))
 	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
+		if isResponsesWebsocketCompactionReplayItemType(item.Get("type").String()) {
 			continue
 		}
 		filtered = append(filtered, item.Raw)

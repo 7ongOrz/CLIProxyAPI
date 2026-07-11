@@ -262,6 +262,74 @@ func TestOptimizeCodexCollaborationNamespaceWithoutModels(t *testing.T) {
 	}
 }
 
+func TestOptimizeCodexCollaborationNamespaceUpdatesToolMetadata(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent"}]}],
+		"client_metadata":{"x-codex-turn-metadata":"{\"sandbox_mode\":\"workspace-write\",\"tool_namespaces_info\":{\"collaboration\":{\"name\":\"collaboration\",\"functions\":{\"spawn_agent\":{\"name\":\"spawn_agent\",\"direct\":true,\"code_mode_name\":\"collaboration__spawn_agent\"}}},\"mcp__notes\":{\"name\":\"mcp__notes\",\"functions\":{}}}}"}
+	}`)
+	got, optimized := optimizeCodexCollaborationNamespace(payload, codexSpawnAgentToolPaths(payload))
+	if !optimized {
+		t.Fatal("collaboration namespace was not optimized")
+	}
+
+	turnMetadata := gjson.GetBytes(got, "client_metadata.x-codex-turn-metadata").String()
+	if gjson.Get(turnMetadata, "tool_namespaces_info.collaboration").Exists() {
+		t.Fatalf("original collaboration metadata was retained: %s", turnMetadata)
+	}
+	optimizedMetadata := gjson.Get(turnMetadata, "tool_namespaces_info.collaboration-optimize")
+	if optimizedMetadata.Get("name").String() != codexOptimizedCollaborationNamespace {
+		t.Fatalf("optimized namespace metadata = %s", optimizedMetadata.Raw)
+	}
+	if gotCodeModeName := optimizedMetadata.Get("functions.spawn_agent.code_mode_name").String(); gotCodeModeName != "collaboration-optimize__spawn_agent" {
+		t.Fatalf("code_mode_name = %q, want collaboration-optimize__spawn_agent", gotCodeModeName)
+	}
+	if !gjson.Get(turnMetadata, "tool_namespaces_info.mcp__notes").Exists() {
+		t.Fatalf("unrelated namespace metadata was removed: %s", turnMetadata)
+	}
+	if gotSandboxMode := gjson.Get(turnMetadata, "sandbox_mode").String(); gotSandboxMode != "workspace-write" {
+		t.Fatalf("sandbox_mode = %q, want workspace-write", gotSandboxMode)
+	}
+}
+
+func TestOptimizeCodexMultiAgentV2RequestRewritesReplayHistory(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent"}]}],
+		"input":[
+			{"type":"function_call","namespace":"collaboration","name":"spawn_agent","arguments":"{\"namespace\":\"collaboration\"}"},
+			{"type":"custom_tool_call","name":"collaboration__send_message","input":"collaboration__send_message"},
+			{"type":"function_call_output","output":"collaboration__send_message"}
+		]
+	}`)
+	headers := http.Header{"User-Agent": []string{"codex-tui/0.145.0"}}
+	cfg := &config.Config{Codex: config.CodexConfig{OptimizeMultiAgentV2: true}}
+	got, optimized := OptimizeCodexMultiAgentV2Request(context.Background(), headers, payload, cfg)
+	if !optimized {
+		t.Fatal("collaboration namespace was not optimized")
+	}
+	if namespace := gjson.GetBytes(got, "tools.0.name").String(); namespace != codexOptimizedCollaborationNamespace {
+		t.Fatalf("tool namespace = %q, want %q", namespace, codexOptimizedCollaborationNamespace)
+	}
+	if namespace := gjson.GetBytes(got, "input.0.namespace").String(); namespace != codexOptimizedCollaborationNamespace {
+		t.Fatalf("history namespace = %q, want %q", namespace, codexOptimizedCollaborationNamespace)
+	}
+	if name := gjson.GetBytes(got, "input.1.name").String(); name != "collaboration-optimize__send_message" {
+		t.Fatalf("history name = %q, want collaboration-optimize__send_message", name)
+	}
+	if arguments := gjson.GetBytes(got, "input.0.arguments").String(); arguments != `{"namespace":"collaboration"}` {
+		t.Fatalf("opaque arguments changed: %q", arguments)
+	}
+	if input := gjson.GetBytes(got, "input.1.input").String(); input != "collaboration__send_message" {
+		t.Fatalf("opaque custom tool input changed: %q", input)
+	}
+	if output := gjson.GetBytes(got, "input.2.output").String(); output != "collaboration__send_message" {
+		t.Fatalf("tool output changed: %q", output)
+	}
+}
+
 func TestRewriteCodexSpawnAgentDescriptionWithoutModelsStillRemovesEncrypted(t *testing.T) {
 	t.Parallel()
 

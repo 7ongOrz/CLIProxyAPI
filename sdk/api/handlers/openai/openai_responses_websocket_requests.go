@@ -16,11 +16,11 @@ import (
 )
 
 func normalizeResponsesWebsocketRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
-	return normalizeResponsesWebsocketRequestWithMode(rawJSON, lastRequest, lastResponseOutput, true, true)
+	return normalizeResponsesWebsocketRequestWithMode(rawJSON, lastRequest, lastResponseOutput, true, true, false)
 }
 
-func normalizeResponsesWebsocketRequestWithMode(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
-	return normalizeResponsesWebsocketRequestWithLastResponseID(rawJSON, lastRequest, lastResponseOutput, "", allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass)
+func normalizeResponsesWebsocketRequestWithMode(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool, forceTranscriptReplacement bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+	return normalizeResponsesWebsocketRequestWithReplayMode(rawJSON, lastRequest, lastResponseOutput, "", nil, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass, forceTranscriptReplacement, false)
 }
 
 func normalizeResponsesWebsocketRequestWithLastResponseID(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
@@ -28,17 +28,22 @@ func normalizeResponsesWebsocketRequestWithLastResponseID(rawJSON []byte, lastRe
 }
 
 func normalizeResponsesWebsocketRequestWithIncrementalState(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, lastResponsePendingToolCallIDs []string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+	return normalizeResponsesWebsocketRequestWithReplayMode(rawJSON, lastRequest, lastResponseOutput, lastResponseID, lastResponsePendingToolCallIDs, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass, false, false)
+}
+
+func normalizeResponsesWebsocketRequestWithReplayMode(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, lastResponsePendingToolCallIDs []string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool, forceTranscriptReplacement bool, forceTranscriptReplay bool) ([]byte, []byte, *interfaces.ErrorMessage) {
 	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
 	switch requestType {
 	case wsRequestTypeCreate:
 		// log.Infof("responses websocket: response.create request")
 		if len(lastRequest) == 0 {
-			return normalizeResponseCreateRequest(rawJSON)
+			dropPreviousResponseID := forceTranscriptReplacement || inputContainsFullTranscript(gjson.GetBytes(rawJSON, "input"))
+			return normalizeResponseCreateRequest(rawJSON, dropPreviousResponseID, allowCompactionReplayBypass)
 		}
-		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, lastResponseID, lastResponsePendingToolCallIDs, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass)
+		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, lastResponseID, lastResponsePendingToolCallIDs, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass, forceTranscriptReplacement, forceTranscriptReplay)
 	case wsRequestTypeAppend:
 		// log.Infof("responses websocket: response.append request")
-		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, lastResponseID, lastResponsePendingToolCallIDs, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass)
+		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, lastResponseID, lastResponsePendingToolCallIDs, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass, forceTranscriptReplacement, forceTranscriptReplay)
 	default:
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
@@ -47,14 +52,21 @@ func normalizeResponsesWebsocketRequestWithIncrementalState(rawJSON []byte, last
 	}
 }
 
-func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
+func normalizeResponseCreateRequest(rawJSON []byte, dropPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
 	if errDelete != nil {
 		normalized = bytes.Clone(rawJSON)
 	}
+	if dropPreviousResponseID {
+		normalized, _ = sjson.DeleteBytes(normalized, "previous_response_id")
+	}
 	normalized, _ = sjson.SetBytes(normalized, "stream", true)
 	if !gjson.GetBytes(normalized, "input").Exists() {
 		normalized, _ = sjson.SetRawBytes(normalized, "input", []byte("[]"))
+	}
+	input := gjson.GetBytes(normalized, "input")
+	if inputContainsFullTranscript(input) && !allowCompactionReplayBypass {
+		normalized, _ = sjson.SetRawBytes(normalized, "input", []byte(inputWithoutCompactionItems(input)))
 	}
 
 	modelName := strings.TrimSpace(gjson.GetBytes(normalized, "model").String())
@@ -64,10 +76,10 @@ func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces
 			Error:      fmt.Errorf("missing model in response.create request"),
 		}
 	}
-	return normalized, bytes.Clone(normalized), nil
+	return normalized, responsesWebsocketSnapshotWithoutCompactionTriggers(normalized), nil
 }
 
-func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, lastResponsePendingToolCallIDs []string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, lastResponsePendingToolCallIDs []string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool, forceTranscriptReplacement bool, forceTranscriptReplay bool) ([]byte, []byte, *interfaces.ErrorMessage) {
 	if len(lastRequest) == 0 {
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
@@ -83,13 +95,41 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 		}
 	}
 
-	// Compaction can cause clients to replace local websocket history with a new
-	// compact transcript on the next `response.create`. When the input already
-	// contains historical model output items, treating it as an incremental append
-	// duplicates stale turn-state and can leave late orphaned function_call items.
-	if shouldReplaceWebsocketTranscript(rawJSON, nextInput) {
+	if inputContainsFullTranscript(nextInput) {
+		normalized, errMsg := buildResponsesWebsocketTranscriptState(rawJSON, lastRequest, lastResponseOutput, nextInput, allowCompactionReplayBypass)
+		if errMsg != nil {
+			return nil, lastRequest, errMsg
+		}
+		return normalized, responsesWebsocketSnapshotWithoutCompactionTriggers(normalized), nil
+	}
+
+	// When the input already contains historical model output items but no compact
+	// marker, treating it as an incremental append duplicates stale turn-state and
+	// can leave late orphaned function_call items.
+	if responsesWebsocketRequestReplacesTranscript(rawJSON, nextInput, lastRequest) {
 		normalized := normalizeResponseTranscriptReplacement(rawJSON, lastRequest)
-		return normalized, bytes.Clone(normalized), nil
+		return normalized, responsesWebsocketSnapshotWithoutCompactionTriggers(normalized), nil
+	}
+
+	if forceTranscriptReplacement {
+		normalized := normalizeResponseTranscriptReplacement(rawJSON, lastRequest)
+		return normalized, responsesWebsocketSnapshotWithoutCompactionTriggers(normalized), nil
+	}
+
+	if inputContainsCompactionTrigger(nextInput) {
+		normalized, errMsg := buildResponsesWebsocketTranscriptState(rawJSON, lastRequest, lastResponseOutput, nextInput, allowCompactionReplayBypass)
+		if errMsg != nil {
+			return nil, lastRequest, errMsg
+		}
+		return normalized, responsesWebsocketSnapshotWithoutCompactionTriggers(normalized), nil
+	}
+
+	if forceTranscriptReplay {
+		normalized, errMsg := buildResponsesWebsocketTranscriptState(rawJSON, lastRequest, lastResponseOutput, nextInput, allowCompactionReplayBypass)
+		if errMsg != nil {
+			return nil, lastRequest, errMsg
+		}
+		return normalized, responsesWebsocketSnapshotWithoutCompactionTriggers(normalized), nil
 	}
 
 	// Websocket v2 mode uses response.create with previous_response_id + incremental input.
@@ -122,29 +162,42 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 				}
 			}
 			normalized, _ = sjson.SetBytes(normalized, "stream", true)
-			return normalized, bytes.Clone(normalized), nil
+			updatedLastRequest, errMsg := buildResponsesWebsocketTranscriptState(rawJSON, lastRequest, lastResponseOutput, nextInput, allowCompactionReplayBypass)
+			if errMsg != nil {
+				return nil, lastRequest, errMsg
+			}
+			return normalized, responsesWebsocketSnapshotWithoutCompactionTriggers(updatedLastRequest), nil
 		}
 	}
 
-	// When the client sends a compact replay for a downstream that can consume it
-	// directly, the input already carries the canonical history. In that case,
-	// skip merging with stale lastRequest/lastResponseOutput to avoid breaking
-	// function_call / function_call_output pairings.
+	normalized, errMsg := buildResponsesWebsocketTranscriptState(rawJSON, lastRequest, lastResponseOutput, nextInput, allowCompactionReplayBypass)
+	if errMsg != nil {
+		return nil, lastRequest, errMsg
+	}
+	return normalized, responsesWebsocketSnapshotWithoutCompactionTriggers(normalized), nil
+}
+
+func buildResponsesWebsocketTranscriptState(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, nextInput gjson.Result, allowCompactionReplayBypass bool) ([]byte, *interfaces.ErrorMessage) {
+	// When the client sends a compact replay, the input already carries the
+	// canonical post-compaction history. In that case, skip merging with stale
+	// lastRequest/lastResponseOutput to avoid re-inflating compacted context or
+	// breaking function_call / function_call_output pairings.
 	// See: https://github.com/router-for-me/CLIProxyAPI/issues/2207
 	var mergedInput []byte
-	if allowCompactionReplayBypass && inputContainsFullTranscript(nextInput) {
-		log.Infof("responses websocket: full transcript detected, skipping stale merge (input items=%d)", len(nextInput.Array()))
-		mergedInput = []byte(nextInput.Raw)
+	if inputContainsFullTranscript(nextInput) {
+		if allowCompactionReplayBypass {
+			log.Infof("responses websocket: full transcript detected, skipping stale merge (input items=%d)", len(nextInput.Array()))
+			mergedInput = []byte(nextInput.Raw)
+		} else {
+			log.Infof("responses websocket: full transcript detected, stripping compaction items for unsupported upstream (input items=%d)", len(nextInput.Array()))
+			mergedInput = []byte(inputWithoutCompactionItems(nextInput))
+		}
 	} else {
 		appendInputRaw := nextInput.Raw
-		if inputContainsFullTranscript(nextInput) {
-			appendInputRaw = inputWithoutCompactionItems(nextInput)
-		}
-
 		var errMerge error
 		mergedInput, errMerge = mergeResponsesWebsocketInput(lastRequest, lastResponseOutput, appendInputRaw)
 		if errMerge != nil {
-			return nil, lastRequest, &interfaces.ErrorMessage{
+			return nil, &interfaces.ErrorMessage{
 				StatusCode: http.StatusBadRequest,
 				Error:      errMerge,
 			}
@@ -172,15 +225,39 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	var errSet error
 	normalized, errSet = sjson.SetRawBytes(normalized, "input", mergedInput)
 	if errSet != nil {
-		return nil, lastRequest, &interfaces.ErrorMessage{
+		return nil, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
 			Error:      fmt.Errorf("failed to merge websocket input: %w", errSet),
 		}
 	}
-	return normalized, normalized, nil
+	return normalized, nil
 }
 
-func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bool {
+func responsesWebsocketSnapshotWithoutCompactionTriggers(payload []byte) []byte {
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return bytes.Clone(payload)
+	}
+	filtered := make([]string, 0, len(input.Array()))
+	removed := false
+	for _, item := range input.Array() {
+		if strings.TrimSpace(item.Get("type").String()) == "compaction_trigger" {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, item.Raw)
+	}
+	if !removed {
+		return bytes.Clone(payload)
+	}
+	out, errSet := sjson.SetRawBytes(payload, "input", []byte("["+strings.Join(filtered, ",")+"]"))
+	if errSet != nil {
+		return bytes.Clone(payload)
+	}
+	return out
+}
+
+func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result, lastRequest []byte) bool {
 	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
 	if requestType != wsRequestTypeCreate && requestType != wsRequestTypeAppend {
 		return false
@@ -207,6 +284,73 @@ func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bo
 		}
 	}
 
+	return inputStartsWithPreviousRequestInput(nextInput, lastRequest)
+}
+
+func responsesWebsocketRequestReplacesTranscript(rawJSON []byte, nextInput gjson.Result, lastRequest []byte) bool {
+	return shouldReplaceWebsocketTranscript(rawJSON, nextInput, lastRequest) ||
+		isCodexFullWebsocketCreateWithoutPreviousResponseID(rawJSON)
+}
+
+func isCodexFullWebsocketCreateWithoutPreviousResponseID(rawJSON []byte) bool {
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String()) != wsRequestTypeCreate {
+		return false
+	}
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()) != "" {
+		return false
+	}
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String()) == "" {
+		return false
+	}
+	clientMetadata := gjson.GetBytes(rawJSON, "client_metadata")
+	if !clientMetadata.IsObject() {
+		return false
+	}
+	responsesLite := strings.EqualFold(strings.TrimSpace(clientMetadata.Get(wsResponsesLiteMetadataKey).String()), "true")
+	if (!gjson.GetBytes(rawJSON, "tools").Exists() && !responsesLite) ||
+		!gjson.GetBytes(rawJSON, "tool_choice").Exists() ||
+		!gjson.GetBytes(rawJSON, "parallel_tool_calls").Exists() ||
+		!gjson.GetBytes(rawJSON, "store").Exists() ||
+		!gjson.GetBytes(rawJSON, "stream").Exists() ||
+		!gjson.GetBytes(rawJSON, "include").Exists() {
+		return false
+	}
+	return strings.TrimSpace(clientMetadata.Get("x-codex-installation-id").String()) != "" &&
+		strings.TrimSpace(clientMetadata.Get("x-codex-window-id").String()) != ""
+}
+
+func inputStartsWithPreviousRequestInput(nextInput gjson.Result, lastRequest []byte) bool {
+	if !nextInput.Exists() || !nextInput.IsArray() {
+		return false
+	}
+	previousInput := gjson.GetBytes(lastRequest, "input")
+	if !previousInput.Exists() || !previousInput.IsArray() {
+		return false
+	}
+	previousItems := previousInput.Array()
+	nextItems := nextInput.Array()
+	if len(previousItems) == 0 || len(nextItems) < len(previousItems) {
+		return false
+	}
+	for i := range previousItems {
+		if !jsonRawValuesEqual(previousItems[i].Raw, nextItems[i].Raw) {
+			return false
+		}
+	}
+	return true
+}
+
+func jsonRawValuesEqual(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == b {
+		return true
+	}
+	normalizedA, okA := normalizeJSONValueRaw(a)
+	normalizedB, okB := normalizeJSONValueRaw(b)
+	if okA && okB {
+		return bytes.Equal(normalizedA, normalizedB)
+	}
 	return false
 }
 
@@ -292,6 +436,18 @@ func inputSatisfiesPendingToolCalls(input gjson.Result, pendingCallIDs []string)
 	return true
 }
 
+func normalizeJSONValueRaw(raw string) ([]byte, bool) {
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return nil, false
+	}
+	normalized, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	return normalized, true
+}
+
 func normalizeResponseTranscriptReplacement(rawJSON []byte, lastRequest []byte) []byte {
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
 	if errDelete != nil {
@@ -362,7 +518,10 @@ func mergeResponsesWebsocketInput(lastRequest []byte, lastResponseOutput []byte,
 	}
 
 	items = dedupeResponsesWebsocketMergeFunctionCalls(items)
-	items = dedupeResponsesWebsocketMergeInputItems(items)
+	items, errDedupe := dedupeResponsesWebsocketMergeInputItems(items)
+	if errDedupe != nil {
+		return nil, errDedupe
+	}
 	return marshalResponsesWebsocketMergeInputItems(items), nil
 }
 
@@ -481,7 +640,7 @@ func dedupeResponsesWebsocketMergeFunctionCalls(items []responsesWebsocketMergeI
 	return filtered
 }
 
-func dedupeResponsesWebsocketMergeInputItems(items []responsesWebsocketMergeInputItem) []responsesWebsocketMergeInputItem {
+func dedupeResponsesWebsocketMergeInputItems(items []responsesWebsocketMergeInputItem) ([]responsesWebsocketMergeInputItem, error) {
 	referencedCallIDs := make(map[string]struct{}, len(items))
 	for _, item := range items {
 		if isResponsesToolCallOutputType(item.itemType) && item.callID != "" {
@@ -490,7 +649,7 @@ func dedupeResponsesWebsocketMergeInputItems(items []responsesWebsocketMergeInpu
 	}
 
 	keepIndexByID := make(map[string]int, len(items))
-	keepReferencedByID := make(map[string]bool, len(items))
+	keepCallIDByID := make(map[string]string, len(items))
 	for index, item := range items {
 		if item.id == "" {
 			continue
@@ -499,24 +658,40 @@ func dedupeResponsesWebsocketMergeInputItems(items []responsesWebsocketMergeInpu
 		referenced = referenced && item.callID != ""
 		if _, seen := keepIndexByID[item.id]; !seen {
 			keepIndexByID[item.id] = index
-			keepReferencedByID[item.id] = referenced
+			keepCallIDByID[item.id] = item.callID
 			continue
 		}
-		if referenced || !keepReferencedByID[item.id] {
+		_, keptReferenced := referencedCallIDs[keepCallIDByID[item.id]]
+		if referenced || !keptReferenced {
 			keepIndexByID[item.id] = index
-			keepReferencedByID[item.id] = referenced
+			keepCallIDByID[item.id] = item.callID
 		}
 	}
 
 	filtered := items[:0]
 	for index, item := range items {
-		if item.id != "" && keepIndexByID[item.id] != index {
-			continue
+		if item.id != "" {
+			keepIndex := keepIndexByID[item.id]
+			if keepIndex != index {
+				_, referenced := referencedCallIDs[item.callID]
+				if !isResponsesToolCallType(item.itemType) ||
+					item.callID == "" ||
+					item.callID == keepCallIDByID[item.id] ||
+					!referenced {
+					continue
+				}
+				itemWithoutID, errDeleteID := sjson.Delete(item.raw, "id")
+				if errDeleteID != nil {
+					return nil, errDeleteID
+				}
+				item.raw = itemWithoutID
+				item.id = ""
+			}
 		}
 		filtered = append(filtered, item)
 	}
 	clear(items[len(filtered):])
-	return filtered
+	return filtered, nil
 }
 
 func marshalResponsesWebsocketMergeInputItems(items []responsesWebsocketMergeInputItem) []byte {
@@ -631,7 +806,7 @@ func dedupeResponsesWebsocketFunctionCalls(items []responsesWebsocketInputItem) 
 	return filtered
 }
 
-func dedupeResponsesWebsocketInputItems(items []responsesWebsocketInputItem) []responsesWebsocketInputItem {
+func dedupeResponsesWebsocketInputItems(items []responsesWebsocketInputItem) ([]responsesWebsocketInputItem, error) {
 	// Collect the call_ids that are still referenced by tool-call output
 	// items. When several input items share the same id, the one we keep must
 	// preserve any call_id that has a matching output; otherwise the upstream
@@ -649,8 +824,10 @@ func dedupeResponsesWebsocketInputItems(items []responsesWebsocketInputItem) []r
 	// For each id, choose the index to keep. The default is the last
 	// occurrence (matching the original dedupe behavior), but we never replace
 	// an item whose call_id still has a matching output with one that does not.
+	// Additional referenced calls sharing that id are retained without their
+	// optional id below so their outputs remain paired.
 	keepIndexByID := make(map[string]int, len(items))
-	keepReferencedByID := make(map[string]bool, len(items))
+	keepCallIDByID := make(map[string]string, len(items))
 	for index, item := range items {
 		if item.id == "" {
 			continue
@@ -659,24 +836,40 @@ func dedupeResponsesWebsocketInputItems(items []responsesWebsocketInputItem) []r
 		referenced = referenced && item.callID != ""
 		if _, seen := keepIndexByID[item.id]; !seen {
 			keepIndexByID[item.id] = index
-			keepReferencedByID[item.id] = referenced
+			keepCallIDByID[item.id] = item.callID
 			continue
 		}
-		if referenced || !keepReferencedByID[item.id] {
+		_, keptReferenced := referencedCallIDs[keepCallIDByID[item.id]]
+		if referenced || !keptReferenced {
 			keepIndexByID[item.id] = index
-			keepReferencedByID[item.id] = referenced
+			keepCallIDByID[item.id] = item.callID
 		}
 	}
 
 	filtered := items[:0]
 	for index, item := range items {
-		if item.id != "" && keepIndexByID[item.id] != index {
-			continue
+		if item.id != "" {
+			keepIndex := keepIndexByID[item.id]
+			if keepIndex != index {
+				_, referenced := referencedCallIDs[item.callID]
+				if !isResponsesToolCallType(item.itemType) ||
+					item.callID == "" ||
+					item.callID == keepCallIDByID[item.id] ||
+					!referenced {
+					continue
+				}
+				itemWithoutID, errDeleteID := sjson.DeleteBytes(item.raw, "id")
+				if errDeleteID != nil {
+					return nil, errDeleteID
+				}
+				item.raw = itemWithoutID
+				item.id = ""
+			}
 		}
 		filtered = append(filtered, item)
 	}
 	clear(items[len(filtered):])
-	return filtered
+	return filtered, nil
 }
 
 func dedupeResponsesWebsocketInputItemsByID(payload []byte) []byte {
@@ -700,7 +893,11 @@ func dedupeInputItemsByID(rawArray string) (string, error) {
 	if errParse != nil {
 		return "", errParse
 	}
-	return marshalResponsesWebsocketInputItems(dedupeResponsesWebsocketInputItems(items))
+	items, errDedupe := dedupeResponsesWebsocketInputItems(items)
+	if errDedupe != nil {
+		return "", errDedupe
+	}
+	return marshalResponsesWebsocketInputItems(items)
 }
 
 func normalizeResponsesWebsocketPassthroughRequest(rawJSON []byte, modelName string) ([]byte, *interfaces.ErrorMessage) {

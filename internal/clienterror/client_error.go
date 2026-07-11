@@ -16,15 +16,16 @@ import (
 const StatusClientClosedRequest = 499
 
 var requestFaultCodes = map[string]struct{}{
-	"cyber_policy":                {},
-	"context_length_exceeded":     {},
-	"message_too_big":             {},
-	"string_above_max_length":     {},
-	"invalid_prompt":              {},
-	"invalid_value":               {},
-	"unsupported_value":           {},
-	"invalid_request_error":       {},
-	"previous_response_not_found": {},
+	"cyber_policy":                  {},
+	"context_length_exceeded":       {},
+	"message_too_big":               {},
+	"string_above_max_length":       {},
+	"invalid_prompt":                {},
+	"invalid_value":                 {},
+	"unsupported_value":             {},
+	"invalid_request_error":         {},
+	"misalignment_policy_violation": {},
+	"previous_response_not_found":   {},
 }
 
 var requestFaultTypes = map[string]struct{}{

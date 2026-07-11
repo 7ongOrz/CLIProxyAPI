@@ -1669,6 +1669,9 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			errs = nil
 		case chunk, ok := <-data:
 			if !ok {
+				if errMsg, hasPendingError := handlers.PendingStreamError(errs); hasPendingError {
+					return nil, errMsg
+				}
 				for _, frame := range acc.Flush() {
 					if out, done, errMsg := processFrame(frame); errMsg != nil {
 						return nil, errMsg
@@ -1997,6 +2000,11 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 			errs = nil
 		case chunk, ok := <-data:
 			if !ok {
+				if errMsg, hasPendingError := handlers.PendingStreamError(errs); hasPendingError {
+					emitError(errMsg)
+					cancel(errMsg.Error)
+					return
+				}
 				for _, frame := range acc.Flush() {
 					if handleFrame(frame) {
 						return

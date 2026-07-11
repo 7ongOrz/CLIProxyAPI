@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -46,12 +47,12 @@ func codexTestAuth(baseURL string) *cliproxyauth.Auth {
 
 func codexTestRequest() (cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	return cliproxyexecutor.Request{
-		Model:   "gpt-5.6-terra",
-		Payload: []byte(`{"model":"gpt-5.6-terra","input":"hello"}`),
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai-response"),
-		Stream:       true,
-	}
+			Model:   "gpt-5.6-terra",
+			Payload: []byte(`{"model":"gpt-5.6-terra","input":"hello"}`),
+		}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FromString("openai-response"),
+			Stream:       true,
+		}
 }
 
 // codexSSEServer streams the supplied event payloads as an HTTP 200 SSE response.
@@ -92,11 +93,11 @@ func codexWebsocketServer(t *testing.T, frames ...string) *httptest.Server {
 
 func codexWebsocketRequest() (cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	return cliproxyexecutor.Request{
-		Model:   "gpt-5.6-terra",
-		Payload: []byte(`{"model":"gpt-5.6-terra","input":[{"type":"message","role":"user","content":"hello"}]}`),
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai-response"),
-	}
+			Model:   "gpt-5.6-terra",
+			Payload: []byte(`{"model":"gpt-5.6-terra","input":[{"type":"message","role":"user","content":"hello"}]}`),
+		}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FromString("openai-response"),
+		}
 }
 
 // drainChunks collects every payload and the first error from a stream result.
@@ -1134,6 +1135,29 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_NonOverloadStaysInStream(t *
 	}
 }
 
+func TestCodexWebsocketsExecutor_BootstrapBuffering_StatusRequestFaultStaysInStream(t *testing.T) {
+	statusError := `{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid input."}}`
+	server := codexWebsocketServer(t, codexCreatedEvent, codexInProgressEvent, statusError)
+	defer server.Close()
+
+	req, opts := codexWebsocketRequest()
+	result, err := NewCodexWebsocketsExecutor(codexBufferingConfig(true)).ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
+
+	if err != nil {
+		t.Fatalf("request fault must stay in-stream: %v", err)
+	}
+	combined, streamErr := drainChunks(result)
+	if streamErr == nil {
+		t.Fatal("expected the request fault as an in-stream error")
+	}
+	if !strings.Contains(combined, "response.created") {
+		t.Fatalf("buffered handshake must precede the request fault: %s", combined)
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
+	}
+}
+
 func TestCodexWebsocketsExecutor_BootstrapBuffering_FlushesInOrderOnFirstOutput(t *testing.T) {
 	server := codexWebsocketServer(t,
 		codexCreatedEvent,
@@ -1230,6 +1254,9 @@ func TestIsCodexOverloadBootstrapFailureRejectsRequestFaults(t *testing.T) {
 	if !isCodexOverloadBootstrapFailure([]byte(capacityErrorShort)) {
 		t.Fatal("short model capacity error should be eligible for bootstrap failover")
 	}
+	if !isCodexOverloadBootstrapFailure([]byte(`{"error":{"code":"slow_down"}}`)) {
+		t.Fatal("slow down rejections should be eligible for bootstrap failover")
+	}
 }
 
 // codexWebsocketServerHoldingConnection behaves like codexWebsocketServer but keeps the upstream
@@ -1310,6 +1337,36 @@ func TestCodexWebsocketsExecutor_BootstrapOverload_DoesNotNotifyDownstreamDiscon
 	}
 }
 
+func TestCodexWebsocketsExecutor_BootstrapReadResetRequiresTranscriptReplay(t *testing.T) {
+	server := codexWebsocketServer(t)
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(codexBufferingConfig(true))
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+
+	const sessionID = "bootstrap-read-reset-session"
+	req, opts := codexWebsocketRequest()
+	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
+	_, err := exec.ExecuteStream(
+		cliproxyexecutor.WithDownstreamWebsocket(context.Background()),
+		codexTestAuth(server.URL),
+		req,
+		opts,
+	)
+	if err == nil {
+		t.Fatal("expected a transcript-replay error")
+	}
+	var replayRequired interface {
+		CodexWebsocketReplayRequired() bool
+	}
+	if !errors.As(err, &replayRequired) || replayRequired == nil || !replayRequired.CodexWebsocketReplayRequired() {
+		t.Fatalf("ExecuteStream() error = %v, want transcript-replay marker", err)
+	}
+	if got := exec.UpstreamGeneration(sessionID); got != 1 {
+		t.Fatalf("upstream generation = %d, want 1", got)
+	}
+}
+
 // A non-overload terminal failure is delivered in-stream and genuinely ends the session, so it
 // must keep signalling the disconnect exactly as it did before buffering existed.
 func TestCodexWebsocketsExecutor_BootstrapNonOverload_StillNotifiesDownstreamDisconnect(t *testing.T) {
@@ -1324,24 +1381,29 @@ func TestCodexWebsocketsExecutor_BootstrapNonOverload_StillNotifiesDownstreamDis
 }
 
 type mockClock struct {
-	mu  sync.Mutex
-	cur time.Time
+	mu        sync.Mutex
+	cur       time.Time
+	started   chan struct{}
+	startOnce sync.Once
 }
 
 func (m *mockClock) now() time.Time {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.startOnce.Do(func() { close(m.started) })
 	return m.cur
 }
 
 func (m *mockClock) advance(d time.Duration) {
+	// Advance after the executor has captured its bootstrap start time.
+	<-m.started
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cur = m.cur.Add(d)
 }
 
 func withMockClock(t *testing.T, initial time.Time) *mockClock {
-	m := &mockClock{cur: initial}
+	m := &mockClock{cur: initial, started: make(chan struct{})}
 	cleanup := setCodexBootstrapNowForTest(m.now)
 	t.Cleanup(cleanup)
 	return m
@@ -1393,16 +1455,6 @@ func TestCodexExecutor_BootstrapBuffering_TimeBudgetReleasesStream(t *testing.T)
 	t0 := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
 	clock := withMockClock(t, t0)
 
-	bootstrapStarted := make(chan struct{})
-	var once sync.Once
-	cleanup := setCodexBootstrapNowForTest(func() time.Time {
-		once.Do(func() {
-			close(bootstrapStarted)
-		})
-		return clock.now()
-	})
-	t.Cleanup(cleanup)
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("event: response.in_progress\ndata: " + codexInProgressEvent + "\n\n"))
@@ -1410,7 +1462,6 @@ func TestCodexExecutor_BootstrapBuffering_TimeBudgetReleasesStream(t *testing.T)
 			f.Flush()
 		}
 
-		<-bootstrapStarted
 		clock.advance(11 * time.Second)
 
 		_, _ = w.Write([]byte("event: response.in_progress\ndata: " + codexInProgressEvent + "\n\n"))
@@ -1593,16 +1644,6 @@ func TestCodexExecutor_BootstrapBuffering_OverloadDirectlyAfterTimeoutDeliveredI
 	t0 := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
 	clock := withMockClock(t, t0)
 
-	bootstrapStarted := make(chan struct{})
-	var once sync.Once
-	cleanup := setCodexBootstrapNowForTest(func() time.Time {
-		once.Do(func() {
-			close(bootstrapStarted)
-		})
-		return clock.now()
-	})
-	t.Cleanup(cleanup)
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -1610,7 +1651,6 @@ func TestCodexExecutor_BootstrapBuffering_OverloadDirectlyAfterTimeoutDeliveredI
 			f.Flush()
 		}
 
-		<-bootstrapStarted
 		// Advance clock past 10s timeout before the first event arrives
 		clock.advance(11 * time.Second)
 

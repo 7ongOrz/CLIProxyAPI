@@ -1,15 +1,12 @@
 package openai
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -18,63 +15,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
-
-// responsesLocalInterrupt cancels an in-flight HTTP turn. A websocket upstream
-// does not use it; that interrupt is written to the existing socket instead.
-type responsesLocalInterrupt struct {
-	mu     sync.Mutex
-	active bool
-	frames chan []byte
-}
-
-func newResponsesLocalInterrupt() *responsesLocalInterrupt {
-	return &responsesLocalInterrupt{frames: make(chan []byte, 1)}
-}
-
-func (s *responsesLocalInterrupt) begin() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	s.active = true
-	s.mu.Unlock()
-}
-
-func (s *responsesLocalInterrupt) end() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	s.active = false
-	select {
-	case <-s.frames:
-	default:
-	}
-	s.mu.Unlock()
-}
-
-func (s *responsesLocalInterrupt) deliver(payload []byte) bool {
-	if s == nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.active {
-		return false
-	}
-	select {
-	case s.frames <- bytes.Clone(payload):
-	default:
-	}
-	return true
-}
-
-func (s *responsesLocalInterrupt) framesChan() <-chan []byte {
-	if s == nil {
-		return nil
-	}
-	return s.frames
-}
 
 // readResponsesWebsocketInput is the only downstream reader. Interrupts are
 // handled immediately so they are not queued behind an active response.
@@ -98,28 +38,30 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 			// response_id, mode, and extension fields must reach upstream unchanged.
 			if json.Valid(payload) && gjson.GetBytes(payload, "type").String() == "response.interrupt" {
 				appendResponsesInterruptDiagnostic(timeline, payload, "")
-				errInterrupt := interrupt(payload)
-				switch {
-				case errInterrupt == nil:
-					appendResponsesInterruptDiagnostic(timeline, payload, "handled")
-					continue
-				case errors.Is(errInterrupt, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) && local.deliver(payload):
+				responseID := gjson.GetBytes(payload, "response_id")
+				// HTTP response IDs belong to this downstream session, including
+				// completed turns and turns followed by a native websocket request.
+				if responseID.Type == gjson.String && local.handle(responseID.String()) {
 					appendResponsesInterruptDiagnostic(timeline, payload, "local_http")
 					continue
-				default:
-					appendResponsesInterruptDiagnostic(timeline, payload, "rejected")
-					// The sanitized outcome replaces raw error logging here: errors
-					// from transport dependencies may contain credentials or URLs.
-					_, errWrite := writeResponsesWebsocketError(writer, nil, &interfaces.ErrorMessage{
-						StatusCode: http.StatusBadRequest,
-						Error:      errInterrupt,
-					})
-					if errWrite != nil {
-						cancel(errWrite)
-						return
-					}
+				}
+				errInterrupt := interrupt(payload)
+				if errInterrupt == nil {
+					appendResponsesInterruptDiagnostic(timeline, payload, "handled")
 					continue
 				}
+				appendResponsesInterruptDiagnostic(timeline, payload, "rejected")
+				// The sanitized outcome replaces raw error logging here: errors
+				// from transport dependencies may contain credentials or URLs.
+				_, errWrite := writeResponsesWebsocketError(writer, nil, &interfaces.ErrorMessage{
+					StatusCode: http.StatusBadRequest,
+					Error:      errInterrupt,
+				})
+				if errWrite != nil {
+					cancel(errWrite)
+					return
+				}
+				continue
 			}
 			select {
 			case input <- cliproxyexecutor.WebsocketInput{Payload: payload}:

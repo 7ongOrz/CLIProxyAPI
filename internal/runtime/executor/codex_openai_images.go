@@ -55,6 +55,14 @@ type codexImageCallResult struct {
 	Quality       string
 }
 
+func parseCodexOpenAIImageTerminalError(payload []byte, modelLevelCooling bool) (statusErr, bool) {
+	if streamErr, _, ok := parseCodexResponseTerminalError(payload, modelLevelCooling); ok {
+		return streamErr, true
+	}
+	streamErr, _, ok := codexTerminalFailureErrWithCooling(payload, modelLevelCooling)
+	return streamErr, ok
+}
+
 func isCodexOpenAIImageRequest(opts cliproxyexecutor.Options) bool {
 	if !strings.EqualFold(strings.TrimSpace(opts.SourceFormat.String()), codexOpenAIImageSourceFormat) {
 		return false
@@ -140,12 +148,13 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 		return resp, errRead
 	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		err = newCodexStatusErrWithCooling(httpResp.StatusCode, data, e.modelLevelCooling())
 		return resp, err
 	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
@@ -155,25 +164,29 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		}
 		eventData := bytes.TrimSpace(line[len(dataTag):])
 		reporter.ObserveResponseModel(eventData)
+		if streamErr, ok := parseCodexOpenAIImageTerminalError(eventData, e.modelLevelCooling()); ok {
+			err = streamErr
+			return resp, err
+		}
 		switch gjson.GetBytes(eventData, "type").String() {
 		case "response.output_item.done":
 			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed":
-			if detail, ok := helps.ParseCodexUsage(eventData); ok {
-				reporter.Publish(ctx, detail)
-			}
-			publishCodexImageToolUsage(ctx, reporter, body, eventData)
+			detail, hasUsage := helps.ParseCodexUsage(eventData)
 			results, createdAt, usageRaw, firstMeta, errExtract := codexExtractImageResults(eventData, outputItemsByIndex, outputItemsFallback)
 			if errExtract != nil {
+				reporter.PublishFailureWithDetail(ctx, detail, errExtract)
+				publishCodexImageToolUsage(ctx, reporter, body, eventData)
 				return resp, errExtract
-			}
-			if len(results) == 0 {
-				return resp, statusErr{code: http.StatusBadGateway, msg: "upstream did not return image output"}
 			}
 			out, errOutput := codexBuildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, prepared.ResponseFormat)
 			if errOutput != nil {
 				return resp, errOutput
 			}
+			if hasUsage {
+				reporter.Publish(ctx, detail)
+			}
+			publishCodexImageToolUsage(ctx, reporter, body, eventData)
 			return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
 		}
 	}
@@ -280,6 +293,12 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			}
 			eventData := bytes.TrimSpace(line[len(dataTag):])
 			reporter.ObserveResponseModel(eventData)
+			if streamErr, ok := parseCodexOpenAIImageTerminalError(eventData, e.modelLevelCooling()); ok {
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				sendError(streamErr)
+				return
+			}
 			switch gjson.GetBytes(eventData, "type").String() {
 			case "response.output_item.done":
 				collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
@@ -289,19 +308,18 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 					return
 				}
 			case "response.completed":
-				if detail, ok := helps.ParseCodexUsage(eventData); ok {
-					reporter.Publish(ctx, detail)
-				}
-				publishCodexImageToolUsage(ctx, reporter, body, eventData)
+				detail, hasUsage := helps.ParseCodexUsage(eventData)
 				results, _, usageRaw, _, errExtract := codexExtractImageResults(eventData, outputItemsByIndex, outputItemsFallback)
 				if errExtract != nil {
+					reporter.PublishFailureWithDetail(ctx, detail, errExtract)
+					publishCodexImageToolUsage(ctx, reporter, body, eventData)
 					sendError(errExtract)
 					return
 				}
-				if len(results) == 0 {
-					sendError(statusErr{code: http.StatusBadGateway, msg: "upstream did not return image output"})
-					return
+				if hasUsage {
+					reporter.Publish(ctx, detail)
 				}
+				publishCodexImageToolUsage(ctx, reporter, body, eventData)
 				for _, img := range results {
 					frame := codexBuildImageCompletedFrame(img, usageRaw, prepared.ResponseFormat, prepared.StreamPrefix)
 					if len(frame) > 0 && !sendPayload(frame) {
@@ -312,10 +330,15 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			sendError(errScan)
 		}
+		streamErr := newCodexIncompleteStreamError()
+		helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+		reporter.PublishFailure(ctx, streamErr)
+		sendError(streamErr)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
@@ -375,12 +398,13 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 		return resp, errRead
 	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		err = newCodexStatusErrWithCooling(httpResp.StatusCode, data, e.modelLevelCooling())
 		return resp, err
 	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	reporter.EnsurePublished(ctx)
@@ -458,29 +482,76 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 			reporter.EnsurePublished(ctx)
 		}()
 
-		buffer := make([]byte, 32*1024)
+		completedEvent := "image_generation.completed"
+		if endpointPath == codexDirectImagesEdit {
+			completedEvent = "image_edit.completed"
+		}
+		completed := false
+		var pendingEventLine []byte
+		sendPayload := func(payload []byte, resultErr error) bool {
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Payload: payload, ResultErr: resultErr}:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		reader := bufio.NewReader(httpResp.Body)
 		for {
-			n, errRead := httpResp.Body.Read(buffer)
-			if n > 0 {
-				chunk := bytes.Clone(buffer[:n])
-				helps.AppendAPIResponseChunk(ctx, e.cfg, chunk)
-				for _, line := range bytes.Split(chunk, []byte("\n")) {
-					streamUsage.ObserveOpenAIStream(bytes.TrimSpace(line))
+			line, errRead := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				trimmedLine := bytes.TrimSpace(line)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				streamUsage.ObserveOpenAIStream(trimmedLine)
+				if bytes.HasPrefix(trimmedLine, []byte("event:")) {
+					pendingEventLine = bytes.Clone(line)
+					if errRead == nil {
+						continue
+					}
 				}
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
-				case <-ctx.Done():
+				if bytes.HasPrefix(trimmedLine, dataTag) {
+					eventData := bytes.TrimSpace(trimmedLine[len(dataTag):])
+					completed = gjson.GetBytes(eventData, "type").String() == completedEvent
+					if streamErr, ok := parseCodexOpenAIImageTerminalError(eventData, e.modelLevelCooling()); ok {
+						frame := make([]byte, 0, len(pendingEventLine)+len(line)+1)
+						frame = append(frame, pendingEventLine...)
+						frame = append(frame, line...)
+						frame = append(frame, '\n')
+						helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+						reporter.PublishFailure(ctx, streamErr)
+						_ = sendPayload(frame, streamErr)
+						return
+					}
+				}
+				if len(pendingEventLine) > 0 {
+					if !sendPayload(pendingEventLine, nil) {
+						return
+					}
+					pendingEventLine = nil
+				}
+				if !bytes.HasPrefix(trimmedLine, []byte("event:")) && !sendPayload(line, nil) {
+					return
+				}
+				if completed && len(trimmedLine) == 0 {
 					return
 				}
 			}
 			if errRead != nil {
+				if ctx.Err() != nil || completed {
+					return
+				}
+				if len(pendingEventLine) > 0 && !sendPayload(pendingEventLine, nil) {
+					return
+				}
 				if errRead != io.EOF {
 					helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-					reporter.PublishFailure(ctx, errRead)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
-					case <-ctx.Done():
-					}
+				}
+				streamErr := newCodexIncompleteImageStreamError()
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+				case <-ctx.Done():
 				}
 				return
 			}
@@ -1004,6 +1075,7 @@ func codexMultipartFileToDataURL(fileHeader *multipart.FileHeader) (string, erro
 // codexExtractImageResults extracts image generation results directly from the
 // completed event and the items collected from response.output_item.done events,
 // without rebuilding the full completed JSON.
+// A completed response must contain at least one usable image.
 //
 // It prefers image_generation_call items already present in the completed event's
 // response.output and only falls back to the collected items when that output is
@@ -1072,6 +1144,9 @@ func codexExtractImageResults(completed []byte, itemsByIndex map[int64][]byte, f
 
 	if usage := gjson.GetBytes(completed, "response.tool_usage.image_gen"); usage.Exists() && usage.IsObject() {
 		usageRaw = []byte(usage.Raw)
+	}
+	if len(results) == 0 {
+		return nil, createdAt, usageRaw, firstMeta, statusErr{code: http.StatusBadGateway, msg: "upstream did not return image output"}
 	}
 	return results, createdAt, usageRaw, firstMeta, nil
 }

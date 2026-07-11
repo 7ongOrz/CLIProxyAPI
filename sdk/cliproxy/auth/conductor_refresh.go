@@ -670,22 +670,6 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	base := auth.Clone()
 	updated, err := exec.Refresh(ctx, base.Clone())
 	now := time.Now()
-	if err != nil && errors.Is(err, context.Canceled) {
-		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
-		m.mu.Lock()
-		if current := m.auths[id]; current != nil {
-			if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
-				current.NextRefreshAfter = now.Add(time.Second)
-			}
-			m.auths[id] = current
-			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
-			}
-		}
-		m.mu.Unlock()
-		m.queueRefreshReschedule(id)
-		return nil, err
-	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	if err != nil {
 		unauthorized := isUnauthorizedError(err)
@@ -693,10 +677,26 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		shouldReschedule := false
 		isDisabled := false
 		shouldUnschedule := false
+		releaseMutation := m.lockAuthMutation(id)
+		defer releaseMutation()
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			if base != nil && current.RegistrationEpoch != base.RegistrationEpoch {
+			// Apply refresh outcomes to the credential that initiated the refresh.
+			if current.RegistrationEpoch != base.RegistrationEpoch ||
+				current.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, current) {
 				m.mu.Unlock()
+				return nil, err
+			}
+			if errors.Is(err, context.Canceled) {
+				if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
+					current.NextRefreshAfter = now.Add(time.Second)
+				}
+				m.auths[id] = current
+				if m.scheduler != nil {
+					m.scheduler.upsertAuth(current.Clone())
+				}
+				m.mu.Unlock()
+				m.queueRefreshReschedule(id)
 				return nil, err
 			}
 			if hasUnauthorizedAuthFailure(current) && !forceRefresh {

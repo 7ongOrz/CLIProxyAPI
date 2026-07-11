@@ -60,31 +60,36 @@ type codexWebsocketSession struct {
 	authID                    string
 	proxyURL                  string
 	multiAgentV2OptimizedConn *websocket.Conn
+	pendingHandshakeConn      *websocket.Conn
+	pendingHandshakeHeaders   http.Header
 	lifecycleBindMu           sync.Mutex
 	lifecycle                 cliproxyexecutor.ExecutionLifecycle
 	lifecycleModel            string
 
 	writeMu sync.Mutex
 
-	activeMu     sync.Mutex
-	activeConn   *websocket.Conn
-	activeCh     chan codexWebsocketRead
-	activeDone   <-chan struct{}
-	activeCancel context.CancelFunc
-	terminalConn *websocket.Conn
-	terminalErr  error
+	activeMu        sync.Mutex
+	activeCh        chan codexWebsocketRead
+	activeConn      *websocket.Conn
+	activeDone      <-chan struct{}
+	activeCancel    context.CancelFunc
+	activeClosedCh  chan codexWebsocketRead
+	activeClosedErr error
+	terminalConn    *websocket.Conn
+	terminalErr     error
+	sessionErr      error
 
 	responseStateConn   *websocket.Conn
 	terminalResponseIDs map[string]struct{}
 
 	readerConn *websocket.Conn
 
-	upstreamGeneration        uint64
-	upstreamDisconnectOnce    sync.Once
-	upstreamDisconnectCh      chan error
-	upstreamDisconnectErrMu   sync.RWMutex
-	upstreamDisconnectErrConn *websocket.Conn
-	upstreamDisconnectErr     error
+	upstreamGeneration           uint64
+	upstreamDisconnectGeneration uint64
+	upstreamDisconnectCh         chan error
+	upstreamDisconnectErrMu      sync.RWMutex
+	upstreamDisconnectErrConn    *websocket.Conn
+	upstreamDisconnectErr        error
 
 	lastEventMu   sync.Mutex
 	lastEventConn *websocket.Conn
@@ -97,6 +102,39 @@ type codexWebsocketRead struct {
 	payload []byte
 	err     error
 }
+
+type websocketUpstreamDisconnectEvent struct {
+	cause      error
+	generation uint64
+}
+
+func (e websocketUpstreamDisconnectEvent) Error() string {
+	if e.cause == nil {
+		return "upstream websocket disconnected"
+	}
+	return e.cause.Error()
+}
+
+func (e websocketUpstreamDisconnectEvent) Unwrap() error {
+	return e.cause
+}
+
+func (e websocketUpstreamDisconnectEvent) UpstreamDisconnectGeneration() uint64 {
+	return e.generation
+}
+
+type codexWebsocketUpstreamResetError struct {
+	cause error
+}
+
+func (e codexWebsocketUpstreamResetError) Error() string {
+	if e.cause == nil {
+		return "codex websockets executor: upstream websocket reset"
+	}
+	return fmt.Sprintf("codex websockets executor: upstream websocket reset: %v", e.cause)
+}
+
+func (e codexWebsocketUpstreamResetError) Unwrap() error { return e.cause }
 
 func (s *codexWebsocketSession) setActive(conn *websocket.Conn, ch chan codexWebsocketRead) {
 	if s == nil {
@@ -113,8 +151,10 @@ func (s *codexWebsocketSession) setActiveLocked(conn *websocket.Conn, ch chan co
 		s.activeCancel = nil
 		s.activeDone = nil
 	}
-	s.activeConn = conn
+	s.activeClosedCh = nil
+	s.activeClosedErr = nil
 	s.activeCh = ch
+	s.activeConn = conn
 	if conn != nil && ch != nil {
 		activeCtx, activeCancel := context.WithCancel(context.Background())
 		s.activeDone = activeCtx.Done()
@@ -169,6 +209,33 @@ func (s *codexWebsocketSession) markTerminalError(conn *websocket.Conn, err erro
 	return true
 }
 
+func (s *codexWebsocketSession) storeHandshakeHeadersForReplay(conn *websocket.Conn, headers http.Header) {
+	if s == nil || conn == nil || len(headers) == 0 {
+		return
+	}
+	s.connMu.Lock()
+	if s.conn == conn {
+		s.pendingHandshakeConn = conn
+		s.pendingHandshakeHeaders = headers.Clone()
+	}
+	s.connMu.Unlock()
+}
+
+func (s *codexWebsocketSession) takeHandshakeHeadersForReplay(conn *websocket.Conn) http.Header {
+	if s == nil || conn == nil {
+		return nil
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.conn != conn || s.pendingHandshakeConn != conn {
+		return nil
+	}
+	headers := s.pendingHandshakeHeaders
+	s.pendingHandshakeConn = nil
+	s.pendingHandshakeHeaders = nil
+	return headers
+}
+
 func (s *codexWebsocketSession) activeForConn(conn *websocket.Conn) (chan codexWebsocketRead, <-chan struct{}) {
 	if s == nil || conn == nil {
 		return nil, nil
@@ -193,17 +260,93 @@ func (s *codexWebsocketSession) clearActive(conn *websocket.Conn, ch chan codexW
 		return false
 	}
 	s.activeMu.Lock()
+	cleared := false
+	if s.activeConn == conn && s.activeCh == ch {
+		s.activeCh = nil
+		s.activeConn = nil
+		if s.activeCancel != nil {
+			s.activeCancel()
+		}
+		s.activeCancel = nil
+		s.activeDone = nil
+		cleared = true
+	}
+	if s.activeClosedCh == ch {
+		s.activeClosedCh = nil
+		s.activeClosedErr = nil
+	}
+	s.activeMu.Unlock()
+	return cleared
+}
+
+func (s *codexWebsocketSession) activeDoneFor(ch chan codexWebsocketRead) (<-chan struct{}, bool) {
+	if s == nil || ch == nil {
+		return nil, false
+	}
+	s.activeMu.Lock()
 	defer s.activeMu.Unlock()
-	if s.activeConn != conn || s.activeCh != ch {
+	if s.activeCh != ch {
+		return nil, false
+	}
+	return s.activeDone, true
+}
+
+func (s *codexWebsocketSession) closedActiveErrorFor(ch chan codexWebsocketRead) error {
+	if s == nil || ch == nil {
+		return nil
+	}
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.activeClosedCh != ch {
+		return nil
+	}
+	return s.activeClosedErr
+}
+
+func (s *codexWebsocketSession) sessionError() error {
+	if s == nil {
+		return nil
+	}
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	return s.sessionErr
+}
+
+func (s *codexWebsocketSession) markSessionError(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.activeMu.Lock()
+	s.sessionErr = err
+	if s.activeClosedCh != nil {
+		s.activeClosedErr = err
+	}
+	s.activeMu.Unlock()
+}
+
+func (s *codexWebsocketSession) closeActiveReadForConn(conn *websocket.Conn, err error) bool {
+	if s == nil || conn == nil {
 		return false
 	}
-	s.activeConn = nil
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.activeConn != conn || s.activeCh == nil {
+		return false
+	}
+	ch := s.activeCh
 	s.activeCh = nil
+	s.activeConn = nil
+	s.activeClosedCh = ch
+	s.activeClosedErr = err
 	if s.activeCancel != nil {
 		s.activeCancel()
 	}
 	s.activeCancel = nil
 	s.activeDone = nil
+	select {
+	case ch <- codexWebsocketRead{conn: conn, err: err}:
+	default:
+	}
 	return true
 }
 
@@ -214,6 +357,56 @@ var (
 	testWebsocketWriteChunkHook   func(chunkIndex int, totalChunks int)
 )
 
+func (s *codexWebsocketSession) closeActiveRead(err error) {
+	if s == nil {
+		return
+	}
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.activeCh == nil {
+		return
+	}
+	ch := s.activeCh
+	conn := s.activeConn
+	s.activeCh = nil
+	s.activeConn = nil
+	s.activeClosedCh = ch
+	s.activeClosedErr = err
+	if s.activeCancel != nil {
+		s.activeCancel()
+	}
+	s.activeCancel = nil
+	s.activeDone = nil
+	select {
+	case ch <- codexWebsocketRead{conn: conn, err: err}:
+	default:
+	}
+}
+
+func (s *codexWebsocketSession) writeCodexMessage(conn *websocket.Conn, msgType int, payload []byte) error {
+	if s == nil {
+		return fmt.Errorf("codex websockets executor: session is nil")
+	}
+	if conn == nil {
+		return fmt.Errorf("codex websockets executor: websocket conn is nil")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	netConn := conn.UnderlyingConn()
+	if netConn != nil {
+		// Keep the active read alive while the request is being written.
+		_ = netConn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+	}
+	if err := s.writeMessageLocked(conn, msgType, payload); err != nil {
+		return err
+	}
+	if netConn != nil {
+		// Give the response a full idle window after the write completes.
+		_ = netConn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+	}
+	return nil
+}
+
 func (s *codexWebsocketSession) writeMessage(conn *websocket.Conn, msgType int, payload []byte) error {
 	if s == nil {
 		return fmt.Errorf("codex websockets executor: session is nil")
@@ -223,6 +416,10 @@ func (s *codexWebsocketSession) writeMessage(conn *websocket.Conn, msgType int, 
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.writeMessageLocked(conn, msgType, payload)
+}
+
+func (s *codexWebsocketSession) writeMessageLocked(conn *websocket.Conn, msgType int, payload []byte) error {
 	if testWebsocketWritePayloadHook != nil {
 		testWebsocketWritePayloadHook(conn)
 	}
@@ -347,15 +544,31 @@ func (s *codexWebsocketSession) bindExecutionLifecycle(opts cliproxyexecutor.Opt
 	if s.conn == conn && s.connCloser == nil {
 		s.connCloser = closer
 	}
-	alreadyBound := s.conn == conn && s.connCloser == closer && s.lifecycle == lifecycle
-	s.connMu.Unlock()
-	if alreadyBound {
+	if s.conn != conn || s.connCloser != closer {
+		s.connMu.Unlock()
+		return fmt.Errorf("codex websockets executor: websocket connection changed during lifecycle bind")
+	}
+	if s.lifecycle == lifecycle {
+		s.connMu.Unlock()
 		return nil
 	}
+	previous := s.lifecycle
+	s.lifecycle = lifecycle
+	s.lifecycleModel = strings.TrimSpace(model)
+	s.connMu.Unlock()
 
 	if errBind := lifecycle.Bind(func() error {
-		return s.closeBoundConnection(conn, closer, lifecycle)
+		return s.closeBoundLifecycle(lifecycle)
 	}); errBind != nil {
+		s.connMu.Lock()
+		if s.lifecycle == lifecycle {
+			s.lifecycle = nil
+			s.lifecycleModel = ""
+		}
+		s.connMu.Unlock()
+		if previous != nil && previous != lifecycle {
+			previous.End("target_replaced")
+		}
 		return errBind
 	}
 	if retained, ok := lifecycle.(interface{ Retain() }); ok {
@@ -363,13 +576,13 @@ func (s *codexWebsocketSession) bindExecutionLifecycle(opts cliproxyexecutor.Opt
 	}
 
 	s.connMu.Lock()
-	if s.conn != conn || s.connCloser != closer {
+	if s.conn != conn || s.connCloser != closer || s.lifecycle != lifecycle {
 		s.connMu.Unlock()
+		if previous != nil && previous != lifecycle {
+			previous.End("target_replaced")
+		}
 		return fmt.Errorf("codex websockets executor: websocket connection closed during lifecycle bind")
 	}
-	previous := s.lifecycle
-	s.lifecycle = lifecycle
-	s.lifecycleModel = strings.TrimSpace(model)
 	s.connMu.Unlock()
 	if previous != nil && previous != lifecycle {
 		previous.End("target_replaced")
@@ -377,38 +590,57 @@ func (s *codexWebsocketSession) bindExecutionLifecycle(opts cliproxyexecutor.Opt
 	return nil
 }
 
-func (s *codexWebsocketSession) closeBoundConnection(conn *websocket.Conn, closer *websocketConnectionCloser, lifecycle cliproxyexecutor.ExecutionLifecycle) error {
-	if s == nil || conn == nil {
+func (s *codexWebsocketSession) closeBoundLifecycle(lifecycle cliproxyexecutor.ExecutionLifecycle) error {
+	s.connMu.Lock()
+	if s.lifecycle != lifecycle {
+		s.connMu.Unlock()
+		go lifecycle.End("connection_closed")
 		return nil
 	}
-	s.detachConnection(conn, lifecycle)
-	errClose := closer.Close()
+	conn := s.conn
+	closer := s.connCloser
+	s.lifecycle = nil
+	s.lifecycleModel = ""
+	s.conn = nil
+	s.connCloser = nil
+	if s.readerConn == conn {
+		s.readerConn = nil
+	}
+	if s.pendingHandshakeConn == conn {
+		s.pendingHandshakeConn = nil
+		s.pendingHandshakeHeaders = nil
+	}
+	s.connMu.Unlock()
+
+	s.closeActiveReadForConn(conn, fmt.Errorf("websockets executor: execution lifecycle ended"))
+	var errClose error
+	if closer != nil {
+		errClose = closer.Close()
+	}
 	go lifecycle.End("connection_closed")
 	return errClose
 }
 
-func (s *codexWebsocketSession) detachConnection(conn *websocket.Conn, lifecycle cliproxyexecutor.ExecutionLifecycle) *websocketConnectionCloser {
+func (s *codexWebsocketSession) detachConnection(conn *websocket.Conn) {
 	if s == nil || conn == nil {
-		return nil
+		return
 	}
 	s.connMu.Lock()
-	var closer *websocketConnectionCloser
-	matched := s.conn == conn
-	if matched {
-		closer = s.connCloser
+	if s.conn == conn {
 		s.conn = nil
 		s.connCloser = nil
 		s.multiAgentV2OptimizedConn = nil
 		if s.readerConn == conn {
 			s.readerConn = nil
 		}
-	}
-	if (lifecycle == nil && matched) || (lifecycle != nil && s.lifecycle == lifecycle) {
+		if s.pendingHandshakeConn == conn {
+			s.pendingHandshakeConn = nil
+			s.pendingHandshakeHeaders = nil
+		}
 		s.lifecycle = nil
 		s.lifecycleModel = ""
 	}
 	s.connMu.Unlock()
-	return closer
 }
 
 func closeWebsocketAfterBindFailure(sess *codexWebsocketSession, conn *websocket.Conn, closer *websocketConnectionCloser) {
@@ -416,7 +648,7 @@ func closeWebsocketAfterBindFailure(sess *codexWebsocketSession, conn *websocket
 		return
 	}
 	if sess != nil {
-		sess.detachConnection(conn, nil)
+		sess.detachConnection(conn)
 	}
 	if errClose := closer.Close(); errClose != nil {
 		log.Errorf("websockets executor: close lifecycle bind failure connection error: %v", errClose)
@@ -480,6 +712,10 @@ func detachMismatchedWebsocketSessionConn(sess *codexWebsocketSession, authID st
 	sess.multiAgentV2OptimizedConn = nil
 	if sess.readerConn == conn {
 		sess.readerConn = nil
+	}
+	if sess.pendingHandshakeConn == conn {
+		sess.pendingHandshakeConn = nil
+		sess.pendingHandshakeHeaders = nil
 	}
 	return conn, closer, previousAuthID, previousWSURL, lifecycle
 }
@@ -570,20 +806,22 @@ func (s *codexWebsocketSession) upstreamDisconnectError(conn *websocket.Conn) er
 	return s.upstreamDisconnectErr
 }
 
-func (s *codexWebsocketSession) notifyUpstreamDisconnect(err error) {
-	if s == nil {
+func (s *codexWebsocketSession) queueUpstreamDisconnectLocked(err error, generation uint64) {
+	if s == nil || s.upstreamDisconnectCh == nil {
 		return
 	}
-	s.upstreamDisconnectOnce.Do(func() {
-		if s.upstreamDisconnectCh == nil {
-			return
-		}
-		select {
-		case s.upstreamDisconnectCh <- err:
-		default:
-		}
-		close(s.upstreamDisconnectCh)
-	})
+	event := websocketUpstreamDisconnectEvent{cause: err, generation: generation}
+	select {
+	case s.upstreamDisconnectCh <- event:
+		return
+	default:
+	}
+	// A queued event can belong to an inactive connection; retain the latest disconnect.
+	select {
+	case <-s.upstreamDisconnectCh:
+	default:
+	}
+	s.upstreamDisconnectCh <- event
 }
 
 func executionSessionIDFromOptions(opts cliproxyexecutor.Options) string {
@@ -640,6 +878,16 @@ func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-cha
 	return sess.upstreamDisconnectCh
 }
 
+func (e *CodexWebsocketsExecutor) UpstreamDisconnectGeneration(sessionID string) uint64 {
+	sess := e.getOrCreateSession(sessionID)
+	if sess == nil {
+		return 0
+	}
+	sess.connMu.Lock()
+	defer sess.connMu.Unlock()
+	return sess.upstreamDisconnectGeneration
+}
+
 func (e *CodexWebsocketsExecutor) UpstreamGeneration(sessionID string) uint64 {
 	sessionID = strings.TrimSpace(sessionID)
 	if e == nil || sessionID == "" {
@@ -661,17 +909,51 @@ func (e *CodexWebsocketsExecutor) UpstreamGeneration(sessionID string) uint64 {
 	return generation
 }
 
-func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
+func (e *CodexWebsocketsExecutor) DropUpstreamSession(sessionID string, reason string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if e == nil || sessionID == "" {
+		return
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sess := store.sessions[sessionID]
+	store.mu.Unlock()
+	if sess == nil {
+		return
+	}
+	sess.connMu.Lock()
+	conn := sess.conn
+	sess.connMu.Unlock()
+	if conn == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "upstream_session_dropped"
+	}
+	e.dropUpstreamConn(sess, conn, reason, nil, false)
+}
+
+func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, bool, error) {
 	if sess == nil {
 		conn, closer, resp, err := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 		if conn != nil {
 			configureRawCodexWebsocketConn(conn, authID, wsURL)
 		}
-		return conn, closer, resp, err
+		return conn, closer, resp, true, err
+	}
+	if errSession := sess.sessionError(); errSession != nil {
+		return nil, nil, nil, false, errSession
 	}
 
 	proxyURL := executionProxyURL(ctx, e.cfg, auth)
 	if staleConn, staleCloser, staleAuthID, staleWSURL, staleLifecycle := detachMismatchedWebsocketSessionConn(sess, authID, wsURL, proxyURL); staleConn != nil {
+		sess.connMu.Lock()
+		sess.upstreamGeneration++
+		sess.connMu.Unlock()
 		staleLastEvent := sess.getLastEventType(staleConn)
 		logCodexWebsocketDisconnectedWithLastEvent(sess, sess.sessionID, staleAuthID, staleWSURL, "target_changed", staleLastEvent, nil)
 		if staleCloser != nil {
@@ -698,15 +980,23 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 			go e.readUpstreamLoop(sess, conn)
 		}
 		logCodexWebsocketConnectedWithReused(sess, sess.sessionID, authID, wsURL, true)
-		return conn, closer, nil, nil
+		return conn, closer, nil, false, nil
 	}
 
 	conn, closer, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 	if errDial != nil {
-		return nil, closer, resp, errDial
+		return nil, closer, resp, false, errDial
 	}
 
 	sess.connMu.Lock()
+	if errSession := sess.sessionError(); errSession != nil {
+		sess.connMu.Unlock()
+		if errClose := closer.Close(); errClose != nil {
+			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
+		}
+		closeHTTPResponseBody(resp, "codex websockets executor: closed session handshake")
+		return nil, nil, nil, false, errSession
+	}
 	if sess.conn != nil {
 		previous := sess.conn
 		previousCloser := sess.connCloser
@@ -715,7 +1005,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 		}
 		logCodexWebsocketConnectedWithReused(sess, sess.sessionID, authID, wsURL, true)
-		return previous, previousCloser, nil, nil
+		return previous, previousCloser, nil, false, nil
 	}
 	sess.conn = conn
 	sess.connCloser = closer
@@ -729,7 +1019,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.configureConn(conn)
 	go e.readUpstreamLoop(sess, conn)
 	logCodexWebsocketConnectedWithReused(sess, sess.sessionID, authID, wsURL, false)
-	return conn, closer, resp, nil
+	return conn, closer, resp, true, nil
 }
 
 func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, conn *websocket.Conn) {
@@ -740,37 +1030,20 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
-			sess.markTerminalError(conn, errRead)
 			mappedErr := mapCodexWebsocketReadError(errRead)
-			ch, done := sess.activeForConn(conn)
-			if !shouldRetryCodexWebsocketSend(mappedErr) {
-				invalidate := func() {
-					e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+			if shouldRetryCodexWebsocketSend(mappedErr) {
+				sess.markTerminalError(conn, codexWebsocketUpstreamResetError{cause: errRead})
+				if !e.detachUpstreamConnForRecovery(sess, conn, "upstream_disconnected", errRead) {
+					return
 				}
-				invalidated := false
-				if ch != nil {
-					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
-					if sess.clearActive(conn, ch) {
-						close(ch)
-					}
-				}
-				if !invalidated {
-					invalidate()
-				}
+				sess.closeActiveReadForConn(conn, codexWebsocketUpstreamResetError{cause: errRead})
 				return
 			}
-
-			if ch != nil {
-				select {
-				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
-				case <-done:
-				default:
-				}
-				if sess.clearActive(conn, ch) {
-					close(ch)
-				}
+			sess.markTerminalError(conn, errRead)
+			if sess.closeActiveReadForConn(conn, errRead) {
+				return
 			}
-			e.dropUpstreamConn(sess, conn, "upstream_disconnected", errRead, false)
+			e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			return
 		}
 
@@ -778,20 +1051,10 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			if msgType == websocket.BinaryMessage {
 				errBinary := fmt.Errorf("codex websockets executor: unexpected binary message")
 				sess.markTerminalError(conn, errBinary)
-				invalidate := func() {
-					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
+				if sess.closeActiveReadForConn(conn, errBinary) {
+					return
 				}
-				invalidated := false
-				ch, done := sess.activeForConn(conn)
-				if ch != nil {
-					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
-					if sess.clearActive(conn, ch) {
-						close(ch)
-					}
-				}
-				if !invalidated {
-					invalidate()
-				}
+				e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
 				return
 			}
 			continue
@@ -834,6 +1097,41 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithoutDisconnectNotify(
 	e.dropUpstreamConn(sess, conn, reason, err, false)
 }
 
+func (e *CodexWebsocketsExecutor) detachUpstreamConnForRecovery(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) bool {
+	if sess == nil || conn == nil {
+		return false
+	}
+
+	sess.connMu.Lock()
+	if sess.conn != conn {
+		sess.connMu.Unlock()
+		return false
+	}
+	authID := sess.authID
+	wsURL := sess.wsURL
+	sessionID := sess.sessionID
+	closer := sess.connCloser
+	sess.conn = nil
+	sess.connCloser = nil
+	if sess.readerConn == conn {
+		sess.readerConn = nil
+	}
+	if sess.pendingHandshakeConn == conn {
+		sess.pendingHandshakeConn = nil
+		sess.pendingHandshakeHeaders = nil
+	}
+	sess.upstreamGeneration++
+	sess.connMu.Unlock()
+
+	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
+	if closer != nil {
+		if errClose := closer.Close(); errClose != nil {
+			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
+		}
+	}
+	return true
+}
+
 func (e *CodexWebsocketsExecutor) dropUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notifyDownstream bool) {
 	if sess == nil || conn == nil {
 		return
@@ -858,6 +1156,14 @@ func (e *CodexWebsocketsExecutor) dropUpstreamConn(sess *codexWebsocketSession, 
 	if sess.readerConn == conn {
 		sess.readerConn = nil
 	}
+	if sess.pendingHandshakeConn == conn {
+		sess.pendingHandshakeConn = nil
+		sess.pendingHandshakeHeaders = nil
+	}
+	if notifyDownstream {
+		sess.upstreamDisconnectGeneration++
+		sess.queueUpstreamDisconnectLocked(err, sess.upstreamDisconnectGeneration)
+	}
 	if !notifyDownstream {
 		sess.upstreamGeneration++
 	}
@@ -865,9 +1171,6 @@ func (e *CodexWebsocketsExecutor) dropUpstreamConn(sess *codexWebsocketSession, 
 
 	lastEvent := sess.getLastEventType(conn)
 	logCodexWebsocketDisconnectedWithLastEvent(sess, sessionID, authID, wsURL, reason, lastEvent, err)
-	if notifyDownstream {
-		sess.notifyUpstreamDisconnect(err)
-	}
 	if closer != nil {
 		if errClose := closer.Close(); errClose != nil {
 			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
@@ -939,6 +1242,9 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	if reason == "" {
 		reason = "session_closed"
 	}
+	sessionClosedErr := fmt.Errorf("codex websockets executor: execution session closed")
+	sess.markSessionError(sessionClosedErr)
+	sess.closeActiveRead(sessionClosedErr)
 
 	sess.connMu.Lock()
 	conn := sess.conn
@@ -955,6 +1261,8 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 		sess.readerConn = nil
 	}
 	sessionID := sess.sessionID
+	sess.pendingHandshakeConn = nil
+	sess.pendingHandshakeHeaders = nil
 	sess.connMu.Unlock()
 
 	lastEvent := sess.getLastEventType(conn)

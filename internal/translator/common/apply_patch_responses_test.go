@@ -116,6 +116,10 @@ func TestApplyPatchResponsesBridgeIdentityAndSnapshotEvidence(t *testing.T) {
 		{"type-before-name", [][]byte{patchEvent("response.output_item.added", 0, patchItem("message", "a", "ca", "", ""))}, patchEvent("response.output_item.done", 0, patchItem("function_call", "a", "ca", "apply_patch", `{"input":"p"}`))},
 		{"invalid-before-name", [][]byte{patchEvent("response.output_item.added", 0, patchItem("function_call", "a", "ca", "", `{"input":"p","extra":1}`))}, patchEvent("response.output_item.done", 0, patchItem("function_call", "a", "ca", "apply_patch", `{"input":"p"}`))},
 		{"partial-snapshot", nil, patchEvent("response.output_item.added", 0, patchItem("function_call", "a", "ca", "apply_patch", `{"input":"p`))},
+		{"completed-delta-extended-snapshot", [][]byte{
+			patchEvent("response.output_item.added", 0, patchItem("function_call", "a", "ca", "apply_patch", "")),
+			[]byte(`{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"a","delta":"{\"input\":\"patch\"}"}`),
+		}, patchEvent("response.output_item.done", 0, patchItem("function_call", "a", "ca", "apply_patch", `{"input":"patch extended"}`))},
 		{"invalid-final-only", nil, []byte(`{"type":"response.completed","response":{"output":[{"type":"function_call","name":"apply_patch","arguments":"{}"}]}}`)},
 		{"old-patch-new-type", [][]byte{patchEvent("response.output_item.added", 0, patchItem("function_call", "a", "ca", "apply_patch", ""))}, []byte(`{"type":"response.completed","response":{"output":[{"type":"message","id":"a","content":[]}]}}`)},
 		{"pending-id-evidence", [][]byte{patchEvent("response.output_item.added", 0, patchItem("function_call", "a", "ca", "", ""))}, patchEvent("response.output_item.done", 0, patchItem("function_call", "a", "changed", "apply_patch", `{"input":"p"}`))},

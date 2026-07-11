@@ -32,6 +32,11 @@ func TestHasMeaningfulCodexOutputDelta(t *testing.T) {
 }
 
 func TestIsCodexTerminalEmptyIncomplete(t *testing.T) {
+	interrupted := []byte(`{"type":"response.incomplete","response":{"id":"r1","incomplete_details":{"reason":"interrupted"},"output":[],"usage":{"output_tokens":0}}}`)
+	if IsCodexTerminalEmptyIncomplete(interrupted, 0, false) {
+		t.Fatal("requested interruption should complete the turn successfully")
+	}
+
 	// Case 1: True empty incomplete with explicit numeric 0
 	trueEmpty := []byte(`{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}`)
 	if !IsCodexTerminalEmptyIncomplete(trueEmpty, 0, false) {

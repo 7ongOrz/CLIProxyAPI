@@ -600,7 +600,7 @@ func TestClaudeExecutor_CountTokens_StripsPromptCacheOptions(t *testing.T) {
 	}
 }
 
-func TestClaudeExecutor_CountTokensUpstream_StripsPromptCacheOptions_EvenWithPayloadRule(t *testing.T) {
+func TestClaudeExecutor_CountTokensUpstream_PreservesPromptCachePayloadOverride(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -648,8 +648,8 @@ func TestClaudeExecutor_CountTokensUpstream_StripsPromptCacheOptions_EvenWithPay
 	if len(upstreamResp.Payload) == 0 {
 		t.Fatal("expected non-empty countTokensUpstream payload")
 	}
-	if gjson.GetBytes(seenBody, "prompt_cache_options").Exists() {
-		t.Fatalf("prompt_cache_options should not be forwarded in count_tokens upstream even if injected by payload rule: %s", string(seenBody))
+	if got := gjson.GetBytes(seenBody, "prompt_cache_options.mode").String(); got != "explicit" {
+		t.Fatalf("configured prompt_cache_options.mode = %q, want explicit: %s", got, seenBody)
 	}
 }
 
@@ -1015,5 +1015,32 @@ func TestClaudeExecutor_CountTokensUpstream_OAuthRelocatesAffectedSystemPrompts(
 				t.Fatalf("%s.content.0.text = %q, want caller guidance: %s", messagePath, got, seenBody)
 			}
 		})
+	}
+}
+
+func TestClaudeExecutor_CountTokens_PayloadConditionsSeeCleanedBody(t *testing.T) {
+	cfg := &config.Config{Payload: config.PayloadConfig{
+		Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{
+				Name:  "*",
+				Match: []map[string]any{{"prompt_cache_options.mode": "explicit"}},
+			}},
+			Params: map[string]any{"messages": []any{}},
+		}},
+	}}
+	executor := NewClaudeExecutor(cfg)
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "test-key",
+		"base_url": "https://gateway.example",
+	}}
+	resp, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-5",
+		Payload: []byte(`{"model":"claude-opus-5","prompt_cache_options":{"mode":"explicit"},"messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("CountTokens() error = %v; payload conditions must observe completed option cleanup", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "input_tokens").Int(); got <= 0 {
+		t.Fatalf("input_tokens = %d, want a positive count", got)
 	}
 }

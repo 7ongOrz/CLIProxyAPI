@@ -9,11 +9,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFromAPIKey(t *testing.T) {
@@ -174,6 +176,115 @@ func TestCodexExecutorCacheHelper_ClaudeRejectsBareUserID(t *testing.T) {
 	}
 	if got := httpReq.Header.Get("Session_id"); got != "" {
 		t.Fatalf("bare metadata.user_id must not create Session_id, got %q", got)
+	}
+}
+
+func TestApplyCodexHeadersPreservesWindowAndThreadHeaders(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	ginCtx.Request.Header.Set("X-Codex-Window-Id", "cache-1:2")
+	ginCtx.Request.Header.Set("Thread-Id", "thread-1")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	httpReq := httptest.NewRequest("POST", "https://example.com/responses", nil).WithContext(ctx)
+
+	applyCodexHeaders(httpReq, &cliproxyauth.Auth{Provider: "codex"}, "oauth-token", true, nil)
+
+	if got := httpReq.Header.Get("X-Codex-Window-Id"); got != "cache-1:2" {
+		t.Fatalf("X-Codex-Window-Id = %q, want cache-1:2", got)
+	}
+	if got := httpReq.Header.Get("Thread-Id"); got != "thread-1" {
+		t.Fatalf("Thread-Id = %q, want thread-1", got)
+	}
+}
+
+func TestCodexRequestMetadataPreservedWithCloaking(t *testing.T) {
+	request := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","prompt_cache_key":"client-cache","client_metadata":{"session_id":"client-session","thread_id":"client-thread","turn_id":"client-turn","x-codex-installation-id":"client-installation","x-codex-window-id":"client-thread:3","x-codex-parent-thread-id":"parent-thread","x-codex-turn-metadata":"{\"turn_id\":\"client-turn\",\"window_id\":\"client-thread:3\"}"},"input":[{"type":"message","role":"user","turn_id":"client-turn","content":"hello"}]}`),
+	}
+	credential := &cliproxyauth.Auth{ID: "metadata-account", Provider: "codex"}
+	for _, tc := range []struct {
+		name          string
+		disabled      bool
+		subagent      string
+		headerOnly    bool
+		wantSessionID string
+	}{
+		{name: "official_cloaking", wantSessionID: "client-cache"},
+		{name: "client_headers", disabled: true, wantSessionID: "client-cache"},
+		{name: "subagent", subagent: "collab_spawn", wantSessionID: "client-session"},
+		{name: "internal_agent", subagent: "compact", wantSessionID: "client-session"},
+		{name: "subagent_header", subagent: "collab_spawn", headerOnly: true, wantSessionID: "client-session"},
+	} {
+		for _, transport := range []string{"http", "websocket"} {
+			t.Run(tc.name+"/"+transport, func(t *testing.T) {
+				cfg := &config.Config{
+					SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
+					Routing:   config.RoutingConfig{SessionAffinity: true},
+					Codex:     config.CodexConfig{DisableCodexCloaking: tc.disabled},
+				}
+				clientHeaders := http.Header{"User-Agent": {"client-agent"}, "Originator": {"client-origin"}}
+				clientHeaders.Set("Session-Id", tc.wantSessionID)
+				request := request
+				if tc.subagent != "" {
+					if tc.headerOnly {
+						clientHeaders.Set("X-OpenAI-Subagent", tc.subagent)
+					} else {
+						var err error
+						request.Payload, err = sjson.SetBytes(request.Payload, "client_metadata.x-openai-subagent", tc.subagent)
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				ctx := context.Background()
+				var body []byte
+				var headers http.Header
+				if transport == "http" {
+					executor := NewCodexExecutor(cfg)
+					req, upstreamBody, err := executor.cacheHelper(ctx, sdktranslator.FormatCodex, "https://example.com/responses", request, request.Payload, clientHeaders)
+					if err != nil {
+						t.Fatal(err)
+					}
+					applyCodexHeaders(req, credential, "token", true, cfg, clientHeaders)
+					finalizeCodexHTTPHeaders(req.Header, upstreamBody, request.Model)
+					body, headers = upstreamBody, req.Header
+				} else {
+					executor := NewCodexWebsocketsExecutor(cfg)
+					prepared, err := executor.prepareCodexWebsocketStream(ctx, credential, request, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, Headers: clientHeaders})
+					if err != nil {
+						t.Fatal(err)
+					}
+					body, headers = prepared.clientBody, prepared.wsHeaders
+				}
+				for _, path := range []string{"prompt_cache_key", "client_metadata", "input.0.turn_id"} {
+					if got, want := gjson.GetBytes(body, path).Raw, gjson.GetBytes(request.Payload, path).Raw; got != want {
+						t.Errorf("%s = %s, want %s", path, got, want)
+					}
+				}
+				wantHeaders := map[string]string{
+					"Session-Id":               tc.wantSessionID,
+					"Thread-Id":                "client-thread",
+					"X-Client-Request-Id":      "client-thread",
+					"X-Codex-Window-Id":        "client-thread:3",
+					"X-Codex-Parent-Thread-Id": "parent-thread",
+					"X-Codex-Turn-Metadata":    `{"turn_id":"client-turn","window_id":"client-thread:3"}`,
+					"User-Agent":               codexUserAgent,
+					"Originator":               codexOriginator,
+				}
+				if tc.disabled {
+					wantHeaders["User-Agent"] = "client-agent"
+					wantHeaders["Originator"] = "client-origin"
+				}
+				for name, want := range wantHeaders {
+					if got := headers.Get(name); got != want {
+						t.Errorf("%s = %q, want %q", name, got, want)
+					}
+				}
+			})
+		}
 	}
 }
 

@@ -35,6 +35,11 @@ type toolCallStreamState struct {
 	Done             bool
 }
 
+type codexTextPartKey struct {
+	outputIndex  int64
+	contentIndex int64
+}
+
 // ConvertCliToOpenAIParams holds parameters for response conversion.
 type ConvertCliToOpenAIParams struct {
 	ServiceTier           string
@@ -45,6 +50,7 @@ type ConvertCliToOpenAIParams struct {
 	toolCallStates        map[string]*toolCallStreamState
 	currentToolCall       *toolCallStreamState
 	citationKeys          map[string]struct{}
+	textPartOffsets       map[codexTextPartKey]int64
 	emittedTextRunes      int64
 	LastImageHashByItemID map[string][32]byte
 }
@@ -72,6 +78,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			FunctionCallIndex:     -1,
 			toolCallStates:        make(map[string]*toolCallStreamState),
 			citationKeys:          make(map[string]struct{}),
+			textPartOffsets:       make(map[codexTextPartKey]int64),
 			LastImageHashByItemID: make(map[string][32]byte),
 		}
 	}
@@ -153,13 +160,15 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", "\n\n")
 	} else if dataType == "response.output_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
+			p.textPartOffset(rootResult.Get("output_index").Int(), rootResult.Get("content_index").Int())
 			delta := deltaResult.String()
 			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 			template, _ = sjson.SetBytes(template, "choices.0.delta.content", delta)
 			p.emittedTextRunes += int64(utf8.RuneCountInString(delta))
 		}
 	} else if dataType == "response.output_text.annotation.added" || dataType == "response.output_text.done" || dataType == "response.content_part.done" {
-		citations := buildCodexURLCitations(codexAnnotationsFromEvent(rootResult), p.emittedTextRunes, p.citationKeys)
+		offset := p.textPartOffset(rootResult.Get("output_index").Int(), rootResult.Get("content_index").Int())
+		citations := buildCodexURLCitations(codexAnnotationsFromEvent(rootResult), offset, p.citationKeys)
 		if len(citations) == 0 {
 			return [][]byte{}
 		}
@@ -300,7 +309,11 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			return [][]byte{}
 		}
 		if itemResult.Get("type").String() == "message" {
-			citations := buildCodexURLCitations(codexAnnotationsFromEvent(rootResult), p.emittedTextRunes, p.citationKeys)
+			var citations [][]byte
+			for contentIndex, part := range itemResult.Get("content").Array() {
+				offset := p.textPartOffset(rootResult.Get("output_index").Int(), int64(contentIndex))
+				citations = append(citations, buildCodexURLCitations(codexAnnotationResults(part.Get("annotations")), offset, p.citationKeys)...)
+			}
 			if len(citations) == 0 {
 				return [][]byte{}
 			}
@@ -635,6 +648,16 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 	return template
 }
 
+// Responses citation indices are local to each part; Chat Completions joins the text.
+func (p *ConvertCliToOpenAIParams) textPartOffset(outputIndex, contentIndex int64) int64 {
+	key := codexTextPartKey{outputIndex: outputIndex, contentIndex: contentIndex}
+	if offset, exists := p.textPartOffsets[key]; exists {
+		return offset
+	}
+	p.textPartOffsets[key] = p.emittedTextRunes
+	return p.emittedTextRunes
+}
+
 func codexAnnotationResults(value gjson.Result) []gjson.Result {
 	if !value.Exists() {
 		return nil
@@ -655,15 +678,6 @@ func codexAnnotationsFromEvent(event gjson.Result) []gjson.Result {
 	for _, path := range []string{"annotation", "annotations", "part.annotations"} {
 		annotations = append(annotations, codexAnnotationResults(event.Get(path))...)
 	}
-	item := event.Get("item")
-	if item.Exists() {
-		annotations = append(annotations, codexAnnotationResults(item.Get("annotations"))...)
-		if content := item.Get("content"); content.IsArray() {
-			for _, contentItem := range content.Array() {
-				annotations = append(annotations, codexAnnotationResults(contentItem.Get("annotations"))...)
-			}
-		}
-	}
 	return annotations
 }
 
@@ -683,35 +697,17 @@ func buildCodexURLCitations(annotations []gjson.Result, runeOffset int64, seen m
 		}
 
 		url := annotation.Get("url").String()
-		key := url + "\x00" + strconv.FormatInt(rawStartIndex, 10)
-		if url == "" {
-			key = annotation.Get("id").String() + "\x00" + strconv.FormatInt(rawStartIndex, 10)
+		key := url + "\x00" + strconv.FormatInt(startIndex, 10)
+		if _, exists := seen[key]; exists {
+			continue
 		}
-		keys := []string{key}
-		if id := annotation.Get("id").String(); id != "" {
-			keys = append(keys, "id\x00"+id)
-		}
-		if seen != nil {
-			duplicate := false
-			for _, key := range keys {
-				if _, exists := seen[key]; exists {
-					duplicate = true
-					break
-				}
-			}
-			if duplicate {
-				continue
-			}
-			for _, key := range keys {
-				seen[key] = struct{}{}
-			}
-		}
+		seen[key] = struct{}{}
 
-		citation := []byte(`{"type":"url_citation","url":"","title":"","start_index":0,"end_index":0}`)
-		citation, _ = sjson.SetBytes(citation, "url", url)
-		citation, _ = sjson.SetBytes(citation, "title", annotation.Get("title").String())
-		citation, _ = sjson.SetBytes(citation, "start_index", startIndex)
-		citation, _ = sjson.SetBytes(citation, "end_index", endIndex)
+		citation := []byte(`{"type":"url_citation","url_citation":{"url":"","title":"","start_index":0,"end_index":0}}`)
+		citation, _ = sjson.SetBytes(citation, "url_citation.url", url)
+		citation, _ = sjson.SetBytes(citation, "url_citation.title", annotation.Get("title").String())
+		citation, _ = sjson.SetBytes(citation, "url_citation.start_index", startIndex)
+		citation, _ = sjson.SetBytes(citation, "url_citation.end_index", endIndex)
 		citations = append(citations, citation)
 	}
 	return citations

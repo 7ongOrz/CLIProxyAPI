@@ -10,6 +10,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/wsrelay"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -199,5 +200,75 @@ func TestClaudePayloadConditionsObserveBuiltinThinkingRemoval(t *testing.T) {
 		if gjson.GetBytes(body, "metadata").Exists() || !gjson.GetBytes(body, "system").Exists() {
 			t.Fatalf("filters matched pre-builtin conditions (stream=%v): %s", stream, body)
 		}
+	}
+}
+
+func TestClaudePromptCachePayloadOverrideSurvivesCleanup(t *testing.T) {
+	cfg := &config.Config{Payload: config.PayloadConfig{
+		Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{Name: "*"}},
+			Params: map[string]any{"prompt_cache_options.mode": "explicit"},
+		}},
+	}}
+	for _, tc := range []struct {
+		name   string
+		stream bool
+	}{{name: "execute"}, {name: "stream", stream: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := executeClaudeContextManagementRequest(t, cfg, []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hello"}]}`), tc.stream)
+			if got := gjson.GetBytes(body, "prompt_cache_options.mode").String(); got != "explicit" {
+				t.Fatalf("configured prompt_cache_options.mode = %q, want explicit: %s", got, body)
+			}
+		})
+	}
+}
+
+func TestClaudeCountTokensUsesFinalPayloadBetas(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload config.PayloadConfig
+		beta    string
+	}{
+		{
+			name: "override",
+			payload: config.PayloadConfig{Override: []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{Name: "*"}},
+				Params: map[string]any{"betas": []string{"configured-beta"}},
+			}}},
+			beta: "configured-beta",
+		},
+		{
+			name: "filter",
+			payload: config.PayloadConfig{Filter: []config.PayloadFilterRule{{
+				Models: []config.PayloadModelRule{{Name: "*"}},
+				Params: []string{"betas"},
+			}}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := &midSystemUpstream{}
+			executor := NewClaudeExecutor(&config.Config{Payload: tc.payload})
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test-key", "cloak_mode": "never"}}
+			payload := []byte(`{"model":"claude-sonnet-5","betas":["original-beta"],"messages":[{"role":"user","content":"hello"}]}`)
+			_, errCount := executor.CountTokens(upstream.context(t, nil), auth, core.Request{
+				Model: "claude-sonnet-5", Payload: payload,
+			}, core.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload})
+			if errCount != nil {
+				t.Fatalf("count tokens: %v", errCount)
+			}
+			if !upstream.called {
+				t.Fatal("expected a native count_tokens request")
+			}
+			want := claudeTokenCountingBeta
+			if tc.beta != "" {
+				want = tc.beta + "," + want
+			}
+			if got := helps.HeaderValueCaseInsensitive(upstream.headers, "Anthropic-Beta"); got != want {
+				t.Errorf("Anthropic-Beta = %q, want %q", got, want)
+			}
+			if gjson.GetBytes(upstream.body, "betas").Exists() {
+				t.Errorf("betas belongs in the header: %s", upstream.body)
+			}
+		})
 	}
 }

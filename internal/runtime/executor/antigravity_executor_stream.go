@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -258,17 +259,6 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if replayAccumulator != nil {
-				replayAccumulator.ObserveSSELine(line)
-			}
-
-			// Capture accounting before the client-facing filter renames usage.
-			streamUsage.Observe(helps.ParseAntigravityStreamUsage(line))
-
-			// Filter usage metadata for all models
-			// Only retain usage statistics in the terminal chunk
-			line = helps.FilterSSEUsageMetadata(line)
-
 			payload := helps.JSONPayload(line)
 			if len(pendingJSON) > 0 {
 				trimmedLine := bytes.TrimSpace(line)
@@ -279,10 +269,12 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 					pendingJSON = append(pendingJSON, '\n')
 					pendingJSON = append(pendingJSON, trimmedLine...)
 				}
-				if !gjson.ValidBytes(pendingJSON) {
+				var compact bytes.Buffer
+				if errCompact := json.Compact(&compact, pendingJSON); errCompact != nil {
 					continue
 				}
-				payload = pendingJSON
+				line = append([]byte("data: "), compact.Bytes()...)
+				payload = helps.JSONPayload(line)
 				pendingJSON = nil
 			} else if payload != nil && !gjson.ValidBytes(payload) {
 				pendingJSON = append([]byte(nil), payload...)
@@ -291,6 +283,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 			if payload == nil {
 				continue
 			}
+			// Process complete events for replay, accounting, and translation.
+			if replayAccumulator != nil {
+				replayAccumulator.ObserveSSELine(line)
+			}
+			// Capture accounting before the client-facing filter renames usage.
+			streamUsage.Observe(helps.ParseAntigravityStreamUsage(line))
+			payload = helps.JSONPayload(helps.FilterSSEUsageMetadata(line))
 			if errorResult := gjson.GetBytes(payload, "error"); errorResult.Exists() {
 				statusCode := int(errorResult.Get("code").Int())
 				if statusCode < http.StatusBadRequest || statusCode > 599 {

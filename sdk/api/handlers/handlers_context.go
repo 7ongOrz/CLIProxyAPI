@@ -129,6 +129,12 @@ func PreparedStreamProviderRoute(ctx context.Context) (string, string) {
 	return strings.TrimSpace(decision.Provider), strings.TrimSpace(decision.Model)
 }
 
+// PreparedStreamModelRouteProvider returns the built-in provider selected by PrepareStreamModelRoute.
+func PreparedStreamModelRouteProvider(ctx context.Context) string {
+	provider, _ := PreparedStreamProviderRoute(ctx)
+	return strings.ToLower(provider)
+}
+
 // WithExecutionSessionID returns a child context tagged with a long-lived execution session ID.
 func WithExecutionSessionID(ctx context.Context, sessionID string) context.Context {
 	sessionID = strings.TrimSpace(sessionID)

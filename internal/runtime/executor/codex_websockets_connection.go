@@ -13,7 +13,6 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
@@ -62,7 +61,9 @@ func writeWebsocketPayloadMessage(provider string, sess *codexWebsocketSession, 
 	start := time.Now()
 	log.Debugf("%s websockets: write payload started session=%s session_object=%s bytes=%d", provider, sessionID, sessionKind, payloadBytes)
 	var errSend error
-	if sess != nil {
+	if sess != nil && provider == "codex" {
+		errSend = sess.writeCodexMessage(conn, websocket.TextMessage, payload)
+	} else if sess != nil {
 		errSend = sess.writeMessage(conn, websocket.TextMessage, payload)
 	} else if conn == nil {
 		errSend = fmt.Errorf("%s websockets executor: websocket conn is nil", provider)
@@ -123,14 +124,6 @@ func mapCodexWebsocketReadError(err error) error {
 	return err
 }
 
-func normalizeCodexWebsocketParallelToolCalls(body []byte, headers http.Header) []byte {
-	if !util.IsCodexResponsesLiteRequest(body, headers) {
-		return body
-	}
-	body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
-	return body
-}
-
 func buildCodexWebsocketRequestBody(body []byte) []byte {
 	return frameCodexWebsocketRequestBody(helps.SanitizeCodexInputItemIDs(body))
 }
@@ -162,10 +155,56 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 	if readCh == nil {
 		return 0, nil, fmt.Errorf("codex websockets executor: session read channel is nil")
 	}
+	readBuffered := func() (int, []byte, error, bool) {
+		for {
+			select {
+			case ev, ok := <-readCh:
+				if !ok {
+					return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed"), true
+				}
+				if ev.conn != conn {
+					continue
+				}
+				if ev.err != nil {
+					if terminalErr := sess.sessionError(); terminalErr != nil {
+						return 0, nil, terminalErr, true
+					}
+					return 0, nil, ev.err, true
+				}
+				return ev.msgType, ev.payload, nil, true
+			default:
+				return 0, nil, nil, false
+			}
+		}
+	}
+	activeDone, active := sess.activeDoneFor(readCh)
+	if !active {
+		if msgType, payload, errRead, ok := readBuffered(); ok {
+			return msgType, payload, errRead
+		}
+		if errRead := sess.closedActiveErrorFor(readCh); errRead != nil {
+			return 0, nil, errRead
+		}
+		if terminalErr := sess.sessionError(); terminalErr != nil {
+			return 0, nil, terminalErr
+		}
+		return 0, nil, fmt.Errorf("codex websockets executor: session read channel inactive")
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return 0, nil, ctx.Err()
+		case <-activeDone:
+			if msgType, payload, errRead, ok := readBuffered(); ok {
+				return msgType, payload, errRead
+			}
+			if errRead := sess.closedActiveErrorFor(readCh); errRead != nil {
+				return 0, nil, errRead
+			}
+			if terminalErr := sess.sessionError(); terminalErr != nil {
+				return 0, nil, terminalErr
+			}
+			return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed")
 		case ev, ok := <-readCh:
 			if !ok {
 				return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed")
@@ -174,6 +213,9 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 				continue
 			}
 			if ev.err != nil {
+				if terminalErr := sess.sessionError(); terminalErr != nil {
+					return 0, nil, terminalErr
+				}
 				return 0, nil, ev.err
 			}
 			return ev.msgType, ev.payload, nil

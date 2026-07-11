@@ -90,8 +90,17 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		responseFilter := newXAIInternalXSearchResponseFilter(prepared.filterInternalXSearch, prepared.clientDeclaredTools)
 		namespaceRestorer := newXAINamespaceRestorer(prepared.namespaceTools)
 		var pendingEventLine []byte
-		emitTranslatedLine := func(translatedLine []byte) bool {
-			lines, errBridge := prepared.applyPatch.Stream(translatedLine)
+		emitTranslatedLineWithResult := func(translatedLine []byte, resultErr error) bool {
+			var lines [][]byte
+			var errBridge error
+			for _, sourceLine := range bytes.SplitAfter(translatedLine, []byte("\n")) {
+				converted, errTransform := prepared.applyPatch.Stream(sourceLine)
+				lines = append(lines, converted...)
+				if errTransform != nil {
+					errBridge = errTransform
+					break
+				}
+			}
 			if errBridge != nil {
 				streamUsage.PublishFailure(ctx, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 			}
@@ -117,6 +126,21 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 				chunks = append(chunks, helps.TranslateStreamWithClaudeInputTokens(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, line, &param, claudeInputTokens)...)
 			}
 			helps.RecordApplyPatchStreamFailureWithUsage(ctx, param, reporter, &streamUsage, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
+			if resultErr != nil {
+				var chunk cliproxyexecutor.StreamChunk
+				if len(chunks) == 0 {
+					chunk.Err = resultErr
+				} else {
+					chunk.Payload = bytes.Join(chunks, nil)
+					chunk.ResultErr = resultErr
+				}
+				select {
+				case out <- chunk:
+					return true
+				case <-ctx.Done():
+					return false
+				}
+			}
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -137,6 +161,9 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 				return false
 			}
 			return true
+		}
+		emitTranslatedLine := func(translatedLine []byte) bool {
+			return emitTranslatedLineWithResult(translatedLine, nil)
 		}
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -168,23 +195,46 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 					}
 					reporter.ObserveResponseModel(eventData)
 					normalizedEventName := gjson.GetBytes(eventData, "type").String()
+					terminalErr, terminalFailure := parseXAIResponseTerminalError(eventData)
+					if terminalFailure {
+						helps.RecordAPIResponseError(ctx, e.cfg, terminalErr)
+						reporter.PublishFailure(ctx, terminalErr)
+					}
 					if normalizedEventName == "response.completed" || normalizedEventName == "response.incomplete" {
 						if detail, ok := helps.ParseCodexUsage(eventData); ok {
 							streamUsage.Observe(detail, true)
 						}
 					}
 
+					var eventLine []byte
 					if hasPendingEventLine {
-						eventLine := []byte("event: " + normalizedEventName)
+						eventLine = []byte("event: " + normalizedEventName)
 						if i == 0 {
 							eventLine = xaiNormalizeReasoningSummaryEventLine(pendingEventLine, normalizedEventName)
 							pendingEventLine = nil
 						}
-						if !emitTranslatedLine(eventLine) {
+					}
+					dataLine := append([]byte("data: "), eventData...)
+					if terminalFailure {
+						frame := make([]byte, 0, len(eventLine)+len(dataLine)+3)
+						if len(eventLine) > 0 {
+							frame = append(frame, eventLine...)
+							frame = append(frame, '\n')
+						}
+						frame = append(frame, dataLine...)
+						frame = append(frame, '\n', '\n')
+						if !emitTranslatedLineWithResult(frame, terminalErr) {
 							return
 						}
+						return
 					}
-					if !emitTranslatedLine(append([]byte("data: "), eventData...)) {
+					if len(eventLine) > 0 && !emitTranslatedLine(eventLine) {
+						return
+					}
+					if !emitTranslatedLine(dataLine) {
+						return
+					}
+					if normalizedEventName == "response.completed" || normalizedEventName == "response.incomplete" {
 						return
 					}
 				}

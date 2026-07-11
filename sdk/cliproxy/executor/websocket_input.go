@@ -27,6 +27,23 @@ func WebsocketInputFromContext(ctx context.Context) <-chan WebsocketInput {
 	return input
 }
 
+type websocketInterruptAckKey struct{}
+
+// WithWebsocketInterruptAckHandler delivers control acknowledgements for the
+// downstream connection, including those received after a response has ended.
+// The handler owns downstream write failures and connection cancellation.
+func WithWebsocketInterruptAckHandler(ctx context.Context, handler func([]byte)) context.Context {
+	return context.WithValue(ctx, websocketInterruptAckKey{}, handler)
+}
+
+func WebsocketInterruptAckHandler(ctx context.Context) func([]byte) {
+	if ctx == nil {
+		return nil
+	}
+	handler, _ := ctx.Value(websocketInterruptAckKey{}).(func([]byte))
+	return handler
+}
+
 // WithWebsocketAuthCheck supplies the live account-state check for a bound
 // connection. It may reject further frames but never select another account.
 type websocketAuthCheckKey struct{}

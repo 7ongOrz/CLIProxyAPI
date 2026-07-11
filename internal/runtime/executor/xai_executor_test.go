@@ -799,6 +799,59 @@ func TestXAIExecutorExecuteStreamFiltersInternalXSearchCalls(t *testing.T) {
 	}
 }
 
+func TestXAIExecutorExecuteStreamEndsAtResponseCompleted(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer func() {
+		close(release)
+		server.Close()
+	}()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+	result, err := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	sawCompleted := false
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				if !sawCompleted {
+					t.Fatal("stream ended without response.completed")
+				}
+				return
+			}
+			if chunk.Err != nil {
+				t.Fatalf("stream chunk error = %v", chunk.Err)
+			}
+			sawCompleted = sawCompleted || strings.Contains(string(chunk.Payload), `"type":"response.completed"`)
+		case <-timer.C:
+			t.Fatal("stream did not end after response.completed")
+		}
+	}
+}
+
 func TestXAIExecutorExecuteFiltersInternalXSearchCalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -871,12 +924,18 @@ func TestXAIExecutorExecuteAcceptsResponseIncomplete(t *testing.T) {
 }
 
 func TestXAIExecutorExecuteStreamAcceptsResponseIncomplete(t *testing.T) {
+	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]}}\n\n")
 		_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":1,\"total_tokens\":9}}}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-release
 	}))
 	defer server.Close()
+	defer close(release)
 
 	exec := NewXAIExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
@@ -895,17 +954,36 @@ func TestXAIExecutorExecuteStreamAcceptsResponseIncomplete(t *testing.T) {
 		t.Fatalf("ExecuteStream() error = %v", err)
 	}
 
-	var stream bytes.Buffer
-	for chunk := range result.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("stream chunk error = %v", chunk.Err)
+	type streamResult struct {
+		payload string
+		err     error
+	}
+	streamDone := make(chan streamResult, 1)
+	go func() {
+		var stream bytes.Buffer
+		var streamErr error
+		for chunk := range result.Chunks {
+			if chunk.Err != nil || chunk.ResultErr != nil {
+				streamErr = errors.Join(chunk.Err, chunk.ResultErr)
+			}
+			stream.Write(chunk.Payload)
+			stream.WriteByte('\n')
 		}
-		stream.Write(chunk.Payload)
-		stream.WriteByte('\n')
+		streamDone <- streamResult{payload: stream.String(), err: streamErr}
+	}()
+
+	var collected streamResult
+	select {
+	case collected = <-streamDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream remained open after response.incomplete")
+	}
+	if collected.err != nil {
+		t.Fatalf("stream chunk error = %v", collected.err)
 	}
 
 	var incomplete gjson.Result
-	for _, line := range strings.Split(stream.String(), "\n") {
+	for _, line := range strings.Split(collected.payload, "\n") {
 		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if !gjson.Valid(line) {
 			continue
@@ -915,13 +993,106 @@ func TestXAIExecutorExecuteStreamAcceptsResponseIncomplete(t *testing.T) {
 		}
 	}
 	if !incomplete.Exists() {
-		t.Fatalf("no response.incomplete chunk forwarded: %s", stream.String())
+		t.Fatalf("no response.incomplete chunk forwarded: %s", collected.payload)
 	}
 	if got := incomplete.Get("response.output.#").Int(); got != 1 {
 		t.Fatalf("incomplete output length = %d, want 1; event=%s", got, incomplete.Raw)
 	}
 	if got := incomplete.Get("response.usage.total_tokens").Int(); got != 9 {
 		t.Fatalf("incomplete usage total_tokens = %d, want 9; event=%s", got, incomplete.Raw)
+	}
+}
+
+func TestXAIExecutorExecuteReportsTerminalErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		payload     string
+		wantStatus  int
+		wantMessage string
+	}{
+		{
+			name:        "response failed",
+			payload:     `{"type":"response.failed","response":{"status":"failed","error":{"type":"authentication_error","code":"invalid_api_key","message":"invalid token"}}}`,
+			wantStatus:  http.StatusUnauthorized,
+			wantMessage: "invalid token",
+		},
+		{
+			name:        "error event",
+			payload:     `{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"rate limited"}}`,
+			wantStatus:  http.StatusTooManyRequests,
+			wantMessage: "rate limited",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", gjson.Get(tt.payload, "type").String(), tt.payload)
+			}))
+			defer server.Close()
+
+			exec := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "xai-token"}}
+			_, errExecute := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "grok-4.5",
+				Payload: []byte(`{"model":"grok-4.5","input":"hi"}`),
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+			if errExecute == nil || statusCodeFromTestError(t, errExecute) != tt.wantStatus {
+				t.Fatalf("Execute() error = %T %v, want status %d", errExecute, errExecute, tt.wantStatus)
+			}
+			if !strings.Contains(errExecute.Error(), tt.wantMessage) {
+				t.Fatalf("Execute() error lost upstream message: %v", errExecute)
+			}
+		})
+	}
+}
+
+func TestXAIExecutorExecuteStreamReportsResponseFailedBeforeEOF(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"authentication_error\",\"code\":\"invalid_api_key\",\"message\":\"invalid token\"}}}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "xai-token"}}
+	result, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":"hi"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse, Stream: true})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+
+	streamDone := make(chan []cliproxyexecutor.StreamChunk, 1)
+	go func() {
+		var chunks []cliproxyexecutor.StreamChunk
+		for chunk := range result.Chunks {
+			chunks = append(chunks, chunk)
+		}
+		streamDone <- chunks
+	}()
+	var chunks []cliproxyexecutor.StreamChunk
+	select {
+	case chunks = <-streamDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream remained open after response.failed")
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("terminal chunks = %d, want one complete SSE frame", len(chunks))
+	}
+	if !bytes.Contains(chunks[0].Payload, []byte("event: response.failed\ndata:")) || chunks[0].ResultErr == nil {
+		t.Fatalf("terminal chunk = payload:%q result_err:%v", chunks[0].Payload, chunks[0].ResultErr)
+	}
+	if got := statusCodeFromTestError(t, chunks[0].ResultErr); got != http.StatusUnauthorized {
+		t.Fatalf("terminal status = %d, want %d", got, http.StatusUnauthorized)
 	}
 }
 

@@ -1078,6 +1078,16 @@ func xaiStatusErr(code int, body []byte) statusErr {
 	return err
 }
 
+func parseXAIResponseTerminalError(payload []byte) (error, bool) {
+	if gjson.GetBytes(payload, "type").String() == "response.failed" {
+		streamErr, body, ok := codexTerminalFailureErr(payload)
+		if ok {
+			return xaiStatusErr(streamErr.StatusCode(), body), true
+		}
+	}
+	return parseXAIWebsocketError(payload)
+}
+
 // isXAIBadCredentialsBody reports whether an xAI error body indicates an
 // invalidated/unusable OAuth access token rather than a generic permission or
 // payment failure. HTTP and websocket payloads both use this helper, so nested

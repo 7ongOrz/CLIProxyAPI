@@ -84,8 +84,23 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		responseFilter := newXAIInternalXSearchResponseFilter(prepared.filterInternalXSearch, prepared.clientDeclaredTools)
 		namespaceRestorer := newXAINamespaceRestorer(prepared.namespaceTools)
 		var pendingEventLine []byte
-		emitTranslatedLine := func(translatedLine []byte) bool {
+		emitTranslatedLineWithResult := func(translatedLine []byte, resultErr error) bool {
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, translatedLine, &param, claudeInputTokens)
+			if resultErr != nil {
+				var chunk cliproxyexecutor.StreamChunk
+				if len(chunks) == 0 {
+					chunk.Err = resultErr
+				} else {
+					chunk.Payload = bytes.Join(chunks, nil)
+					chunk.ResultErr = resultErr
+				}
+				select {
+				case out <- chunk:
+					return true
+				case <-ctx.Done():
+					return false
+				}
+			}
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -94,6 +109,9 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 				}
 			}
 			return true
+		}
+		emitTranslatedLine := func(translatedLine []byte) bool {
+			return emitTranslatedLineWithResult(translatedLine, nil)
 		}
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -120,6 +138,11 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						continue
 					}
 					normalizedEventName := gjson.GetBytes(eventData, "type").String()
+					terminalErr, terminalFailure := parseXAIResponseTerminalError(eventData)
+					if terminalFailure {
+						helps.RecordAPIResponseError(ctx, e.cfg, terminalErr)
+						reporter.PublishFailure(ctx, terminalErr)
+					}
 					switch normalizedEventName {
 					case "response.output_item.done":
 						xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
@@ -137,17 +160,35 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						normalizedEventName = gjson.GetBytes(eventData, "type").String()
 					}
 
+					var eventLine []byte
 					if hasPendingEventLine {
-						eventLine := []byte("event: " + normalizedEventName)
+						eventLine = []byte("event: " + normalizedEventName)
 						if i == 0 {
 							eventLine = xaiNormalizeReasoningSummaryEventLine(pendingEventLine, normalizedEventName)
 							pendingEventLine = nil
 						}
-						if !emitTranslatedLine(eventLine) {
+					}
+					dataLine := append([]byte("data: "), eventData...)
+					if terminalFailure {
+						frame := make([]byte, 0, len(eventLine)+len(dataLine)+3)
+						if len(eventLine) > 0 {
+							frame = append(frame, eventLine...)
+							frame = append(frame, '\n')
+						}
+						frame = append(frame, dataLine...)
+						frame = append(frame, '\n', '\n')
+						if !emitTranslatedLineWithResult(frame, terminalErr) {
 							return
 						}
+						return
 					}
-					if !emitTranslatedLine(append([]byte("data: "), eventData...)) {
+					if len(eventLine) > 0 && !emitTranslatedLine(eventLine) {
+						return
+					}
+					if !emitTranslatedLine(dataLine) {
+						return
+					}
+					if normalizedEventName == "response.completed" || normalizedEventName == "response.incomplete" {
 						return
 					}
 				}

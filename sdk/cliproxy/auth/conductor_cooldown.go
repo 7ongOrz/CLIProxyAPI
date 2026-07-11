@@ -753,6 +753,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 	}
+	if !result.Success && statusCodeFromResult(result.Error) == http.StatusUpgradeRequired {
+		m.recordAvailabilityNeutralResult(ctx, result)
+		return
+	}
 	modelKey := canonicalModelKey(result.Model)
 
 	var authSnapshot *Auth

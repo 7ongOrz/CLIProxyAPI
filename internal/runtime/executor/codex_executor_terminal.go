@@ -14,6 +14,16 @@ import (
 )
 
 const codexIncompleteStreamMessage = "stream error: stream disconnected before completion: stream closed before response.completed"
+const codexIncompleteImageStreamMessage = "stream error: image stream disconnected before completion"
+
+type codexIdentityStatusErr struct {
+	statusErr
+	clientErr statusErr
+}
+
+func (e codexIdentityStatusErr) ClientError() error {
+	return e.clientErr
+}
 
 type codexIncompleteStreamError struct {
 	statusErr
@@ -23,6 +33,13 @@ func newCodexIncompleteStreamError() codexIncompleteStreamError {
 	return codexIncompleteStreamError{statusErr: statusErr{
 		code: http.StatusRequestTimeout,
 		msg:  codexIncompleteStreamMessage,
+	}}
+}
+
+func newCodexIncompleteImageStreamError() codexIncompleteStreamError {
+	return codexIncompleteStreamError{statusErr: statusErr{
+		code: http.StatusRequestTimeout,
+		msg:  codexIncompleteImageStreamMessage,
 	}}
 }
 
@@ -156,7 +173,7 @@ func codexTerminalStreamErrWithCooling(eventData []byte, modelLevelCooling bool)
 	if !ok || !codexTerminalStreamErrShouldHandle(body) {
 		return statusErr{}, nil, false
 	}
-	return newCodexStatusErrWithCooling(http.StatusBadRequest, body, modelLevelCooling), body, true
+	return newCodexStatusErrWithCooling(codexResponseFailureStatus(eventData, body), body, modelLevelCooling), body, true
 }
 
 func codexTerminalFailureErr(eventData []byte) (statusErr, []byte, bool) {
@@ -164,19 +181,24 @@ func codexTerminalFailureErr(eventData []byte) (statusErr, []byte, bool) {
 }
 
 func codexTerminalFailureErrWithCooling(eventData []byte, modelLevelCooling bool) (statusErr, []byte, bool) {
-	if streamErr, body, ok := codexTerminalStreamErrWithCooling(eventData, modelLevelCooling); ok {
-		return streamErr, body, true
-	}
 	body, ok := codexTerminalFailureBody(eventData)
 	if !ok {
 		return statusErr{}, nil, false
 	}
-	return newCodexStatusErrWithCooling(codexTerminalFailureStatus(body), body, modelLevelCooling), body, true
+	return newCodexStatusErrWithCooling(codexResponseFailureStatus(eventData, body), body, modelLevelCooling), body, true
 }
 
-func codexTerminalFailureStatus(body []byte) int {
-	for _, path := range []string{"error.status_code", "error.status"} {
-		if status := int(gjson.GetBytes(body, path).Int()); status >= 400 && status <= 599 {
+func codexResponseFailureStatus(eventData, body []byte) int {
+	for _, path := range []string{
+		"status",
+		"status_code",
+		"response.status_code",
+		"response.error.status",
+		"response.error.status_code",
+		"error.status",
+		"error.status_code",
+	} {
+		if status := int(gjson.GetBytes(eventData, path).Int()); status >= 400 && status <= 599 {
 			return status
 		}
 	}
@@ -184,17 +206,30 @@ func codexTerminalFailureStatus(body []byte) int {
 	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
 	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
 	switch {
-	case errorCode == "cyber_policy":
-		return http.StatusBadRequest
-	case errorType == "not_found_error", errorCode == "not_found", errorCode == "model_not_found":
-		return http.StatusNotFound
+	case isCodexUsageLimitError(body),
+		isCodexModelCapacityError(body),
+		errorType == "rate_limit_error",
+		errorCode == "rate_limit_exceeded",
+		errorCode == "insufficient_quota",
+		errorCode == "usage_not_included":
+		return http.StatusTooManyRequests
 	case errorType == "authentication_error", errorCode == "invalid_api_key", errorCode == "unauthorized":
 		return http.StatusUnauthorized
 	case errorType == "permission_error", errorCode == "forbidden", errorCode == "permission_denied":
 		return http.StatusForbidden
-	case errorType == "rate_limit_error", errorCode == "rate_limit_exceeded":
-		return http.StatusTooManyRequests
-	case errorType == "invalid_request_error", errorType == "bad_request_error":
+	case errorType == "not_found_error", errorCode == "not_found", errorCode == "model_not_found":
+		return http.StatusNotFound
+	case errorType == "invalid_request_error",
+		errorType == "bad_request_error",
+		errorCode == "invalid_request_error",
+		errorCode == "previous_response_not_found",
+		errorCode == "context_length_exceeded",
+		errorCode == "context_too_large",
+		errorCode == "invalid_prompt",
+		errorCode == "bio_policy",
+		errorCode == "cyber_policy",
+		errorCode == "misalignment_policy_violation",
+		codexTerminalStreamErrShouldHandle(body):
 		return http.StatusBadRequest
 	default:
 		return http.StatusBadGateway
@@ -326,6 +361,16 @@ func newCodexStatusErrWithCooling(statusCode int, body []byte, modelLevelCooling
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func withCodexIdentityClientError(err statusErr, state codexIdentityConfuseState) error {
+	clientBody := applyCodexIdentityExposeResponsePayload([]byte(err.msg), state)
+	if bytes.Equal(clientBody, []byte(err.msg)) {
+		return err
+	}
+	clientErr := err
+	clientErr.msg = string(clientBody)
+	return codexIdentityStatusErr{statusErr: err, clientErr: clientErr}
 }
 
 func classifyCodexStatusError(statusCode int, body []byte) []byte {
@@ -471,7 +516,7 @@ func observeCodexTokenEvent(reporter *helps.UsageReporter, payload []byte) {
 
 // newCodexBootstrapOverloadErr reports a buffered overload rejection with its real status.
 //
-// The status is deliberately produced here instead of in codexTerminalFailureStatus: that mapping
+// The status is deliberately produced here instead of in codexResponseFailureStatus: that mapping
 // is shared with the unbuffered path, where the rejection is delivered in-stream and a status
 // change would alter cooldown classification and retry-after parsing for everyone. Keeping 503
 // scoped to this path means disabling the feature restores the previous behaviour exactly.
@@ -494,7 +539,9 @@ func isCodexOverloadBootstrapFailure(body []byte) bool {
 		errorMessage = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "message").String()))
 	}
 	switch {
-	case errorType == "service_unavailable_error", errorCode == "server_is_overloaded":
+	case errorType == "service_unavailable_error",
+		errorCode == "server_is_overloaded",
+		errorCode == "slow_down":
 		return true
 	case errorType == "rate_limit_error", errorCode == "rate_limit_exceeded":
 		return true

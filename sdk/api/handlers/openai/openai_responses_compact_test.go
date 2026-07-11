@@ -19,9 +19,10 @@ import (
 )
 
 type compactCaptureExecutor struct {
-	alt          string
-	sourceFormat string
-	calls        int
+	alt             string
+	sourceFormat    string
+	calls           int
+	responseHeaders http.Header
 }
 
 func (e *compactCaptureExecutor) Identifier() string { return "test-provider" }
@@ -30,7 +31,7 @@ func (e *compactCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Aut
 	e.calls++
 	e.alt = opts.Alt
 	e.sourceFormat = opts.SourceFormat.String()
-	return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+	return coreexecutor.Response{Payload: []byte(`{"ok":true}`), Headers: e.responseHeaders.Clone()}, nil
 }
 
 func (e *compactCaptureExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
@@ -84,7 +85,7 @@ func TestOpenAIResponsesCompactRejectsStream(t *testing.T) {
 
 func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	executor := &compactCaptureExecutor{}
+	executor := &compactCaptureExecutor{responseHeaders: http.Header{"X-Codex-Turn-State": {"state-1"}}}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
@@ -118,6 +119,9 @@ func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	}
 	if strings.TrimSpace(resp.Body.String()) != `{"ok":true}` {
 		t.Fatalf("body = %s", resp.Body.String())
+	}
+	if got := resp.Header().Get("X-Codex-Turn-State"); got != "state-1" {
+		t.Fatalf("X-Codex-Turn-State = %q, want state-1", got)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,6 +21,51 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestXAIWebsocketRequestDoesNotSetCodexReadDeadline(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErr <- errUpgrade
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _, errRead := conn.ReadMessage()
+		serverErr <- errRead
+	}))
+	defer server.Close()
+
+	var trackedConn *websocketReadDeadlineConn
+	dialer := websocket.Dialer{
+		NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, errDial := (&net.Dialer{}).DialContext(ctx, network, address)
+			if errDial != nil {
+				return nil, errDial
+			}
+			trackedConn = &websocketReadDeadlineConn{Conn: conn}
+			return trackedConn, nil
+		},
+	}
+	conn, _, errDial := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_, deadlineCallsBefore := trackedConn.readDeadline()
+	if errWrite := writeXAIWebsocketMessage(&codexWebsocketSession{}, conn, []byte(`{"type":"response.create"}`)); errWrite != nil {
+		t.Fatalf("write websocket request: %v", errWrite)
+	}
+	_, deadlineCallsAfter := trackedConn.readDeadline()
+	if deadlineCallsAfter != deadlineCallsBefore {
+		t.Fatalf("read deadline calls = %d, want unchanged at %d", deadlineCallsAfter, deadlineCallsBefore)
+	}
+	if errRead := <-serverErr; errRead != nil {
+		t.Fatalf("read websocket request: %v", errRead)
+	}
+}
 
 func TestXAIWebsocketsEnabledForConfigAPIKey(t *testing.T) {
 	auth := &cliproxyauth.Auth{

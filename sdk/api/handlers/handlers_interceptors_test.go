@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -462,6 +463,135 @@ func TestHandlerLifecycleCompletesSuccessfulStreamOnce(t *testing.T) {
 	}
 }
 
+func TestHandlerLifecycleCompletesFailedResultStream(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prelude bool
+	}{
+		{name: "bootstrap"},
+		{name: "midstream", prelude: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := "handler-interceptor-lifecycle-result-error-" + tc.name
+			const internalError = "internal provider identity failed"
+			executor := &interceptorCaptureExecutor{
+				stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+					chunks := make(chan coreexecutor.StreamChunk, 2)
+					if tc.prelude {
+						chunks <- coreexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.created"}` + "\n\n")}
+					}
+					chunks <- coreexecutor.StreamChunk{
+						Payload: []byte(`data: {"type":"response.failed","response":{"error":{"message":"client-visible failure"}}}` + "\n\n"),
+						ResultErr: &coreauth.Error{
+							Code:       "request_scoped",
+							Message:    internalError,
+							HTTPStatus: http.StatusBadRequest,
+						},
+					}
+					close(chunks)
+					return &coreexecutor.StreamResult{Chunks: chunks}, nil
+				},
+			}
+			handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{})
+			completions := make(chan pluginapi.RequestCompletion, 1)
+			handler.SetPluginHost(&handlerInterceptorTestHost{
+				completeRequest: func(_ context.Context, completion pluginapi.RequestCompletion) {
+					completions <- completion
+				},
+			})
+
+			dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+				context.Background(),
+				"openai-response",
+				model,
+				[]byte(`{"model":"`+model+`","stream":true}`),
+				"",
+			)
+			var payload []byte
+			for chunk := range dataChan {
+				payload = append(payload, chunk...)
+			}
+			for errMsg := range errChan {
+				if errMsg != nil {
+					t.Fatalf("unexpected stream error: %+v", errMsg)
+				}
+			}
+			if !strings.Contains(string(payload), "client-visible failure") {
+				t.Fatalf("stream payload = %q, want client-visible failure", payload)
+			}
+			if strings.Contains(string(payload), internalError) {
+				t.Fatalf("stream payload leaked internal result error: %q", payload)
+			}
+
+			select {
+			case completion := <-completions:
+				if completion.Outcome != pluginapi.RequestCompletionFailed ||
+					completion.StatusCode != http.StatusBadRequest ||
+					completion.Error == "" ||
+					strings.Contains(completion.Error, internalError) {
+					t.Fatalf("stream completion = %#v", completion)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("missing failed stream completion")
+			}
+		})
+	}
+}
+
+func TestHandlerLifecycleUsesClientErrorForMidstreamFailure(t *testing.T) {
+	const internalError = "failed for confused upstream identity"
+	const clientError = "failed for original client identity"
+	model := "handler-interceptor-lifecycle-client-error"
+	executor := &interceptorCaptureExecutor{
+		stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 2)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.created"}` + "\n\n")}
+			chunks <- coreexecutor.StreamChunk{Err: modelExecutionClientError{
+				statusCode: http.StatusBadRequest,
+				internal:   internalError,
+				client:     clientError,
+			}}
+			close(chunks)
+			return &coreexecutor.StreamResult{Chunks: chunks}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{})
+	completions := make(chan pluginapi.RequestCompletion, 1)
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		completeRequest: func(_ context.Context, completion pluginapi.RequestCompletion) {
+			completions <- completion
+		},
+	})
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai-response",
+		model,
+		[]byte(`{"model":"`+model+`","stream":true}`),
+		"",
+	)
+	for range dataChan {
+	}
+	var streamErr *interfaces.ErrorMessage
+	for errMsg := range errChan {
+		streamErr = errMsg
+	}
+	if streamErr == nil || streamErr.Error == nil || streamErr.Error.Error() != clientError {
+		t.Fatalf("stream error = %#v, want %q", streamErr, clientError)
+	}
+
+	select {
+	case completion := <-completions:
+		if completion.Outcome != pluginapi.RequestCompletionFailed ||
+			completion.StatusCode != http.StatusBadRequest ||
+			completion.Error != clientError {
+			t.Fatalf("stream completion = %#v", completion)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing failed stream completion")
+	}
+}
+
 func TestHandlerLifecycleCompletesCanceledStream(t *testing.T) {
 	model := "handler-interceptor-lifecycle-canceled-stream"
 	chunks := make(chan coreexecutor.StreamChunk, 1)
@@ -496,6 +626,98 @@ func TestHandlerLifecycleCompletesCanceledStream(t *testing.T) {
 	completion := <-completions
 	if completion.Outcome != pluginapi.RequestCompletionCanceled || completion.StatusCode != 0 {
 		t.Fatalf("completion = %#v", completion)
+	}
+}
+
+func TestHandlerLifecycleCompletesTerminalResponsesStreamBeforeSourceCloses(t *testing.T) {
+	const terminalPayload = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n"
+
+	tests := []struct {
+		name       string
+		newHandler func(*testing.T, <-chan coreexecutor.StreamChunk) *BaseAPIHandler
+	}{
+		{
+			name: "auth manager",
+			newHandler: func(t *testing.T, chunks <-chan coreexecutor.StreamChunk) *BaseAPIHandler {
+				model := "handler-terminal-auth-stream"
+				executor := &interceptorCaptureExecutor{
+					stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+						return &coreexecutor.StreamResult{Chunks: chunks}, nil
+					},
+				}
+				return newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{})
+			},
+		},
+		{
+			name: "plugin executor",
+			newHandler: func(_ *testing.T, chunks <-chan coreexecutor.StreamChunk) *BaseAPIHandler {
+				host := &handlerDirectExecutorRouteHost{}
+				host.hasRouters = true
+				host.route = func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+					return pluginapi.ModelRouteResponse{
+						Handled:    true,
+						TargetKind: pluginapi.ModelRouteTargetExecutor,
+						Target:     "terminal-stream-plugin",
+					}, true
+				}
+				host.stream = func(context.Context, string, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+					return &coreexecutor.StreamResult{Chunks: chunks}, nil
+				}
+				handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+				handler.SetModelRouterHost(host)
+				return handler
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			chunks := make(chan coreexecutor.StreamChunk, 1)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte(terminalPayload)}
+			handler := tc.newHandler(t, chunks)
+			completions := make(chan pluginapi.RequestCompletion, 1)
+			handler.SetPluginHost(&handlerInterceptorNoStreamTestHost{
+				handlerInterceptorTestHost: &handlerInterceptorTestHost{
+					completeRequest: func(_ context.Context, completion pluginapi.RequestCompletion) {
+						completions <- completion
+					},
+				},
+			})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+				ctx,
+				"openai-response",
+				"handler-terminal-auth-stream",
+				[]byte(`{"stream":true}`),
+				"",
+			)
+			select {
+			case payload := <-dataChan:
+				if string(payload) != terminalPayload {
+					t.Fatalf("stream payload = %q, want terminal payload", payload)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("missing terminal stream payload")
+			}
+			cancel()
+			for range dataChan {
+			}
+			for errMsg := range errChan {
+				if errMsg != nil {
+					t.Fatalf("unexpected stream error: %+v", errMsg)
+				}
+			}
+
+			select {
+			case completion := <-completions:
+				if completion.Outcome != pluginapi.RequestCompletionSucceeded || completion.StatusCode != http.StatusOK {
+					t.Fatalf("completion = %#v, want succeeded", completion)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("missing stream completion")
+			}
+		})
 	}
 }
 

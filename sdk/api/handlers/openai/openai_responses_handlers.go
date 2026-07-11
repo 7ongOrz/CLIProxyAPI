@@ -549,6 +549,11 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, hasErr := pendingOpenAIStreamError(errChan); hasErr {
+					h.WriteErrorResponse(c, errMsg)
+					cliCancel(errMsg.Error)
+					return
+				}
 				// Stream closed without data? Send headers and done.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)

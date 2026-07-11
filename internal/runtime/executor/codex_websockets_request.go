@@ -82,7 +82,10 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
+	misc.EnsureHeader(headers, ginHeaders, "x-codex-window-id", "")
+	misc.EnsureHeader(headers, ginHeaders, "x-codex-parent-thread-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
+	misc.EnsureHeader(headers, ginHeaders, "thread-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
 	if isAPIKey {
@@ -127,6 +130,12 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	applyCodexCloakingHeaders(headers, cfg)
 
 	return headers
+}
+
+func finalizeCodexWebsocketHeaders(headers http.Header, body []byte, modelName string, identityState *codexIdentityConfuseState) {
+	applyCodexClientMetadataCompatibilityHeaders(headers, body)
+	applyModelHeaderOverrides(headers, modelName)
+	applyCodexIdentityConfuseHeaders(headers, identityState)
 }
 
 func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, fallbackValue string) {
@@ -208,11 +217,11 @@ func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string,
 	}
 
 	selectedKey := ""
-	if _, ok := headers[fallbackKey]; ok && codexSessionHeaderKeyUsesUnderscore(fallbackKey) {
+	if _, ok := headers[fallbackKey]; ok && codexSessionHeaderKey(fallbackKey) {
 		selectedKey = fallbackKey
 	} else {
 		for existingKey := range headers {
-			if codexSessionHeaderKeyUsesUnderscore(existingKey) {
+			if codexSessionHeaderKey(existingKey) {
 				selectedKey = existingKey
 				break
 			}
@@ -229,13 +238,21 @@ func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string,
 	headers[selectedKey] = []string{value}
 }
 
+func setCodexSessionHeader(headers http.Header, key string, value string) {
+	if headers == nil {
+		return
+	}
+	for existingKey := range headers {
+		if codexSessionHeaderKey(existingKey) {
+			delete(headers, existingKey)
+		}
+	}
+	setHeaderCasePreserved(headers, key, value)
+}
+
 func codexSessionHeaderKey(key string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	return normalized == "session_id" || normalized == "session-id"
-}
-
-func codexSessionHeaderKeyUsesUnderscore(key string) bool {
-	return strings.ToLower(strings.TrimSpace(key)) == "session_id"
 }
 
 func headerValueCaseInsensitive(headers http.Header, key string) string {

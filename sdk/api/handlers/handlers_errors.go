@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"golang.org/x/net/context"
 )
@@ -117,21 +118,17 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	}
 
 	body := BuildErrorResponseBody(status, errText)
-	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
-	var previous []byte
-	if existing, exists := c.Get("API_RESPONSE"); exists {
-		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
-			previous = existingBytes
+	upstreamResponseCaptured, _ := c.Get(logging.APIResponseCapturedContextKey)
+	hasUpstreamResponse, _ := upstreamResponseCaptured.(bool)
+	if !hasUpstreamResponse {
+		if existing, exists := c.Get("API_RESPONSE"); exists {
+			if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
+				hasUpstreamResponse = true
+			}
 		}
 	}
-	appendAPIResponse(c, body)
-	trimmedErrText := strings.TrimSpace(errText)
-	trimmedBody := bytes.TrimSpace(body)
-	if len(previous) > 0 {
-		if (trimmedErrText != "" && bytes.Contains(previous, []byte(trimmedErrText))) ||
-			(len(trimmedBody) > 0 && bytes.Contains(previous, trimmedBody)) {
-			c.Set("API_RESPONSE", previous)
-		}
+	if !hasUpstreamResponse {
+		appendAPIResponse(c, body)
 	}
 
 	if !c.Writer.Written() {
@@ -163,14 +160,27 @@ func writeDirectErrorResponse(c *gin.Context, status int, msg *interfaces.ErrorM
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
 	if h.Cfg.RequestLog {
 		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+			logErr := err
+			if err != nil && err.Error != nil {
+				var requestLogErrorProvider interface {
+					requestLogError() error
+				}
+				if errors.As(err.Error, &requestLogErrorProvider) && requestLogErrorProvider != nil {
+					if requestLogErr := requestLogErrorProvider.requestLogError(); requestLogErr != nil {
+						logErrCopy := *err
+						logErrCopy.Error = requestLogErr
+						logErr = &logErrCopy
+					}
+				}
+			}
 			if apiResponseErrors, isExist := ginContext.Get("API_RESPONSE_ERROR"); isExist {
 				if slicesAPIResponseError, isOk := apiResponseErrors.([]*interfaces.ErrorMessage); isOk {
-					slicesAPIResponseError = append(slicesAPIResponseError, err)
+					slicesAPIResponseError = append(slicesAPIResponseError, logErr)
 					ginContext.Set("API_RESPONSE_ERROR", slicesAPIResponseError)
 				}
 			} else {
 				// Create new response data entry
-				ginContext.Set("API_RESPONSE_ERROR", []*interfaces.ErrorMessage{err})
+				ginContext.Set("API_RESPONSE_ERROR", []*interfaces.ErrorMessage{logErr})
 			}
 		}
 	}

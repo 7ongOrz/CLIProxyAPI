@@ -138,15 +138,21 @@ func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testin
 			t.Fatalf("read body: %v", errRead)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"AA==\",\"partial_image_index\":0}\n\n"))
+		confusedSessionID := codexIdentityConfuseUUID("auth-image-stream", "session", "image")
+		_, _ = io.WriteString(w, "event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"session_id\":\""+confusedSessionID+"\",\"b64_json\":\"AA==\",\"partial_image_index\":0}\n\n")
 		_, _ = w.Write([]byte("event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"BB==\",\"usage\":{\"total_tokens\":10,\"input_tokens\":4,\"output_tokens\":6}}\n\n"))
 	}))
 	defer server.Close()
 
-	executor := NewCodexExecutor(&config.Config{})
-	stream, errStream := executor.ExecuteStream(context.Background(), newCodexOpenAIImageTestAuth(server.URL), cliproxyexecutor.Request{
+	executor := NewCodexExecutor(&config.Config{
+		Routing: config.RoutingConfig{SessionAffinity: true},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	})
+	auth := newCodexOpenAIImageTestAuth(server.URL)
+	auth.ID = "auth-image-stream"
+	stream, errStream := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-image-2",
-		Payload: []byte(`{"model":"gpt-image-2","prompt":"A cute baby sea otter","partial_images":2}`),
+		Payload: []byte(`{"model":"gpt-image-2","prompt":"A cute baby sea otter","partial_images":2,"client_metadata":{"session_id":"image"}}`),
 	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, true))
 	if errStream != nil {
 		t.Fatalf("ExecuteStream() error = %v", errStream)
@@ -172,9 +178,15 @@ func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testin
 	if got := gjson.GetBytes(gotBody, "partial_images").Int(); got != 2 {
 		t.Fatalf("partial_images = %d, want 2; body=%s", got, string(gotBody))
 	}
+	if got := gjson.GetBytes(gotBody, "client_metadata.session_id").String(); got == "" || got == "image" {
+		t.Fatalf("upstream session_id was not confused: %s", gotBody)
+	}
 	out := combined.String()
 	if !strings.Contains(out, "event: image_generation.partial_image") || !strings.Contains(out, "event: image_generation.completed") {
 		t.Fatalf("stream output missing image events: %q", out)
+	}
+	if !strings.Contains(out, `"session_id":"image"`) {
+		t.Fatalf("stream output did not expose the original session id: %q", out)
 	}
 }
 
@@ -313,5 +325,140 @@ func TestCodexExecutorDirectOpenAIImageEditUsesImagesEditEndpointForMultipart(t 
 	maskURL := gjson.GetBytes(gotBody, "mask.image_url").String()
 	if !strings.Contains(maskURL, ";base64,bWFzay1kYXRh") {
 		t.Fatalf("mask.image_url = %q, want mask-data data URL; body=%s", maskURL, string(gotBody))
+	}
+}
+
+func TestCodexExecutorResponsesImageRejectsTerminalFailure(t *testing.T) {
+	tests := []struct {
+		name        string
+		event       string
+		wantMessage string
+	}{
+		{
+			name:        "failed",
+			event:       `{"type":"response.failed","response":{"error":{"type":"invalid_request_error","message":"image request failed"}}}`,
+			wantMessage: "image request failed",
+		},
+		{
+			name:        "incomplete",
+			event:       `{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}`,
+			wantMessage: "Incomplete response returned, reason: content_filter",
+		},
+		{
+			name:        "error",
+			event:       `{"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"invalid image request"}}`,
+			wantMessage: "invalid image request",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/responses" {
+					t.Errorf("path = %q, want /responses", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: " + tt.event + "\n\n"))
+			}))
+			defer server.Close()
+
+			executor := NewCodexExecutor(&config.Config{})
+			_, errExecute := executor.Execute(context.Background(), newCodexOpenAIImageTestAuth(server.URL), cliproxyexecutor.Request{
+				Model:   codexOpenAIImagesMainModel,
+				Payload: []byte(`{"model":"gpt-5.4-mini","prompt":"draw a sea otter"}`),
+			}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, false))
+			if errExecute == nil {
+				t.Fatal("Execute() error = nil, want terminal response error")
+			}
+			statusErr, ok := errExecute.(interface{ StatusCode() int })
+			if !ok || statusErr.StatusCode() != http.StatusBadRequest {
+				t.Fatalf("status error = %v, want %d", errExecute, http.StatusBadRequest)
+			}
+			if !strings.Contains(errExecute.Error(), tt.wantMessage) {
+				t.Fatalf("error = %v, want %q", errExecute, tt.wantMessage)
+			}
+			if strings.Contains(errExecute.Error(), "stream disconnected before completion") {
+				t.Fatalf("terminal response was replaced by a generic disconnect error: %v", errExecute)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorResponsesImageStreamReportsFailureAfterPartialImage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("path = %q, want /responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"AA==","partial_image_index":0,"output_format":"png"}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"image stream failed"}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	stream, errStream := executor.ExecuteStream(context.Background(), newCodexOpenAIImageTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   codexOpenAIImagesMainModel,
+		Payload: []byte(`{"model":"gpt-5.4-mini","prompt":"draw a sea otter","partial_images":1}`),
+	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, true))
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error = %v", errStream)
+	}
+
+	first, ok := <-stream.Chunks
+	if !ok {
+		t.Fatal("stream closed before partial image")
+	}
+	if first.Err != nil || !strings.Contains(string(first.Payload), "image_generation.partial_image") {
+		t.Fatalf("first chunk = payload %q, err %v; want partial image", first.Payload, first.Err)
+	}
+
+	second, ok := <-stream.Chunks
+	if !ok {
+		t.Fatal("stream closed without reporting terminal error")
+	}
+	if second.Err == nil || !strings.Contains(second.Err.Error(), "image stream failed") {
+		t.Fatalf("second chunk = payload %q, err %v; want terminal failure", second.Payload, second.Err)
+	}
+	if statusErr, okStatus := second.Err.(interface{ StatusCode() int }); !okStatus || statusErr.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("terminal error = %v, want status %d", second.Err, http.StatusBadRequest)
+	}
+}
+
+func TestCodexExecutorResponsesImageStreamRejectsEOFBeforeCompletion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("path = %q, want /responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"AA==","partial_image_index":0,"output_format":"png"}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	stream, errStream := executor.ExecuteStream(context.Background(), newCodexOpenAIImageTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   codexOpenAIImagesMainModel,
+		Payload: []byte(`{"model":"gpt-5.4-mini","prompt":"draw a sea otter","partial_images":1}`),
+	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, true))
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error = %v", errStream)
+	}
+
+	first, ok := <-stream.Chunks
+	if !ok {
+		t.Fatal("stream closed before partial image")
+	}
+	if first.Err != nil || !strings.Contains(string(first.Payload), "image_generation.partial_image") {
+		t.Fatalf("first chunk = payload %q, err %v; want partial image", first.Payload, first.Err)
+	}
+
+	second, ok := <-stream.Chunks
+	if !ok {
+		t.Fatal("stream closed without reporting incomplete stream")
+	}
+	if second.Err == nil || !strings.Contains(second.Err.Error(), "stream closed before response.completed") {
+		t.Fatalf("second chunk = payload %q, err %v; want incomplete stream", second.Payload, second.Err)
+	}
+	if statusErr, okStatus := second.Err.(interface{ StatusCode() int }); !okStatus || statusErr.StatusCode() != http.StatusRequestTimeout {
+		t.Fatalf("terminal error = %v, want status %d", second.Err, http.StatusRequestTimeout)
 	}
 }

@@ -47,7 +47,7 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 
 func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
 	if sess != nil {
-		return sess.writeMessage(conn, websocket.TextMessage, payload)
+		return sess.writeCodexMessage(conn, websocket.TextMessage, payload)
 	}
 	if conn == nil {
 		return fmt.Errorf("codex websockets executor: websocket conn is nil")
@@ -138,10 +138,56 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 	if readCh == nil {
 		return 0, nil, fmt.Errorf("codex websockets executor: session read channel is nil")
 	}
+	readBuffered := func() (int, []byte, error, bool) {
+		for {
+			select {
+			case ev, ok := <-readCh:
+				if !ok {
+					return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed"), true
+				}
+				if ev.conn != conn {
+					continue
+				}
+				if ev.err != nil {
+					if terminalErr := sess.terminalError(); terminalErr != nil {
+						return 0, nil, terminalErr, true
+					}
+					return 0, nil, ev.err, true
+				}
+				return ev.msgType, ev.payload, nil, true
+			default:
+				return 0, nil, nil, false
+			}
+		}
+	}
+	activeDone, active := sess.activeDoneFor(readCh)
+	if !active {
+		if msgType, payload, errRead, ok := readBuffered(); ok {
+			return msgType, payload, errRead
+		}
+		if errRead := sess.closedActiveErrorFor(readCh); errRead != nil {
+			return 0, nil, errRead
+		}
+		if terminalErr := sess.terminalError(); terminalErr != nil {
+			return 0, nil, terminalErr
+		}
+		return 0, nil, fmt.Errorf("codex websockets executor: session read channel inactive")
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return 0, nil, ctx.Err()
+		case <-activeDone:
+			if msgType, payload, errRead, ok := readBuffered(); ok {
+				return msgType, payload, errRead
+			}
+			if errRead := sess.closedActiveErrorFor(readCh); errRead != nil {
+				return 0, nil, errRead
+			}
+			if terminalErr := sess.terminalError(); terminalErr != nil {
+				return 0, nil, terminalErr
+			}
+			return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed")
 		case ev, ok := <-readCh:
 			if !ok {
 				return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed")
@@ -150,6 +196,9 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 				continue
 			}
 			if ev.err != nil {
+				if terminalErr := sess.terminalError(); terminalErr != nil {
+					return 0, nil, terminalErr
+				}
 				return 0, nil, ev.err
 			}
 			return ev.msgType, ev.payload, nil

@@ -180,6 +180,13 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			result.RetryAfter = retryAfterFromError(errExecute)
 			m.reportHomeResult(execCtx, result, preparedAuth)
 			lastErr = errExecute
+			if cliproxyexecutor.DownstreamWebsocket(ctx) && selection.Retained() && isRequestScopedError(errExecute) {
+				releaseAttempt()
+				if !m.retainHomeWebsocketSelection(ctx, opts, routeModel, selection) {
+					selection.End("request_replay_retain_failed")
+				}
+				return cliproxyexecutor.Response{}, errExecute
+			}
 			if isRequestInvalidError(errExecute) {
 				releaseAttempt()
 				selection.End("request_invalid")

@@ -2,6 +2,8 @@ package openai
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -342,5 +345,19 @@ func TestImagesEdits_DisableImageGenerationChat_DoesNotReturn404(t *testing.T) {
 
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+}
+
+func TestCollectImagesFromResponsesStreamPrefersPendingError(t *testing.T) {
+	data := make(chan []byte)
+	close(data)
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	expected := errors.New("image stream failed")
+	errs <- &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: expected}
+	close(errs)
+
+	_, errMsg := collectImagesFromResponsesStream(context.Background(), data, errs, "b64_json")
+	if errMsg == nil || !errors.Is(errMsg.Error, expected) {
+		t.Fatalf("stream error = %#v, want %v", errMsg, expected)
 	}
 }

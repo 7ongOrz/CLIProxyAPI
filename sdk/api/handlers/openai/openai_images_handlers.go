@@ -63,6 +63,18 @@ type imagesStreamExecutionResult struct {
 	Errs            <-chan *interfaces.ErrorMessage
 }
 
+func pendingOpenAIStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces.ErrorMessage, bool) {
+	if errs == nil {
+		return nil, false
+	}
+	select {
+	case errMsg, ok := <-errs:
+		return errMsg, ok && errMsg != nil
+	default:
+		return nil, false
+	}
+}
+
 func setImagesSSEHeaders(c *gin.Context) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -1230,6 +1242,16 @@ func (h *OpenAIAPIHandler) streamRoutedImages(c *gin.Context, imageReq []byte, i
 		case chunk, ok := <-dataChan:
 			if !ok {
 				stopKeepAlive()
+				if errMsg, hasErr := pendingOpenAIStreamError(errChan); hasErr {
+					if streamStarted {
+						writeImagesStreamErrorEvent(c, errMsg)
+						flusher.Flush()
+					} else {
+						h.WriteErrorResponse(c, errMsg)
+					}
+					cliCancel(errMsg.Error)
+					return
+				}
 				setImagesSSEHeaders(c)
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = c.Writer.Write([]byte("\n"))
@@ -1283,6 +1305,14 @@ func (h *OpenAIAPIHandler) forwardRawImageStream(ctx context.Context, c *gin.Con
 			errs = nil
 		case chunk, ok := <-data:
 			if !ok {
+				if errMsg, hasErr := pendingOpenAIStreamError(errs); hasErr {
+					writeImagesStreamErrorEvent(c, errMsg)
+					if flusher, ok := c.Writer.(http.Flusher); ok {
+						flusher.Flush()
+					}
+					cancel(errMsg.Error)
+					return
+				}
 				cancel(nil)
 				return
 			}
@@ -1358,6 +1388,16 @@ func (h *OpenAIAPIHandler) streamOpenAICompatImages(c *gin.Context, compatReq []
 		case chunk, ok := <-dataChan:
 			if !ok {
 				stopKeepAlive()
+				if errMsg, hasErr := pendingOpenAIStreamError(errChan); hasErr {
+					if streamStarted {
+						writeImagesStreamErrorEvent(c, errMsg)
+						flusher.Flush()
+					} else {
+						h.WriteErrorResponse(c, errMsg)
+					}
+					cliCancel(errMsg.Error)
+					return
+				}
 				setImagesSSEHeaders(c)
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				flusher.Flush()
@@ -1617,6 +1657,9 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			errs = nil
 		case chunk, ok := <-data:
 			if !ok {
+				if errMsg, hasErr := pendingOpenAIStreamError(errs); hasErr {
+					return nil, errMsg
+				}
 				for _, frame := range acc.Flush() {
 					if out, done, errMsg := processFrame(frame); errMsg != nil {
 						return nil, errMsg
@@ -1795,6 +1838,16 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 		case chunk, ok := <-dataChan:
 			if !ok {
 				stopKeepAlive()
+				if errMsg, hasErr := pendingOpenAIStreamError(errChan); hasErr {
+					if streamStarted {
+						writeImagesStreamErrorEvent(c, errMsg)
+						flusher.Flush()
+					} else {
+						h.WriteErrorResponse(c, errMsg)
+					}
+					cliCancel(errMsg.Error)
+					return
+				}
 				setImagesSSEHeaders(c)
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = c.Writer.Write([]byte("\n"))
@@ -1919,6 +1972,11 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 			errs = nil
 		case chunk, ok := <-data:
 			if !ok {
+				if errMsg, hasErr := pendingOpenAIStreamError(errs); hasErr {
+					emitError(errMsg)
+					cancel(errMsg.Error)
+					return
+				}
 				for _, frame := range acc.Flush() {
 					if processFrame(frame) {
 						cancel(nil)

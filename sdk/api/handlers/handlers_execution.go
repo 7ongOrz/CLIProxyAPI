@@ -23,6 +23,19 @@ type pluginExecutorFormatResolver interface {
 	PluginExecutorRequestToFormat(string, coreexecutor.Request, coreexecutor.Options) sdktranslator.Format
 }
 
+type clientExecutionError struct {
+	error
+	requestLogErr error
+}
+
+func (e clientExecutionError) Unwrap() error {
+	return e.error
+}
+
+func (e clientExecutionError) requestLogError() error {
+	return e.requestLogErr
+}
+
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
@@ -312,13 +325,26 @@ func executionErrorMessage(err error) *interfaces.ErrorMessage {
 			status = code
 		}
 	}
-	var addon http.Header
-	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-		if hdr := he.Headers(); hdr != nil {
-			addon = hdr.Clone()
+	addon := errorAddonHeaders(err)
+	clientErr := err
+	var clientErrorProvider interface {
+		error
+		ClientError() error
+	}
+	if errors.As(err, &clientErrorProvider) && clientErrorProvider != nil {
+		if exposedErr := clientErrorProvider.ClientError(); exposedErr != nil {
+			clientErr = clientExecutionError{error: exposedErr, requestLogErr: err}
+			addon = errorAddonHeaders(exposedErr)
 		}
 	}
-	return &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+	return &interfaces.ErrorMessage{StatusCode: status, Error: clientErr, Addon: addon}
+}
+
+func errorAddonHeaders(err error) http.Header {
+	if headerProvider, ok := err.(interface{ Headers() http.Header }); ok && headerProvider != nil {
+		return headerProvider.Headers().Clone()
+	}
+	return nil
 }
 
 func (h *BaseAPIHandler) pluginExecutorHost() PluginExecutorHost {

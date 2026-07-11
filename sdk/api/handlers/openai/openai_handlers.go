@@ -500,6 +500,11 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, hasErr := pendingOpenAIStreamError(errChan); hasErr {
+					h.WriteErrorResponse(c, errMsg)
+					cliCancel(errMsg.Error)
+					return
+				}
 				// Stream closed without data? Send DONE or just headers.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
@@ -607,6 +612,11 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, hasErr := pendingOpenAIStreamError(errChan); hasErr {
+					h.WriteErrorResponse(c, errMsg)
+					cliCancel(errMsg.Error)
+					return
+				}
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")

@@ -125,25 +125,46 @@ func mergeJSONArrayRaw(existingRaw, appendRaw string) (string, error) {
 	return string(out), nil
 }
 
-// inputContainsFullTranscript returns true when the input array carries compact
-// replay markers that indicate the client already sent the full conversation
-// transcript. Merging that input with stale lastRequest/lastResponseOutput
-// would duplicate or break function_call/function_call_output pairings, so the
-// caller should use the input as-is.
-//
-// Assistant messages alone are not enough to classify the payload as a replay:
-// incremental websocket requests may legitimately append assistant items.
 func inputContainsFullTranscript(input gjson.Result) bool {
 	if !input.IsArray() {
 		return false
 	}
 	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
+		if isResponsesWebsocketCompactionReplayItemType(item.Get("type").String()) {
 			return true
 		}
 	}
 	return false
+}
+
+func inputContainsCompactionTrigger(input gjson.Result) bool {
+	if !input.IsArray() {
+		return false
+	}
+	for _, item := range input.Array() {
+		if strings.TrimSpace(item.Get("type").String()) == "compaction_trigger" {
+			return true
+		}
+	}
+	return false
+}
+
+func isResponsesWebsocketCompactionItemType(t string) bool {
+	switch strings.TrimSpace(t) {
+	case "compaction", "compaction_summary", "compaction_trigger", "context_compaction":
+		return true
+	default:
+		return false
+	}
+}
+
+func isResponsesWebsocketCompactionReplayItemType(t string) bool {
+	switch strings.TrimSpace(t) {
+	case "compaction", "compaction_summary", "context_compaction":
+		return true
+	default:
+		return false
+	}
 }
 
 func inputWithoutCompactionItems(input gjson.Result) string {
@@ -152,8 +173,7 @@ func inputWithoutCompactionItems(input gjson.Result) string {
 	}
 	filtered := make([]string, 0, len(input.Array()))
 	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
+		if isResponsesWebsocketCompactionReplayItemType(item.Get("type").String()) {
 			continue
 		}
 		filtered = append(filtered, item.Raw)

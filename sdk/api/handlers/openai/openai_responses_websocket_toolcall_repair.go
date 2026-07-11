@@ -36,6 +36,7 @@ type websocketToolOutputSession struct {
 
 type responsesWebsocketToolCacheTurn struct {
 	sessionKey  string
+	reset       bool
 	outputs     map[string]json.RawMessage
 	outputOrder []string
 	calls       map[string]json.RawMessage
@@ -242,6 +243,12 @@ func newResponsesWebsocketToolCacheTurn(sessionKey string) *responsesWebsocketTo
 	}
 }
 
+func (t *responsesWebsocketToolCacheTurn) resetOnCommit() {
+	if t != nil {
+		t.reset = true
+	}
+}
+
 func (t *responsesWebsocketToolCacheTurn) recordRequest(payload []byte) {
 	if t == nil || len(payload) == 0 {
 		return
@@ -308,14 +315,33 @@ func (t *responsesWebsocketToolCacheTurn) commit() {
 	defaultWebsocketToolCacheTransactionMu.Lock()
 	defer defaultWebsocketToolCacheTransactionMu.Unlock()
 	if defaultWebsocketToolOutputCache != nil {
+		if t.reset {
+			defaultWebsocketToolOutputCache.deleteSession(t.sessionKey)
+		}
 		for _, callID := range t.outputOrder {
 			defaultWebsocketToolOutputCache.record(t.sessionKey, callID, t.outputs[callID])
 		}
 	}
 	if defaultWebsocketToolCallCache != nil {
+		if t.reset {
+			defaultWebsocketToolCallCache.deleteSession(t.sessionKey)
+		}
 		for _, callID := range t.callOrder {
 			defaultWebsocketToolCallCache.record(t.sessionKey, callID, t.calls[callID])
 		}
+	}
+}
+
+func resetResponsesWebsocketToolCaches(sessionKey string) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return
+	}
+	if defaultWebsocketToolOutputCache != nil {
+		defaultWebsocketToolOutputCache.deleteSession(sessionKey)
+	}
+	if defaultWebsocketToolCallCache != nil {
+		defaultWebsocketToolCallCache.deleteSession(sessionKey)
 	}
 }
 

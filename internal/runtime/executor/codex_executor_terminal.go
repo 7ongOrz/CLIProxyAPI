@@ -14,6 +14,15 @@ import (
 
 const codexIncompleteStreamMessage = "stream error: stream disconnected before completion: stream closed before response.completed"
 
+type codexIdentityStatusErr struct {
+	statusErr
+	clientErr statusErr
+}
+
+func (e codexIdentityStatusErr) ClientError() error {
+	return e.clientErr
+}
+
 type codexIncompleteStreamError struct {
 	statusErr
 }
@@ -160,9 +169,8 @@ func codexTerminalFailureStatus(body []byte) int {
 	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
 	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
 	switch {
-	case errorCode == "cyber_policy":
-		return http.StatusBadRequest
-	case errorType == "invalid_request_error", errorType == "bad_request_error":
+	case errorCode == "cyber_policy", errorCode == "previous_response_not_found",
+		errorType == "invalid_request_error", errorType == "bad_request_error":
 		return http.StatusBadRequest
 	case errorType == "authentication_error", errorCode == "invalid_api_key", errorCode == "unauthorized":
 		return http.StatusUnauthorized
@@ -293,6 +301,16 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func withCodexIdentityClientError(err statusErr, state codexIdentityConfuseState) error {
+	clientBody := applyCodexIdentityExposeResponsePayload([]byte(err.msg), state)
+	if bytes.Equal(clientBody, []byte(err.msg)) {
+		return err
+	}
+	clientErr := err
+	clientErr.msg = string(clientBody)
+	return codexIdentityStatusErr{statusErr: err, clientErr: clientErr}
 }
 
 func classifyCodexStatusError(statusCode int, body []byte) []byte {

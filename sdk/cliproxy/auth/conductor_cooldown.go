@@ -698,6 +698,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	if !result.Success && statusCodeFromResult(result.Error) == http.StatusUpgradeRequired {
+		m.recordAvailabilityNeutralResult(ctx, result)
+		return
+	}
 	modelKey := canonicalModelKey(result.Model)
 
 	shouldResumeModel := false

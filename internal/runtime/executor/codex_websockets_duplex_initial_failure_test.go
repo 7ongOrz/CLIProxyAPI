@@ -13,10 +13,12 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	auth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	translator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestCodexDuplexInitialFailure(t *testing.T) {
@@ -33,6 +35,11 @@ func TestCodexDuplexInitialFailure(t *testing.T) {
 	} {
 		for _, failover := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/failover=%t", tc.name, failover), func(t *testing.T) {
+				wantKey := "client-key"
+				if failover {
+					// The conductor attaches session metadata used by the native Codex cache path.
+					wantKey = helps.ProviderSessionUUID("codex", map[string]any{core.ExecutionSessionMetadataKey: t.Name()})
+				}
 				var rejected, succeeded atomic.Int32
 				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					c, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
@@ -43,11 +50,21 @@ func TestCodexDuplexInitialFailure(t *testing.T) {
 					defer func() { _ = c.Close() }()
 					// Bound a broken test without making server closure drive client recovery.
 					_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
-					if _, _, err = c.ReadMessage(); err != nil {
+					_, requestPayload, err := c.ReadMessage()
+					if err != nil {
 						t.Error(err)
 						return
 					}
-					payloads := []string{tc.payload}
+					key := gjson.GetBytes(requestPayload, "prompt_cache_key").String()
+					if key != wantKey {
+						t.Errorf("upstream prompt cache key = %q, want %q", key, wantKey)
+					}
+					messagePath := "error.message"
+					if gjson.Get(tc.payload, "type").String() == "response.failed" {
+						messagePath = "response.error.message"
+					}
+					failure, _ := sjson.Set(tc.payload, messagePath, key)
+					payloads := []string{failure}
 					if r.Header.Get("Authorization") == "Bearer bad-key" {
 						rejected.Add(1)
 					} else {
@@ -73,13 +90,14 @@ func TestCodexDuplexInitialFailure(t *testing.T) {
 				cfg := &config.Config{}
 				cfg.Codex.ResponseSteering = true
 				cfg.CodexResponseSteering = true
+				cfg.Routing.SessionAffinity = true
 				exec := NewCodexWebsocketsExecutor(cfg)
 				exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 				model := "duplex-initial-failure-model"
 				bad := &auth.Auth{ID: "duplex-initial-bad", Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{
 					"api_key": "bad-key", "base_url": upstream.URL, "websockets": "true", "priority": "4",
 				}}
-				req := core.Request{Model: model, Payload: []byte(`{"model":"duplex-initial-failure-model","input":[]}`)}
+				req := core.Request{Model: model, Payload: []byte(`{"model":"duplex-initial-failure-model","prompt_cache_key":"client-key","input":[]}`)}
 				opts := core.Options{SourceFormat: translator.FromString("codex"), Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}}
 				if !failover {
 					result, err := exec.ExecuteStream(ctx, bad, req, opts)
@@ -93,6 +111,9 @@ func TestCodexDuplexInitialFailure(t *testing.T) {
 					var status interface{ StatusCode() int }
 					if !errors.As(chunk.Err, &status) || status.StatusCode() != tc.status {
 						t.Fatalf("status lost: %v", chunk.Err)
+					}
+					if got := gjson.Get(chunk.Err.Error(), "error.message").String(); got != "client-key" {
+						t.Fatalf("error message = %q, want client-key", got)
 					}
 					var scoped interface{ IsRequestScoped() bool }
 					if errors.As(chunk.Err, &scoped) && scoped.IsRequestScoped() {

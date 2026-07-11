@@ -52,6 +52,9 @@ func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputFor
 }
 
 func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsCompactionReplayForModel(modelName string) bool {
+	if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		return false
+	}
 	auths, _ := h.responsesWebsocketAvailableAuthsForModel(modelName)
 	if len(auths) == 0 {
 		return false
@@ -136,16 +139,15 @@ func responsesWebsocketPinnedAuthMatchesModel(auth *coreauth.Auth, modelName str
 		return false
 	}
 	providerSet, modelKey := responsesWebsocketProviderSetForModel(responsesWebsocketResolvedModelName(modelName))
-	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if _, ok := providerSet[providerKey]; !ok {
-		return false
-	}
 	if !responsesWebsocketAuthAvailableForModel(auth, modelKey, time.Now()) {
 		return false
 	}
-
 	if homeRuntime {
 		return strings.EqualFold(strings.TrimSpace(pinnedModelKey), strings.TrimSpace(modelKey))
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if _, ok := providerSet[providerKey]; !ok {
+		return false
 	}
 	return registry.GetGlobalRegistry().ClientSupportsModel(auth.ID, modelKey)
 }

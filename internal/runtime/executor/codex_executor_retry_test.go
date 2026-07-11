@@ -112,6 +112,39 @@ func TestCodexQuotaErrorModelLevelCooling(t *testing.T) {
 	}
 }
 
+func TestCodexTerminalQuotaCoolingScope(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","resets_in_seconds":3600}}}`)
+	for _, modelLevelCooling := range []bool{false, true} {
+		t.Run(strconv.FormatBool(modelLevelCooling), func(t *testing.T) {
+			for _, parse := range []struct {
+				name string
+				fn   func([]byte, bool) (statusErr, bool)
+			}{
+				{"response", parseCodexResponseFailed},
+				{"image", parseCodexOpenAIImageTerminalError},
+				{"terminal", func(payload []byte, cooling bool) (statusErr, bool) {
+					err, _, ok := codexTerminalFailureErrWithCooling(payload, cooling)
+					return err, ok
+				}},
+			} {
+				t.Run(parse.name, func(t *testing.T) {
+					err, ok := parse.fn(payload, modelLevelCooling)
+					if !ok || err.StatusCode() != http.StatusTooManyRequests {
+						t.Fatalf("quota result = %v, recognized = %t; want 429", err, ok)
+					}
+					wantCredentialScope := !modelLevelCooling
+					if err.IsCredentialScoped() != wantCredentialScope {
+						t.Fatalf("credential scope = %t, want %t", err.IsCredentialScoped(), wantCredentialScope)
+					}
+					if retry := err.RetryAfter(); retry == nil || *retry != time.Hour {
+						t.Fatalf("retry delay = %v, want one hour", retry)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestParseCodexRetryAfterQuotaLayouts(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	for _, layout := range []string{"nested", "top-level"} {

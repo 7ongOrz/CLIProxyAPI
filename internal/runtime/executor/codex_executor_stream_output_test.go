@@ -562,6 +562,36 @@ func TestCodexTerminalFailureErrClassifiesStatus(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			name:       "misalignment policy",
+			event:      `{"type":"error","error":{"code":"misalignment_policy_violation","message":"This request violated the misalignment policy."}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "invalid prompt without type",
+			event:      `{"type":"response.failed","response":{"error":{"code":"invalid_prompt","message":"Invalid prompt."}}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "bio policy without type",
+			event:      `{"type":"response.failed","response":{"error":{"code":"bio_policy","message":"This content was flagged for biological risk."}}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "insufficient quota without type",
+			event:      `{"type":"response.failed","response":{"error":{"code":"insufficient_quota","message":"Quota exceeded."}}}`,
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
+			name:       "usage not included without type",
+			event:      `{"type":"response.failed","response":{"error":{"code":"usage_not_included","message":"Upgrade to Plus to use Codex."}}}`,
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
+			name:       "explicit response status wins",
+			event:      `{"type":"response.failed","response":{"error":{"status_code":403,"code":"context_length_exceeded","message":"Forbidden."}}}`,
+			wantStatus: http.StatusForbidden,
+		},
+		{
 			name:       "authentication",
 			event:      `{"type":"response.failed","response":{"error":{"type":"authentication_error","code":"invalid_api_key","message":"Invalid token."}}}`,
 			wantStatus: http.StatusUnauthorized,

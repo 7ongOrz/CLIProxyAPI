@@ -293,19 +293,13 @@ func validateApplyPatchSnapshots(previous, current string) error {
 	return errFinishArguments
 }
 
-// finishClaudeApplyPatchArguments treats complete streamed JSON as a complete
-// snapshot, not a prefix that a later snapshot may silently extend. A partial
-// source can still be completed by a consistent full snapshot.
+// finishClaudeApplyPatchArguments selects the final snapshot for the shared decoder
+// to reconcile with the streamed input.
 func finishClaudeApplyPatchArguments(call *translatorcommon.ApplyPatchCallState, arguments, snapshot string) (string, string, error) {
-	if snapshot == "" {
-		return call.FinishArguments(arguments)
+	if snapshot != "" {
+		arguments = snapshot
 	}
-	if gjson.Valid(arguments) {
-		if _, _, errFinishArguments := call.FinishArguments(arguments); errFinishArguments != nil {
-			return "", "", errFinishArguments
-		}
-	}
-	return call.FinishArguments(snapshot)
+	return call.FinishArguments(arguments)
 }
 
 func (st *claudeToResponsesState) failToolInput(err error, nextSeq func() int) [][]byte {

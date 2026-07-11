@@ -236,10 +236,11 @@ func (d *ApplyPatchInputDecoder) Finish(arguments string) (string, error) {
 	if _, errPush := final.Push(arguments); errPush != nil {
 		return "", d.fail(errPush)
 	}
+	// A closed JSON string fixes the complete input, even before Finish is called.
+	if d.phase >= patchAfterValue && input != d.Input() {
+		return "", d.fail(errors.New("conflicting apply_patch arguments completion"))
+	}
 	if d.finished {
-		if input != d.Input() {
-			return "", d.fail(errors.New("conflicting apply_patch arguments completion"))
-		}
 		return "", nil
 	}
 	if !strings.HasPrefix(input, d.Input()) {

@@ -107,6 +107,10 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		}
 		for _, eventData := range events {
 			reporter.ObserveResponseModel(eventData)
+			if streamErr, ok := parseXAIResponseTerminalError(eventData); ok {
+				reporter.PublishFailure(ctx, streamErr)
+				return resp, streamErr
+			}
 			eventType := gjson.GetBytes(eventData, "type").String()
 			switch eventType {
 			case "response.output_item.done":

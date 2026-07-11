@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -242,6 +243,110 @@ func TestHomeWebsocketSessionReusesRetainedSelection(t *testing.T) {
 	}
 	if got := executor.calls.Load(); got != 2 {
 		t.Fatalf("executor calls = %d, want 2", got)
+	}
+}
+
+type retainedHomeReplayError struct{}
+
+func (retainedHomeReplayError) Error() string         { return "websocket transcript replay required" }
+func (retainedHomeReplayError) StatusCode() int       { return http.StatusBadRequest }
+func (retainedHomeReplayError) IsRequestScoped() bool { return true }
+
+type retainedHomeReplayExecutor struct {
+	calls atomic.Int32
+}
+
+func (*retainedHomeReplayExecutor) Identifier() string { return "home-execution" }
+
+func (e *retainedHomeReplayExecutor) retain(opts cliproxyexecutor.Options) bool {
+	if lifecycle, ok := opts.ExecutionLifecycle.(interface{ Retain() }); ok {
+		lifecycle.Retain()
+	}
+	return e.calls.Add(1) == 1
+}
+
+func (e *retainedHomeReplayExecutor) Execute(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if e.retain(opts) {
+		return cliproxyexecutor.Response{}, retainedHomeReplayError{}
+	}
+	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
+}
+
+func (e *retainedHomeReplayExecutor) ExecuteStream(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if e.retain(opts) {
+		return nil, retainedHomeReplayError{}
+	}
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed"}`)}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*retainedHomeReplayExecutor) Refresh(context.Context, *Auth) (*Auth, error) { return nil, nil }
+func (*retainedHomeReplayExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+func (*retainedHomeReplayExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func TestHomeWebsocketRequestScopedReplayRetainsSelection(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		stream bool
+	}{
+		{name: "nonstream"},
+		{name: "stream", stream: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dispatcher := &retainingHomeExecutionDispatcher{}
+			registry := executionregistry.New()
+			manager := NewManager(nil, nil, nil)
+			manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+			manager.PublishHomeDispatch(dispatcher, registry, 1)
+			executor := &retainedHomeReplayExecutor{}
+			manager.RegisterExecutor(executor)
+
+			ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+			opts := cliproxyexecutor.Options{
+				Stream: test.stream,
+				Metadata: map[string]any{
+					cliproxyexecutor.ExecutionSessionMetadataKey: "replay-session",
+					cliproxyexecutor.PinnedAuthMetadataKey:       "home-auth",
+				},
+			}
+			request := cliproxyexecutor.Request{Model: "model-a"}
+			execute := func() error {
+				if !test.stream {
+					_, errExecute := manager.Execute(ctx, []string{"home-execution"}, request, opts)
+					return errExecute
+				}
+				result, errExecute := manager.ExecuteStream(ctx, []string{"home-execution"}, request, opts)
+				if result != nil {
+					for range result.Chunks {
+					}
+				}
+				return errExecute
+			}
+
+			if errFirst := execute(); !errors.As(errFirst, new(retainedHomeReplayError)) {
+				t.Fatalf("first execution error = %v, want request-scoped replay", errFirst)
+			}
+			if errSecond := execute(); errSecond != nil {
+				t.Fatalf("second execution error = %v", errSecond)
+			}
+			if got := dispatcher.calls.Load(); got != 1 {
+				t.Fatalf("Home RPOP calls = %d, want 1 for retained replay selection", got)
+			}
+			if got := executor.calls.Load(); got != 2 {
+				t.Fatalf("executor calls = %d, want 2", got)
+			}
+
+			manager.CloseExecutionSession("replay-session")
+			if errDrain := registry.Drain(context.Background()); errDrain != nil {
+				t.Fatalf("Drain() error = %v", errDrain)
+			}
+		})
 	}
 }
 

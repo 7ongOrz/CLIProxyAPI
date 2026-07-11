@@ -25,8 +25,10 @@ import (
 )
 
 type failOnceStreamExecutor struct {
-	mu    sync.Mutex
-	calls int
+	mu             sync.Mutex
+	calls          int
+	refreshes      int
+	resultErrFirst bool
 }
 
 func (e *failOnceStreamExecutor) Identifier() string { return "codex" }
@@ -43,14 +45,20 @@ func (e *failOnceStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, 
 
 	ch := make(chan coreexecutor.StreamChunk, 1)
 	if call == 1 {
-		ch <- coreexecutor.StreamChunk{
-			Err: &coreauth.Error{
-				Code:       "unauthorized",
-				Message:    "unauthorized",
-				Retryable:  false,
-				HTTPStatus: http.StatusUnauthorized,
-			},
+		streamErr := &coreauth.Error{
+			Code:       "unauthorized",
+			Message:    "unauthorized for confused upstream identity",
+			Retryable:  false,
+			HTTPStatus: http.StatusUnauthorized,
 		}
+		chunk := coreexecutor.StreamChunk{Err: streamErr}
+		if e.resultErrFirst {
+			chunk = coreexecutor.StreamChunk{
+				Payload:   []byte(`{"type":"error","status":401,"error":{"message":"unauthorized for original client identity"}}`),
+				ResultErr: streamErr,
+			}
+		}
+		ch <- chunk
 		close(ch)
 		return &coreexecutor.StreamResult{
 			Headers: http.Header{"X-Upstream-Attempt": {"1"}},
@@ -61,12 +69,18 @@ func (e *failOnceStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, 
 	ch <- coreexecutor.StreamChunk{Payload: []byte("ok")}
 	close(ch)
 	return &coreexecutor.StreamResult{
-		Headers: http.Header{"X-Upstream-Attempt": {"2"}},
-		Chunks:  ch,
+		Headers: http.Header{
+			"X-Upstream-Attempt": {"2"},
+			"X-Codex-Turn-State": {"state-2"},
+		},
+		Chunks: ch,
 	}, nil
 }
 
 func (e *failOnceStreamExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	e.mu.Lock()
+	e.refreshes++
+	e.mu.Unlock()
 	return auth, nil
 }
 
@@ -86,6 +100,12 @@ func (e *failOnceStreamExecutor) Calls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
+}
+
+func (e *failOnceStreamExecutor) Refreshes() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.refreshes
 }
 
 type blockingRetryStreamExecutor struct {
@@ -139,9 +159,27 @@ func (e *blockingRetryStreamExecutor) HttpRequest(ctx context.Context, auth *cor
 }
 
 type payloadThenErrorStreamExecutor struct {
-	mu    sync.Mutex
-	calls int
+	mu                    sync.Mutex
+	calls                 int
+	resultErrOnly         bool
+	resultErr             error
+	preludePayload        []byte
+	resultPayload         []byte
+	succeedAfterResultErr bool
+	successPayload        []byte
 }
+
+type streamResultError struct {
+	message    string
+	status     int
+	retryAfter time.Duration
+}
+
+func (e *streamResultError) Error() string { return e.message }
+
+func (e *streamResultError) StatusCode() int { return e.status }
+
+func (e *streamResultError) RetryAfter() *time.Duration { return &e.retryAfter }
 
 func (e *payloadThenErrorStreamExecutor) Identifier() string { return "codex" }
 
@@ -152,18 +190,43 @@ func (e *payloadThenErrorStreamExecutor) Execute(context.Context, *coreauth.Auth
 func (e *payloadThenErrorStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	e.mu.Lock()
 	e.calls++
+	call := e.calls
 	e.mu.Unlock()
+
+	if e.succeedAfterResultErr && call > 1 {
+		ch := make(chan coreexecutor.StreamChunk, 1)
+		ch <- coreexecutor.StreamChunk{Payload: e.successPayload}
+		close(ch)
+		return &coreexecutor.StreamResult{Chunks: ch}, nil
+	}
+
+	streamErr := &coreauth.Error{
+		Code:       "upstream_closed",
+		Message:    "upstream closed",
+		Retryable:  false,
+		HTTPStatus: http.StatusBadGateway,
+	}
+	if e.resultErrOnly {
+		resultErr := error(streamErr)
+		if e.resultErr != nil {
+			resultErr = e.resultErr
+		}
+		ch := make(chan coreexecutor.StreamChunk, 2)
+		if len(e.preludePayload) > 0 {
+			ch <- coreexecutor.StreamChunk{Payload: e.preludePayload}
+		}
+		resultPayload := e.resultPayload
+		if len(resultPayload) == 0 {
+			resultPayload = []byte("partial")
+		}
+		ch <- coreexecutor.StreamChunk{Payload: resultPayload, ResultErr: resultErr}
+		close(ch)
+		return &coreexecutor.StreamResult{Chunks: ch}, nil
+	}
 
 	ch := make(chan coreexecutor.StreamChunk, 2)
 	ch <- coreexecutor.StreamChunk{Payload: []byte("partial")}
-	ch <- coreexecutor.StreamChunk{
-		Err: &coreauth.Error{
-			Code:       "upstream_closed",
-			Message:    "upstream closed",
-			Retryable:  false,
-			HTTPStatus: http.StatusBadGateway,
-		},
-	}
+	ch <- coreexecutor.StreamChunk{Err: streamErr}
 	close(ch)
 	return &coreexecutor.StreamResult{Chunks: ch}, nil
 }
@@ -329,8 +392,8 @@ func (e *authAwareStreamExecutor) AuthIDs() []string {
 	return out
 }
 
-func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
-	executor := &failOnceStreamExecutor{}
+func TestExecuteStreamWithAuthManager_RetriesBootstrapResultErrorBeforeForwarding(t *testing.T) {
+	executor := &failOnceStreamExecutor{resultErrFirst: true}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
@@ -338,7 +401,11 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 		ID:       "auth1",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"email": "test1@example.com"},
+		Metadata: map[string]any{
+			"email":         "test1@example.com",
+			"access_token":  "access-token-1",
+			"refresh_token": "refresh-token-1",
+		},
 	}
 	if _, err := manager.Register(context.Background(), auth1); err != nil {
 		t.Fatalf("manager.Register(auth1): %v", err)
@@ -348,7 +415,11 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 		ID:       "auth2",
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"email": "test2@example.com"},
+		Metadata: map[string]any{
+			"email":         "test2@example.com",
+			"access_token":  "access-token-2",
+			"refresh_token": "refresh-token-2",
+		},
 	}
 	if _, err := manager.Register(context.Background(), auth2); err != nil {
 		t.Fatalf("manager.Register(auth2): %v", err)
@@ -388,6 +459,9 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	}
 	if executor.Calls() != 2 {
 		t.Fatalf("expected 2 stream attempts, got %d", executor.Calls())
+	}
+	if executor.Refreshes() != 1 {
+		t.Fatalf("expected 1 credential refresh, got %d", executor.Refreshes())
 	}
 	upstreamAttemptHeader := upstreamHeaders.Get("X-Upstream-Attempt")
 	if upstreamAttemptHeader != "2" {
@@ -772,8 +846,11 @@ func TestExecuteStreamWithAuthManager_HeaderPassthroughDisabledByDefault(t *test
 	if string(got) != "ok" {
 		t.Fatalf("expected payload ok, got %q", string(got))
 	}
-	if upstreamHeaders != nil {
-		t.Fatalf("expected nil upstream headers when passthrough is disabled, got %#v", upstreamHeaders)
+	if got := upstreamHeaders.Get("X-Codex-Turn-State"); got != "state-2" {
+		t.Fatalf("X-Codex-Turn-State = %q, want state-2", got)
+	}
+	if got := upstreamHeaders.Get("X-Upstream-Attempt"); got != "" {
+		t.Fatalf("X-Upstream-Attempt = %q, want empty with passthrough disabled", got)
 	}
 }
 
@@ -844,6 +921,214 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 	}
 	if executor.Calls() != 1 {
 		t.Fatalf("expected 1 stream attempt, got %d", executor.Calls())
+	}
+
+	var success, failed int64
+	for _, authID := range []string{auth1.ID, auth2.ID} {
+		updated, ok := manager.GetByID(authID)
+		if !ok || updated == nil {
+			t.Fatalf("manager.GetByID(%q) returned ok=%t auth=%v", authID, ok, updated)
+		}
+		success += updated.Success
+		failed += updated.Failed
+	}
+	if success != 0 || failed != 1 {
+		t.Fatalf("auth totals = success=%d failed=%d, want 0/1", success, failed)
+	}
+}
+
+func TestAuthManagerStreamResultErrorMarksFailureAndPreservesRetryAfter(t *testing.T) {
+	const internalError = "confused upstream identity"
+	retryAfter := 15 * time.Minute
+	executor := &payloadThenErrorStreamExecutor{
+		resultErrOnly:  true,
+		preludePayload: []byte("partial"),
+		resultPayload:  []byte("failed"),
+		resultErr: &streamResultError{
+			message:    internalError,
+			status:     http.StatusTooManyRequests,
+			retryAfter: retryAfter,
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "auth-result-error", Provider: "codex", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(): %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	startedAt := time.Now()
+	result, err := manager.ExecuteStream(
+		context.Background(),
+		[]string{"codex"},
+		coreexecutor.Request{Model: "test-model"},
+		coreexecutor.Options{},
+	)
+	if err != nil {
+		t.Fatalf("manager.ExecuteStream(): %v", err)
+	}
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before payload")
+	}
+	if string(chunk.Payload) != "partial" || chunk.Err != nil || chunk.ResultErr != nil {
+		t.Fatalf("forwarded chunk = payload %q err=%v result_err=%v", chunk.Payload, chunk.Err, chunk.ResultErr)
+	}
+	chunk, ok = <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before result error payload")
+	}
+	if string(chunk.Payload) != "failed" || chunk.Err != nil || chunk.ResultErr != nil {
+		t.Fatalf("result error chunk = payload %q err=%v result_err=%v", chunk.Payload, chunk.Err, chunk.ResultErr)
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("manager.GetByID(%q) returned ok=%t auth=%v", auth.ID, ok, updated)
+	}
+	if updated.Success != 0 || updated.Failed != 1 {
+		t.Fatalf("auth totals = success=%d failed=%d, want 0/1", updated.Success, updated.Failed)
+	}
+	state := updated.ModelStates["test-model"]
+	if state == nil {
+		t.Fatal("test-model state is nil")
+	}
+	if state.StatusMessage != internalError {
+		t.Fatalf("model status message = %q, want %q", state.StatusMessage, internalError)
+	}
+	finishedAt := time.Now()
+	if state.NextRetryAfter.Before(startedAt.Add(retryAfter)) || state.NextRetryAfter.After(finishedAt.Add(retryAfter)) {
+		t.Fatalf("model retry time = %v, want provider delay %v", state.NextRetryAfter, retryAfter)
+	}
+	if _, ok = <-result.Chunks; ok {
+		t.Fatal("unexpected chunk after payload")
+	}
+}
+
+func TestAuthManagerBootstrapResultErrorSeparatesClientAndAccounting(t *testing.T) {
+	const clientPayload = `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"limited original client identity"}}`
+	const internalError = `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"limited confused upstream identity"}}`
+	retryAfter := 15 * time.Minute
+	executor := &payloadThenErrorStreamExecutor{
+		resultErrOnly: true,
+		resultPayload: []byte(clientPayload),
+		resultErr: &streamResultError{
+			message:    internalError,
+			status:     http.StatusTooManyRequests,
+			retryAfter: retryAfter,
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	manager.SetRetryConfig(0, 0, 1)
+
+	auth := &coreauth.Auth{ID: "auth-bootstrap-result-error", Provider: "codex", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(): %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	startedAt := time.Now()
+	result, err := manager.ExecuteStream(
+		context.Background(),
+		[]string{"codex"},
+		coreexecutor.Request{Model: "test-model"},
+		coreexecutor.Options{},
+	)
+	if err != nil {
+		t.Fatalf("manager.ExecuteStream(): %v", err)
+	}
+
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before client error payload")
+	}
+	if string(chunk.Payload) != clientPayload || chunk.Err != nil || chunk.ResultErr != nil {
+		t.Fatalf("client chunk = payload %q err=%v result_err=%v", chunk.Payload, chunk.Err, chunk.ResultErr)
+	}
+	if _, ok = <-result.Chunks; ok {
+		t.Fatal("unexpected chunk after client error payload")
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("manager.GetByID(%q) returned ok=%t auth=%v", auth.ID, ok, updated)
+	}
+	state := updated.ModelStates["test-model"]
+	if state == nil || state.StatusMessage != internalError {
+		t.Fatalf("model status = %#v, want internal error %q", state, internalError)
+	}
+	finishedAt := time.Now()
+	if state.NextRetryAfter.Before(startedAt.Add(retryAfter)) || state.NextRetryAfter.After(finishedAt.Add(retryAfter)) {
+		t.Fatalf("model retry time = %v, want provider delay %v", state.NextRetryAfter, retryAfter)
+	}
+	if !state.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
+		t.Fatalf("quota recovery time = %v, want %v", state.Quota.NextRecoverAt, state.NextRetryAfter)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_RetriesBootstrapResultErrorWithCoolingDisabled(t *testing.T) {
+	const clientErrorPayload = `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"limited original client identity"}}`
+	const successPayload = `{"type":"response.completed","response":{"id":"resp-1"}}`
+	executor := &payloadThenErrorStreamExecutor{
+		resultErrOnly:         true,
+		resultPayload:         []byte(clientErrorPayload),
+		succeedAfterResultErr: true,
+		successPayload:        []byte(successPayload),
+		resultErr: &streamResultError{
+			message:    `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"limited confused upstream identity"}}`,
+			status:     http.StatusTooManyRequests,
+			retryAfter: time.Millisecond,
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	manager.SetRetryConfig(1, 100*time.Millisecond, 0)
+
+	auth := &coreauth.Auth{
+		ID:       "auth-bootstrap-retry-after",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"disable_cooling": true},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(): %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	result, err := manager.ExecuteStream(
+		context.Background(),
+		[]string{"codex"},
+		coreexecutor.Request{Model: "test-model"},
+		coreexecutor.Options{},
+	)
+	if err != nil {
+		t.Fatalf("manager.ExecuteStream(): %v", err)
+	}
+	if executor.Calls() != 2 {
+		t.Fatalf("stream calls = %d, want 2", executor.Calls())
+	}
+
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before response payload")
+	}
+	if string(chunk.Payload) != successPayload || chunk.Err != nil || chunk.ResultErr != nil {
+		t.Fatalf("client chunk = payload %q err=%v result_err=%v", chunk.Payload, chunk.Err, chunk.ResultErr)
+	}
+	if _, ok = <-result.Chunks; ok {
+		t.Fatal("unexpected chunk after response payload")
 	}
 }
 

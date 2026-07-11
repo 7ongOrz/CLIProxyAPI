@@ -17,6 +17,12 @@ var gatewayHeaderPrefixes = []string{
 	"x-bt-",
 }
 
+// protocolResponseHeaders carry client protocol state and must be returned even
+// when generic upstream header passthrough is disabled.
+var protocolResponseHeaders = []string{
+	"X-Codex-Turn-State",
+}
+
 // hopByHopHeaders lists RFC 7230 Section 6.1 hop-by-hop headers that MUST NOT
 // be forwarded by proxies, plus security-sensitive headers that should not leak.
 var hopByHopHeaders = map[string]struct{}{
@@ -99,6 +105,20 @@ func connectionScopedHeaders(src http.Header) map[string]struct{} {
 		}
 	}
 	return scoped
+}
+
+func preserveProtocolResponseHeaders(dst, src http.Header) http.Header {
+	for _, key := range protocolResponseHeaders {
+		values := src.Values(key)
+		if len(values) == 0 {
+			continue
+		}
+		if dst == nil {
+			dst = make(http.Header)
+		}
+		dst[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
+	}
+	return dst
 }
 
 // WriteUpstreamHeaders writes filtered upstream headers to the gin response writer.

@@ -1842,17 +1842,17 @@ func finalInterceptorHeaders(current, intercepted http.Header) http.Header {
 }
 
 func downstreamHeadersFromExecutor(headers http.Header, passthrough bool) http.Header {
-	if !passthrough {
-		return nil
+	if passthrough {
+		return FilterUpstreamHeaders(headers)
 	}
-	return FilterUpstreamHeaders(headers)
+	return preserveProtocolResponseHeaders(nil, headers)
 }
 
 func downstreamHeadersAfterInterceptors(baseRaw, finalRaw http.Header, passthrough bool) http.Header {
 	if passthrough {
 		return FilterUpstreamHeaders(finalRaw)
 	}
-	return FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw))
+	return preserveProtocolResponseHeaders(FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw)), finalRaw)
 }
 
 func diffHeaders(base, next http.Header) http.Header {

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -156,7 +157,9 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
-	ginCtx.Request.Header.Set("X-Codex-Turn-Metadata", `{"prompt_cache_key":"cache-1","turn_id":"turn-1","window_id":"cache-1:0"}`)
+	ginCtx.Request.Header.Set("X-Codex-Installation-Id", "install-1")
+	ginCtx.Request.Header.Set("X-Codex-Turn-Metadata", `{"installation_id":"install-1","prompt_cache_key":"cache-1","session_id":"cache-1","thread_id":"cache-1","turn_id":"turn-1","forked_from_thread_id":"parent-1","parent_thread_id":"parent-1","window_id":"cache-1:2"}`)
+	ginCtx.Request.Header.Set("X-Codex-Parent-Thread-Id", "parent-1")
 	ginCtx.Request.Header.Set("X-Client-Request-Id", "client-request-1")
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
@@ -165,7 +168,7 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 		Codex:   config.CodexConfig{IdentityConfuse: true},
 	}}
 	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex"}
-	rawJSON := []byte(`{"model":"gpt-5-codex","stream":true,"client_metadata":{"x-codex-turn-metadata":"{\"prompt_cache_key\":\"cache-1\",\"turn_id\":\"turn-1\",\"window_id\":\"cache-1:0\"}","x-codex-window-id":"cache-1:0"}}`)
+	rawJSON := []byte(`{"model":"gpt-5-codex","stream":true,"client_metadata":{"session_id":"cache-1","thread_id":"cache-1","turn_id":"turn-1","x-codex-turn-metadata":"{\"installation_id\":\"install-1\",\"prompt_cache_key\":\"cache-1\",\"session_id\":\"cache-1\",\"thread_id\":\"cache-1\",\"turn_id\":\"turn-1\",\"forked_from_thread_id\":\"parent-1\",\"parent_thread_id\":\"parent-1\",\"window_id\":\"cache-1:2\"}","x-codex-window-id":"cache-1:2","x-codex-parent-thread-id":"parent-1"}}`)
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
 		Payload: []byte(`{"model":"gpt-5-codex","prompt_cache_key":"cache-1","client_metadata":{"x-codex-installation-id":"install-1"}}`),
@@ -181,25 +184,54 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 
 	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-1", "prompt-cache", "cache-1")
 	expectedTurnID := codexIdentityConfuseUUID("auth-1", "turn", "turn-1")
+	expectedParentThreadID := codexIdentityConfuseUUID("auth-1", "prompt-cache", "parent-1")
 	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
+	}
+	if strings.Contains(string(body), "cache-1") {
+		t.Fatalf("upstream body still contains original prompt cache key: %s", string(body))
 	}
 	expectedInstallationID := codexIdentityConfuseUUID("auth-1", "installation", "install-1")
 	if gotID := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); gotID != expectedInstallationID {
 		t.Fatalf("installation id = %q, want %q", gotID, expectedInstallationID)
 	}
+	if gotID := httpReq.Header.Get("X-Codex-Installation-Id"); gotID != expectedInstallationID {
+		t.Fatalf("X-Codex-Installation-Id = %q, want %q", gotID, expectedInstallationID)
+	}
+	for _, path := range []string{"client_metadata.session_id", "client_metadata.thread_id"} {
+		if got := gjson.GetBytes(body, path).String(); got != expectedPromptCacheKey {
+			t.Fatalf("%s = %q, want %q", path, got, expectedPromptCacheKey)
+		}
+	}
+	if got := gjson.GetBytes(body, "client_metadata.turn_id").String(); got != expectedTurnID {
+		t.Fatalf("client_metadata.turn_id = %q, want %q", got, expectedTurnID)
+	}
 	gotBodyMetadata := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String()
+	if got := gjson.Get(gotBodyMetadata, "installation_id").String(); got != expectedInstallationID {
+		t.Fatalf("client_metadata.x-codex-turn-metadata.installation_id = %q, want %q", got, expectedInstallationID)
+	}
 	if gotMetadataPromptCacheKey := gjson.Get(gotBodyMetadata, "prompt_cache_key").String(); gotMetadataPromptCacheKey != expectedPromptCacheKey {
 		t.Fatalf("client_metadata.x-codex-turn-metadata.prompt_cache_key = %q, want %q", gotMetadataPromptCacheKey, expectedPromptCacheKey)
+	}
+	for _, field := range []string{"session_id", "thread_id"} {
+		if got := gjson.Get(gotBodyMetadata, field).String(); got != expectedPromptCacheKey {
+			t.Fatalf("client_metadata.x-codex-turn-metadata.%s = %q, want %q", field, got, expectedPromptCacheKey)
+		}
 	}
 	if gotMetadataTurnID := gjson.Get(gotBodyMetadata, "turn_id").String(); gotMetadataTurnID != expectedTurnID {
 		t.Fatalf("client_metadata.x-codex-turn-metadata.turn_id = %q, want %q", gotMetadataTurnID, expectedTurnID)
 	}
-	if gotMetadataWindowID := gjson.Get(gotBodyMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":0" {
-		t.Fatalf("client_metadata.x-codex-turn-metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":0")
+	if gotMetadataParentThreadID := gjson.Get(gotBodyMetadata, "parent_thread_id").String(); gotMetadataParentThreadID != expectedParentThreadID {
+		t.Fatalf("client_metadata.x-codex-turn-metadata.parent_thread_id = %q, want %q", gotMetadataParentThreadID, expectedParentThreadID)
 	}
-	if gotWindowID := gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(); gotWindowID != expectedPromptCacheKey+":0" {
-		t.Fatalf("client_metadata.x-codex-window-id = %q, want %q", gotWindowID, expectedPromptCacheKey+":0")
+	if got := gjson.Get(gotBodyMetadata, "forked_from_thread_id").String(); got != expectedParentThreadID {
+		t.Fatalf("client_metadata.x-codex-turn-metadata.forked_from_thread_id = %q, want %q", got, expectedParentThreadID)
+	}
+	if gotMetadataWindowID := gjson.Get(gotBodyMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":2" {
+		t.Fatalf("client_metadata.x-codex-turn-metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":2")
+	}
+	if gotWindowID := gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(); gotWindowID != expectedPromptCacheKey+":2" {
+		t.Fatalf("client_metadata.x-codex-window-id = %q, want %q", gotWindowID, expectedPromptCacheKey+":2")
 	}
 	if gotHeader := httpReq.Header["Session_id"]; len(gotHeader) != 1 || gotHeader[0] != expectedPromptCacheKey {
 		t.Fatalf("Session_id = %#v, want [%q]", gotHeader, expectedPromptCacheKey)
@@ -212,18 +244,417 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if gotCanonicalSession := httpReq.Header.Get("Session-Id"); gotCanonicalSession != "" {
 		t.Fatalf("Session-Id = %q, want empty", gotCanonicalSession)
 	}
-	if gotWindow := httpReq.Header.Get("X-Codex-Window-Id"); gotWindow != expectedPromptCacheKey+":0" {
-		t.Fatalf("X-Codex-Window-Id = %q, want %q", gotWindow, expectedPromptCacheKey+":0")
+	if gotWindow := httpReq.Header.Get("X-Codex-Window-Id"); gotWindow != expectedPromptCacheKey+":2" {
+		t.Fatalf("X-Codex-Window-Id = %q, want %q", gotWindow, expectedPromptCacheKey+":2")
+	}
+	if gotParentThreadID := httpReq.Header.Get("X-Codex-Parent-Thread-Id"); gotParentThreadID != expectedParentThreadID {
+		t.Fatalf("X-Codex-Parent-Thread-Id = %q, want %q", gotParentThreadID, expectedParentThreadID)
 	}
 	gotHeaderMetadata := httpReq.Header.Get("X-Codex-Turn-Metadata")
+	if got := gjson.Get(gotHeaderMetadata, "installation_id").String(); got != expectedInstallationID {
+		t.Fatalf("X-Codex-Turn-Metadata.installation_id = %q, want %q", got, expectedInstallationID)
+	}
 	if gotMetadataPromptCacheKey := gjson.Get(gotHeaderMetadata, "prompt_cache_key").String(); gotMetadataPromptCacheKey != expectedPromptCacheKey {
 		t.Fatalf("X-Codex-Turn-Metadata.prompt_cache_key = %q, want %q", gotMetadataPromptCacheKey, expectedPromptCacheKey)
+	}
+	for _, field := range []string{"session_id", "thread_id"} {
+		if got := gjson.Get(gotHeaderMetadata, field).String(); got != expectedPromptCacheKey {
+			t.Fatalf("X-Codex-Turn-Metadata.%s = %q, want %q", field, got, expectedPromptCacheKey)
+		}
 	}
 	if gotMetadataTurnID := gjson.Get(gotHeaderMetadata, "turn_id").String(); gotMetadataTurnID != expectedTurnID {
 		t.Fatalf("X-Codex-Turn-Metadata.turn_id = %q, want %q", gotMetadataTurnID, expectedTurnID)
 	}
-	if gotMetadataWindowID := gjson.Get(gotHeaderMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":0" {
-		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":0")
+	if gotMetadataParentThreadID := gjson.Get(gotHeaderMetadata, "parent_thread_id").String(); gotMetadataParentThreadID != expectedParentThreadID {
+		t.Fatalf("X-Codex-Turn-Metadata.parent_thread_id = %q, want %q", gotMetadataParentThreadID, expectedParentThreadID)
+	}
+	if got := gjson.Get(gotHeaderMetadata, "forked_from_thread_id").String(); got != expectedParentThreadID {
+		t.Fatalf("X-Codex-Turn-Metadata.forked_from_thread_id = %q, want %q", got, expectedParentThreadID)
+	}
+	if gotMetadataWindowID := gjson.Get(gotHeaderMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":2" {
+		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":2")
+	}
+}
+
+func TestCodexIdentityConfusePreservesParentThreadAcrossRequests(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{ID: "auth-parent", Provider: "codex"}
+	parentThreadID := "parent-thread-1"
+	parentRequest := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"parent-thread-1","client_metadata":{"thread_id":"parent-thread-1","x-codex-window-id":"parent-thread-1:0","x-codex-turn-metadata":"{\"thread_id\":\"parent-thread-1\",\"window_id\":\"parent-thread-1:0\"}"}}`)
+
+	parentBody, _ := applyCodexIdentityConfuseBody(cfg, auth, parentRequest, parentRequest)
+	confusedParentThreadID := gjson.GetBytes(parentBody, "client_metadata.thread_id").String()
+	if confusedParentThreadID != codexIdentityConfuseUUID(auth.ID, "prompt-cache", parentThreadID) {
+		t.Fatalf("parent thread id = %q, want deterministic confused id", confusedParentThreadID)
+	}
+	if got := gjson.GetBytes(parentBody, "prompt_cache_key").String(); got != confusedParentThreadID {
+		t.Fatalf("parent prompt_cache_key = %q, want parent thread id %q", got, confusedParentThreadID)
+	}
+	if got := gjson.GetBytes(parentBody, "client_metadata.x-codex-window-id").String(); got != confusedParentThreadID+":0" {
+		t.Fatalf("parent window id = %q, want %q", got, confusedParentThreadID+":0")
+	}
+	parentTurnMetadata := gjson.GetBytes(parentBody, "client_metadata.x-codex-turn-metadata").String()
+	if got := gjson.Get(parentTurnMetadata, "thread_id").String(); got != confusedParentThreadID {
+		t.Fatalf("parent turn metadata thread id = %q, want %q", got, confusedParentThreadID)
+	}
+	if got := gjson.Get(parentTurnMetadata, "window_id").String(); got != confusedParentThreadID+":0" {
+		t.Fatalf("parent turn metadata window id = %q, want %q", got, confusedParentThreadID+":0")
+	}
+	if strings.Contains(string(parentBody), parentThreadID) {
+		t.Fatalf("parent body still contains original thread id: %s", string(parentBody))
+	}
+
+	childRequest := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"child-thread-1","client_metadata":{"thread_id":"child-thread-1","x-codex-window-id":"child-thread-1:0","x-codex-parent-thread-id":"parent-thread-1","x-codex-turn-metadata":"{\"thread_id\":\"child-thread-1\",\"window_id\":\"child-thread-1:0\",\"forked_from_thread_id\":\"parent-thread-1\",\"parent_thread_id\":\"parent-thread-1\"}"}}`)
+	childBody, childState := applyCodexIdentityConfuseBody(cfg, auth, childRequest, childRequest)
+	if got := gjson.GetBytes(childBody, "client_metadata.x-codex-parent-thread-id").String(); got != confusedParentThreadID {
+		t.Fatalf("child parent thread id = %q, want mapped parent thread id %q", got, confusedParentThreadID)
+	}
+	childTurnMetadata := gjson.GetBytes(childBody, "client_metadata.x-codex-turn-metadata").String()
+	for _, field := range []string{"forked_from_thread_id", "parent_thread_id"} {
+		if got := gjson.Get(childTurnMetadata, field).String(); got != confusedParentThreadID {
+			t.Fatalf("child turn metadata %s = %q, want mapped parent thread id %q", field, got, confusedParentThreadID)
+		}
+	}
+
+	childHeaders := http.Header{}
+	childHeaders.Set("X-Codex-Parent-Thread-Id", parentThreadID)
+	childHeaders.Set("X-Codex-Turn-Metadata", `{"forked_from_thread_id":"parent-thread-1","parent_thread_id":"parent-thread-1"}`)
+	applyCodexIdentityConfuseHeaders(childHeaders, &childState)
+	if got := childHeaders.Get("X-Codex-Parent-Thread-Id"); got != confusedParentThreadID {
+		t.Fatalf("child parent thread header = %q, want mapped parent thread id %q", got, confusedParentThreadID)
+	}
+	childHeaderMetadata := childHeaders.Get("X-Codex-Turn-Metadata")
+	for _, field := range []string{"forked_from_thread_id", "parent_thread_id"} {
+		if got := gjson.Get(childHeaderMetadata, field).String(); got != confusedParentThreadID {
+			t.Fatalf("child header metadata %s = %q, want mapped parent thread id %q", field, got, confusedParentThreadID)
+		}
+	}
+	if strings.Contains(string(childBody), parentThreadID) || strings.Contains(childHeaders.Get("X-Codex-Parent-Thread-Id"), parentThreadID) || strings.Contains(childHeaderMetadata, parentThreadID) {
+		t.Fatal("child request still contains original parent thread id")
+	}
+
+	otherAuth := &cliproxyauth.Auth{ID: "auth-other", Provider: "codex"}
+	otherParentBody, _ := applyCodexIdentityConfuseBody(cfg, otherAuth, parentRequest, parentRequest)
+	if got := gjson.GetBytes(otherParentBody, "client_metadata.thread_id").String(); got == confusedParentThreadID {
+		t.Fatalf("different auth mapped parent thread id to the same value %q", got)
+	}
+}
+
+func TestApplyCodexIdentityConfuseBodyRemapsDistinctOfficialMetadata(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{ID: "auth-distinct", Provider: "codex"}
+	rawTurnMetadata := `{"installation_id":"install-2","session_id":"session-2","thread_id":"thread-2","turn_id":"turn-2","window_id":"thread-2:4","forked_from_thread_id":"parent-2","parent_thread_id":"parent-2","note":"guardian:parent-2"}`
+	rawJSON := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"guardian:parent-2","client_metadata":{"x-codex-installation-id":"install-2","session_id":"session-2","thread_id":"thread-2","turn_id":"turn-2","x-codex-window-id":"thread-2:4","x-codex-parent-thread-id":"parent-2","x-codex-turn-metadata":"{\"installation_id\":\"install-2\",\"session_id\":\"session-2\",\"thread_id\":\"thread-2\",\"turn_id\":\"turn-2\",\"window_id\":\"thread-2:4\",\"forked_from_thread_id\":\"parent-2\",\"parent_thread_id\":\"parent-2\",\"note\":\"guardian:parent-2\"}"}}`)
+
+	body, state := applyCodexIdentityConfuseBody(cfg, auth, rawJSON, rawJSON)
+
+	expectedPromptCacheKey := codexIdentityConfuseUUID(auth.ID, "prompt-cache", "guardian:parent-2")
+	expectedInstallationID := codexIdentityConfuseUUID(auth.ID, "installation", "install-2")
+	expectedSessionID := codexIdentityConfuseUUID(auth.ID, "session", "session-2")
+	expectedThreadID := codexIdentityConfuseUUID(auth.ID, "prompt-cache", "thread-2")
+	expectedTurnID := codexIdentityConfuseUUID(auth.ID, "turn", "turn-2")
+	expectedParentThreadID := codexIdentityConfuseUUID(auth.ID, "prompt-cache", "parent-2")
+	expectedWindowID := expectedThreadID + ":4"
+
+	for _, tt := range []struct {
+		path string
+		want string
+	}{
+		{path: "prompt_cache_key", want: expectedPromptCacheKey},
+		{path: "client_metadata.x-codex-installation-id", want: expectedInstallationID},
+		{path: "client_metadata.session_id", want: expectedSessionID},
+		{path: "client_metadata.thread_id", want: expectedThreadID},
+		{path: "client_metadata.turn_id", want: expectedTurnID},
+		{path: "client_metadata.x-codex-window-id", want: expectedWindowID},
+		{path: "client_metadata.x-codex-parent-thread-id", want: expectedParentThreadID},
+	} {
+		if got := gjson.GetBytes(body, tt.path).String(); got != tt.want {
+			t.Fatalf("%s = %q, want %q", tt.path, got, tt.want)
+		}
+	}
+
+	turnMetadata := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String()
+	for _, tt := range []struct {
+		field string
+		want  string
+	}{
+		{field: "installation_id", want: expectedInstallationID},
+		{field: "session_id", want: expectedSessionID},
+		{field: "thread_id", want: expectedThreadID},
+		{field: "turn_id", want: expectedTurnID},
+		{field: "window_id", want: expectedWindowID},
+		{field: "forked_from_thread_id", want: expectedParentThreadID},
+		{field: "parent_thread_id", want: expectedParentThreadID},
+	} {
+		if got := gjson.Get(turnMetadata, tt.field).String(); got != tt.want {
+			t.Fatalf("turn metadata %s = %q, want %q", tt.field, got, tt.want)
+		}
+	}
+	if got := gjson.Get(turnMetadata, "note").String(); got != "guardian:parent-2" {
+		t.Fatalf("turn metadata note = %q, want unchanged", got)
+	}
+
+	headers := http.Header{}
+	headers.Set("Session_id", "session-2")
+	headers.Set("Thread-Id", "thread-2")
+	headers.Set("X-Client-Request-Id", "thread-2")
+	headers.Set("X-Codex-Window-Id", "thread-2:4")
+	headers.Set("X-Codex-Parent-Thread-Id", "parent-2")
+	headers.Set("X-Codex-Turn-Metadata", rawTurnMetadata)
+	applyCodexIdentityConfuseHeaders(headers, &state)
+
+	if got := codexSessionHeaderValue(headers); got != expectedSessionID {
+		t.Fatalf("session_id = %q, want %q", got, expectedSessionID)
+	}
+	for _, headerName := range []string{"Thread-Id", "X-Client-Request-Id"} {
+		if got := headers.Get(headerName); got != expectedThreadID {
+			t.Fatalf("%s = %q, want %q", headerName, got, expectedThreadID)
+		}
+	}
+	if got := headers.Get("X-Codex-Window-Id"); got != expectedWindowID {
+		t.Fatalf("X-Codex-Window-Id = %q, want %q", got, expectedWindowID)
+	}
+	if got := headers.Get("X-Codex-Parent-Thread-Id"); got != expectedParentThreadID {
+		t.Fatalf("X-Codex-Parent-Thread-Id = %q, want %q", got, expectedParentThreadID)
+	}
+
+	echo := []byte(`{"prompt_cache_key":"guardian:parent-2","installation_id":"install-2","session_id":"session-2","thread_id":"thread-2","turn_id":"turn-2","window_id":"thread-2:4","parent_thread_id":"parent-2"}`)
+	confusedEcho := applyCodexIdentityConfuseResponsePayload(echo, state)
+	exposedEcho := applyCodexIdentityExposeResponsePayload(confusedEcho, state)
+	if string(exposedEcho) != string(echo) {
+		t.Fatalf("identity response round trip = %s, want %s", exposedEcho, echo)
+	}
+}
+
+func TestApplyCodexIdentityConfuseBodyDerivesPromptCacheKeyFromMetadata(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex"}
+	rawJSON := []byte(`{"model":"gpt-5-codex","client_metadata":{"x-codex-turn-metadata":"{\"prompt_cache_key\":\"cache-meta-1\",\"turn_id\":\"turn-meta-1\",\"parent_thread_id\":\"parent-meta-1\",\"window_id\":\"cache-meta-1:6\"}","x-codex-window-id":"cache-meta-1:6","x-codex-parent-thread-id":"parent-meta-1"}}`)
+
+	body, state := applyCodexIdentityConfuseBody(cfg, auth, []byte(`{"model":"gpt-5-codex"}`), rawJSON)
+
+	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-1", "prompt-cache", "cache-meta-1")
+	expectedTurnID := codexIdentityConfuseUUID("auth-1", "turn", "turn-meta-1")
+	if state.promptCacheKey != expectedPromptCacheKey {
+		t.Fatalf("state.promptCacheKey = %q, want %q", state.promptCacheKey, expectedPromptCacheKey)
+	}
+	if strings.Contains(string(body), "cache-meta-1") {
+		t.Fatalf("upstream body still contains metadata prompt cache key: %s", string(body))
+	}
+	if strings.Contains(string(body), "parent-meta-1") {
+		t.Fatalf("upstream body still contains parent thread id: %s", string(body))
+	}
+	gotMetadata := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String()
+	if got := gjson.Get(gotMetadata, "prompt_cache_key").String(); got != expectedPromptCacheKey {
+		t.Fatalf("metadata prompt_cache_key = %q, want %q", got, expectedPromptCacheKey)
+	}
+	if got := gjson.Get(gotMetadata, "turn_id").String(); got != expectedTurnID {
+		t.Fatalf("metadata turn_id = %q, want %q", got, expectedTurnID)
+	}
+	expectedParentThreadID := codexIdentityConfuseUUID("auth-1", "prompt-cache", "parent-meta-1")
+	if got := gjson.Get(gotMetadata, "parent_thread_id").String(); got != expectedParentThreadID {
+		t.Fatalf("metadata parent_thread_id = %q, want %q", got, expectedParentThreadID)
+	}
+	if got := gjson.Get(gotMetadata, "window_id").String(); got != expectedPromptCacheKey+":6" {
+		t.Fatalf("metadata window_id = %q, want %q", got, expectedPromptCacheKey+":6")
+	}
+	if got := gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(); got != expectedPromptCacheKey+":6" {
+		t.Fatalf("client_metadata.x-codex-window-id = %q, want %q", got, expectedPromptCacheKey+":6")
+	}
+	if got := gjson.GetBytes(body, "client_metadata.x-codex-parent-thread-id").String(); got != expectedParentThreadID {
+		t.Fatalf("parent thread id = %q, want %q", got, expectedParentThreadID)
+	}
+}
+
+func TestApplyCodexIdentityConfuseBodyConfusesRawJSONInstallationID(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex"}
+	rawJSON := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"cache-1","client_metadata":{"x-codex-installation-id":"install-raw-1"}}`)
+
+	body, _ := applyCodexIdentityConfuseBody(cfg, auth, []byte(`{"model":"gpt-5-codex"}`), rawJSON)
+
+	expectedInstallationID := codexIdentityConfuseUUID("auth-1", "installation", "install-raw-1")
+	if got := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); got != expectedInstallationID {
+		t.Fatalf("installation id = %q, want %q", got, expectedInstallationID)
+	}
+	if strings.Contains(string(body), "install-raw-1") {
+		t.Fatalf("upstream body still contains raw installation id: %s", string(body))
+	}
+}
+
+func TestApplyCodexIdentityConfuseHeadersDerivesPromptCacheKeyFromHeaders(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("X-Codex-Turn-Metadata", `{"prompt_cache_key":"cache-header-1","turn_id":"turn-header-1","parent_thread_id":"parent-header-1","window_id":"cache-header-1:7"}`)
+	headers.Set("X-Codex-Window-Id", "cache-header-1:7")
+	headers.Set("X-Codex-Parent-Thread-Id", "parent-header-1")
+	headers.Set("Thread-Id", "thread-header-1")
+	state := &codexIdentityConfuseState{enabled: true, authID: "auth-1"}
+
+	applyCodexIdentityConfuseHeaders(headers, state)
+
+	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-1", "prompt-cache", "cache-header-1")
+	expectedThreadID := codexIdentityConfuseUUID("auth-1", "prompt-cache", "thread-header-1")
+	expectedTurnID := codexIdentityConfuseUUID("auth-1", "turn", "turn-header-1")
+	if strings.Contains(headers.Get("X-Codex-Turn-Metadata"), "cache-header-1") {
+		t.Fatalf("upstream turn metadata still contains original prompt cache key: %s", headers.Get("X-Codex-Turn-Metadata"))
+	}
+	if got := headers.Get("X-Codex-Parent-Thread-Id"); got == "parent-header-1" || got != codexIdentityConfuseUUID("auth-1", "prompt-cache", "parent-header-1") {
+		t.Fatalf("X-Codex-Parent-Thread-Id = %q, want confused parent thread id", got)
+	}
+	confusedParentThreadID := headers.Get("X-Codex-Parent-Thread-Id")
+	applyCodexIdentityConfuseHeaders(headers, state)
+	if got := headers.Get("X-Codex-Parent-Thread-Id"); got != confusedParentThreadID {
+		t.Fatalf("X-Codex-Parent-Thread-Id was confused twice: got %q, want %q", got, confusedParentThreadID)
+	}
+	if got := headers.Get("X-Codex-Window-Id"); got != expectedPromptCacheKey+":7" {
+		t.Fatalf("X-Codex-Window-Id = %q, want %q", got, expectedPromptCacheKey+":7")
+	}
+	if got := headers.Get("Thread-Id"); got != expectedThreadID {
+		t.Fatalf("Thread-Id = %q, want %q", got, expectedThreadID)
+	}
+	gotMetadata := headers.Get("X-Codex-Turn-Metadata")
+	if got := gjson.Get(gotMetadata, "prompt_cache_key").String(); got != expectedPromptCacheKey {
+		t.Fatalf("metadata prompt_cache_key = %q, want %q", got, expectedPromptCacheKey)
+	}
+	if got := gjson.Get(gotMetadata, "turn_id").String(); got != expectedTurnID {
+		t.Fatalf("metadata turn_id = %q, want %q", got, expectedTurnID)
+	}
+	if got := gjson.Get(gotMetadata, "parent_thread_id").String(); got != confusedParentThreadID {
+		t.Fatalf("metadata parent_thread_id = %q, want %q", got, confusedParentThreadID)
+	}
+	if got := gjson.Get(gotMetadata, "window_id").String(); got != expectedPromptCacheKey+":7" {
+		t.Fatalf("metadata window_id = %q, want %q", got, expectedPromptCacheKey+":7")
+	}
+}
+
+func TestApplyCodexIdentityConfuseHeadersDerivesPromptCacheKeyFromWindowHeader(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("X-Codex-Window-Id", "cache-window-1:8")
+	headers.Set("Thread-Id", "thread-header-1")
+	state := &codexIdentityConfuseState{enabled: true, authID: "auth-1"}
+
+	applyCodexIdentityConfuseHeaders(headers, state)
+
+	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-1", "prompt-cache", "cache-window-1")
+	expectedThreadID := codexIdentityConfuseUUID("auth-1", "prompt-cache", "thread-header-1")
+	if got := headers.Get("X-Codex-Window-Id"); got != expectedPromptCacheKey+":8" {
+		t.Fatalf("X-Codex-Window-Id = %q, want %q", got, expectedPromptCacheKey+":8")
+	}
+	if got := headers.Get("Thread-Id"); got != expectedThreadID {
+		t.Fatalf("Thread-Id = %q, want %q", got, expectedThreadID)
+	}
+}
+
+func TestApplyCodexIdentityConfuseHeadersConfusesParentThreadWithoutPromptCacheKey(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("X-Codex-Parent-Thread-Id", "parent-only-1")
+	headers.Set("X-Codex-Turn-Metadata", `{"parent_thread_id":"parent-only-1"}`)
+	state := &codexIdentityConfuseState{enabled: true, authID: "auth-1"}
+
+	applyCodexIdentityConfuseHeaders(headers, state)
+
+	expectedParentThreadID := codexIdentityConfuseUUID("auth-1", "prompt-cache", "parent-only-1")
+	if got := headers.Get("X-Codex-Parent-Thread-Id"); got != expectedParentThreadID {
+		t.Fatalf("X-Codex-Parent-Thread-Id = %q, want %q", got, expectedParentThreadID)
+	}
+	gotMetadata := headers.Get("X-Codex-Turn-Metadata")
+	if got := gjson.Get(gotMetadata, "parent_thread_id").String(); got != expectedParentThreadID {
+		t.Fatalf("metadata parent_thread_id = %q, want %q", got, expectedParentThreadID)
+	}
+	if got := headers.Get("Thread-Id"); got != "" {
+		t.Fatalf("Thread-Id = %q, want empty without prompt cache key", got)
+	}
+	if got := headers.Get("X-Codex-Window-Id"); got != "" {
+		t.Fatalf("X-Codex-Window-Id = %q, want empty without prompt cache key", got)
+	}
+}
+
+func TestConfuseCodexWindowIDPreservesOnlyGeneration(t *testing.T) {
+	state := &codexIdentityConfuseState{
+		enabled:                true,
+		authID:                 "auth-1",
+		originalPromptCacheKey: "cache-1",
+		promptCacheKey:         codexIdentityConfuseUUID("auth-1", "prompt-cache", "cache-1"),
+	}
+
+	tests := []struct {
+		name     string
+		windowID string
+		want     string
+	}{
+		{
+			name:     "official original window generation",
+			windowID: "cache-1:2",
+			want:     state.promptCacheKey + ":2",
+		},
+		{
+			name:     "already confused window generation",
+			windowID: state.promptCacheKey + ":3",
+			want:     state.promptCacheKey + ":3",
+		},
+		{
+			name:     "multi segment original window keeps only numeric generation",
+			windowID: "cache-1:workspace:4",
+			want:     state.promptCacheKey + ":4",
+		},
+		{
+			name:     "non numeric original suffix falls back",
+			windowID: "cache-1:workspace",
+			want:     state.promptCacheKey + ":0",
+		},
+		{
+			name:     "distinct thread window preserves its identity and generation",
+			windowID: "other-window:5",
+			want:     codexIdentityConfuseUUID("auth-1", "prompt-cache", "other-window") + ":5",
+		},
+		{
+			name:     "unrelated window without numeric suffix falls back",
+			windowID: "other-window",
+			want:     state.promptCacheKey + ":0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := confuseCodexWindowID(tt.windowID, state); got != tt.want {
+				t.Fatalf("confuseCodexWindowID(%q) = %q, want %q", tt.windowID, got, tt.want)
+			}
+			if strings.Contains(confuseCodexWindowID(tt.windowID, state), "cache-1") {
+				t.Fatalf("confused window id leaked original prompt cache key: %q", confuseCodexWindowID(tt.windowID, state))
+			}
+		})
+	}
+}
+
+func TestApplyCodexHeadersPreservesWindowAndThreadHeaders(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	ginCtx.Request.Header.Set("X-Codex-Window-Id", "cache-1:2")
+	ginCtx.Request.Header.Set("Thread-Id", "thread-1")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	httpReq := httptest.NewRequest("POST", "https://example.com/responses", nil).WithContext(ctx)
+
+	applyCodexHeaders(httpReq, &cliproxyauth.Auth{Provider: "codex"}, "oauth-token", true, nil)
+
+	if got := httpReq.Header.Get("X-Codex-Window-Id"); got != "cache-1:2" {
+		t.Fatalf("X-Codex-Window-Id = %q, want cache-1:2", got)
+	}
+	if got := httpReq.Header.Get("Thread-Id"); got != "thread-1" {
+		t.Fatalf("Thread-Id = %q, want thread-1", got)
 	}
 }
 

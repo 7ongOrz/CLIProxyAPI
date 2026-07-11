@@ -115,6 +115,7 @@ func TestIsRequestFaultStructuredIdentifiers(t *testing.T) {
 		"invalid_value",
 		"unsupported_value",
 		"invalid_request_error",
+		"misalignment_policy_violation",
 		"previous_response_not_found",
 	} {
 		t.Run("code/"+code, func(t *testing.T) {

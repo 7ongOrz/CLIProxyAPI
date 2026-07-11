@@ -112,8 +112,8 @@ func testCodexNativeStreamFidelity(t *testing.T, source sdktranslator.Format) {
 						}
 						alias := headerValueCaseInsensitive(upstreamHeaders, "session_id")
 						t.Logf("upstream session alias: %q", alias)
-						if (alias == "") != native {
-							t.Errorf("session alias = %q, native = %t", alias, native)
+						if alias != "" || upstreamHeaders.Get("Session-Id") != "session-1" {
+							t.Errorf("canonical Session-Id = %q, legacy alias = %q", upstreamHeaders.Get("Session-Id"), alias)
 						}
 					}
 					t.Logf("downstream metadata: %q", metadataEvents)
@@ -121,14 +121,19 @@ func testCodexNativeStreamFidelity(t *testing.T, source sdktranslator.Format) {
 						t.Errorf("metadata event changed or duplicated: %q", metadataEvents)
 					}
 					t.Logf("upstream request: %s; downstream completion: %s", body, terminal)
-					if native {
+					// The fork applies the Lite input contract to explicit Lite headers across source formats.
+					if native || lite == "header" {
 						if gjson.GetBytes(body, "instructions").Exists() {
 							t.Errorf("native request gained instructions: %s", body)
 						}
+					} else if gjson.GetBytes(body, "instructions").Type != gjson.String {
+						t.Errorf("compatibility instructions missing: %s", body)
+					}
+					if native {
 						if string(terminal) != completed {
 							t.Errorf("native completion changed: %s", terminal)
 						}
-					} else if gjson.GetBytes(body, "instructions").Type != gjson.String || gjson.GetBytes(terminal, "response.output.0.id").String() != "msg_1" {
+					} else if gjson.GetBytes(terminal, "response.output.0.id").String() != "msg_1" {
 						t.Errorf("compatibility normalization/backfill lost: %s; %s", body, terminal)
 					}
 				})

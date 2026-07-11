@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -31,6 +33,7 @@ func TestMergeResponsesWebsocketInputMatchesCompatibilityScenarios(t *testing.T)
 		lastResponseOutput string
 		appendInput        string
 		want               string
+		skipReference      bool
 	}{
 		{
 			name:               "messages and paired tool call",
@@ -52,6 +55,22 @@ func TestMergeResponsesWebsocketInputMatchesCompatibilityScenarios(t *testing.T)
 			lastResponseOutput: `[{"type":"function_call","id":"fc-1","call_id":"call-other","name":"second","arguments":"{}"}]`,
 			appendInput:        `[{"type":"function_call_output","id":"fco-1","call_id":"call-kept","output":"done"}]`,
 			want:               `[{"type":"function_call","id":"fc-1","call_id":"call-kept","name":"first","arguments":"{}"},{"type":"function_call_output","id":"fco-1","call_id":"call-kept","output":"done"}]`,
+		},
+		{
+			name:               "duplicate id keeps all referenced function calls",
+			lastRequest:        `{"input":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"first","arguments":"{}"},{"type":"function_call_output","id":"fco-1","call_id":"call-1","output":"one"}]}`,
+			lastResponseOutput: `[{"type":"function_call","id":"fc-1","call_id":"call-2","name":"second","arguments":"{}"}]`,
+			appendInput:        `[{"type":"function_call_output","id":"fco-2","call_id":"call-2","output":"two"}]`,
+			want:               `[{"type":"function_call","call_id":"call-1","name":"first","arguments":"{}"},{"type":"function_call_output","id":"fco-1","call_id":"call-1","output":"one"},{"type":"function_call","id":"fc-1","call_id":"call-2","name":"second","arguments":"{}"},{"type":"function_call_output","id":"fco-2","call_id":"call-2","output":"two"}]`,
+			skipReference:      true,
+		},
+		{
+			name:               "duplicate id keeps all referenced custom tool calls",
+			lastRequest:        `{"input":[{"type":"custom_tool_call","id":"ctc-1","call_id":"call-1","name":"first","input":"{}"},{"type":"custom_tool_call_output","id":"ctco-1","call_id":"call-1","output":"one"}]}`,
+			lastResponseOutput: `[{"type":"custom_tool_call","id":"ctc-1","call_id":"call-2","name":"second","input":"{}"}]`,
+			appendInput:        `[{"type":"custom_tool_call_output","id":"ctco-2","call_id":"call-2","output":"two"}]`,
+			want:               `[{"type":"custom_tool_call","call_id":"call-1","name":"first","input":"{}"},{"type":"custom_tool_call_output","id":"ctco-1","call_id":"call-1","output":"one"},{"type":"custom_tool_call","id":"ctc-1","call_id":"call-2","name":"second","input":"{}"},{"type":"custom_tool_call_output","id":"ctco-2","call_id":"call-2","output":"two"}]`,
+			skipReference:      true,
 		},
 		{
 			name:               "raw JSON values and escaping",
@@ -143,11 +162,13 @@ func TestMergeResponsesWebsocketInputMatchesCompatibilityScenarios(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			legacy, errLegacy := mergeResponsesWebsocketInputReference([]byte(test.lastRequest), []byte(test.lastResponseOutput), test.appendInput)
-			if errLegacy != nil {
-				t.Fatalf("legacy merge failed: %v", errLegacy)
+			if !test.skipReference {
+				legacy, errLegacy := mergeResponsesWebsocketInputReference([]byte(test.lastRequest), []byte(test.lastResponseOutput), test.appendInput)
+				if errLegacy != nil {
+					t.Fatalf("legacy merge failed: %v", errLegacy)
+				}
+				assertJSONSemanticallyEqual(t, []byte(legacy), test.want)
 			}
-			assertJSONSemanticallyEqual(t, []byte(legacy), test.want)
 
 			got, errGot := mergeResponsesWebsocketInput([]byte(test.lastRequest), []byte(test.lastResponseOutput), test.appendInput)
 			if errGot != nil {
@@ -258,7 +279,7 @@ func TestNormalizeResponseSubsequentRequestDetachesSourceBuffers(t *testing.T) {
 	lastResponseOutput := []byte(`[{"type":"message","id":"msg-2","role":"assistant","content":[{"type":"output_text","text":"response sentinel"}]}]`)
 	raw := []byte(`{"type":"response.create","input":[{"type":"message","id":"msg-3","role":"user","content":"append sentinel"}]}`)
 
-	normalized, next, errMessage := normalizeResponseSubsequentRequest(raw, lastRequest, lastResponseOutput, "", nil, false, false)
+	normalized, next, errMessage := normalizeResponseSubsequentRequest(raw, lastRequest, lastResponseOutput, "", nil, false, false, false, false)
 	if errMessage != nil {
 		t.Fatalf("normalizeResponseSubsequentRequest() error = %v", errMessage.Error)
 	}
@@ -349,7 +370,7 @@ func BenchmarkNormalizeResponseSubsequentRequestTranscripts(b *testing.B) {
 			b.SetBytes(int64(len(lastRequest) + len(lastResponseOutput) + len(raw)))
 			b.ReportAllocs()
 			for b.Loop() {
-				normalized, _, errMessage := normalizeResponseSubsequentRequest(raw, lastRequest, lastResponseOutput, "", nil, false, false)
+				normalized, _, errMessage := normalizeResponseSubsequentRequest(raw, lastRequest, lastResponseOutput, "", nil, false, false, false, false)
 				if errMessage != nil {
 					b.Fatalf("normalizeResponseSubsequentRequest() error = %v", errMessage.Error)
 				}
@@ -514,14 +535,19 @@ func dedupeReferenceResponsesWebsocketFunctionCalls(items []referenceResponsesWe
 
 func dedupeReferenceResponsesWebsocketInputItems(items []referenceResponsesWebsocketInputItem) []referenceResponsesWebsocketInputItem {
 	referencedCallIDs := make(map[string]struct{}, len(items))
+	callIDs := make(map[string]struct{}, len(items))
 	for _, item := range items {
 		if isResponsesToolCallOutputType(item.itemType) && item.callID != "" {
 			referencedCallIDs[item.callID] = struct{}{}
+		}
+		if isResponsesToolCallType(item.itemType) && item.callID != "" {
+			callIDs[item.callID] = struct{}{}
 		}
 	}
 
 	keepIndexByID := make(map[string]int, len(items))
 	keepReferencedByID := make(map[string]bool, len(items))
+	keepCallIDByID := make(map[string]string, len(items))
 	for index, item := range items {
 		if item.id == "" {
 			continue
@@ -531,18 +557,27 @@ func dedupeReferenceResponsesWebsocketInputItems(items []referenceResponsesWebso
 		if _, seen := keepIndexByID[item.id]; !seen {
 			keepIndexByID[item.id] = index
 			keepReferencedByID[item.id] = referenced
+			keepCallIDByID[item.id] = item.callID
 			continue
 		}
 		if referenced || !keepReferencedByID[item.id] {
 			keepIndexByID[item.id] = index
 			keepReferencedByID[item.id] = referenced
+			keepCallIDByID[item.id] = item.callID
 		}
 	}
 
 	filtered := items[:0]
 	for index, item := range items {
 		if item.id != "" && keepIndexByID[item.id] != index {
-			continue
+			if item.callID == keepCallIDByID[item.id] {
+				continue
+			}
+			if !responsesWebsocketToolItemHasPair(item.itemType, item.callID, callIDs, referencedCallIDs) {
+				continue
+			}
+			item.raw, _ = sjson.DeleteBytes(item.raw, "id")
+			item.id = ""
 		}
 		filtered = append(filtered, item)
 	}

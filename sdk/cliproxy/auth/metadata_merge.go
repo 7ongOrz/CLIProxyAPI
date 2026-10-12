@@ -75,13 +75,17 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 	merged.CodexRefreshPatch = updated.CodexRefreshPatch
 
 	// 1. Refresh Lifecycle Timestamps
-	merged.RejectedAccessToken = updated.RejectedAccessToken
 	if !updated.LastRefreshedAt.IsZero() {
 		merged.LastRefreshedAt = updated.LastRefreshedAt
 	}
 	if !updated.NextRefreshAfter.IsZero() || (base != nil && !base.NextRefreshAfter.IsZero()) {
 		merged.NextRefreshAfter = updated.NextRefreshAfter
 	}
+	// Partial refreshes retain the active credential's current failure state.
+	if !activeCredentialRefreshed(merged) {
+		return merged
+	}
+	merged.RejectedAccessToken = updated.RejectedAccessToken
 
 	// 2. Error and Status recovery
 	baseErrMsg := ""

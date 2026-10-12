@@ -412,6 +412,11 @@ func authAccessToken(auth *Auth) string {
 	return authOuterAccessToken(auth)
 }
 
+func activeCredentialRefreshed(auth *Auth) bool {
+	return auth.CodexRefreshPatch == nil ||
+		auth.CodexRefreshPatch.RefreshedCredential(auth.Metadata, IsCodexUseSIWC(auth))
+}
+
 func authRefreshToken(auth *Auth) string {
 	if token := authMetadataString(auth, "refresh_token"); token != "" {
 		return token
@@ -440,7 +445,28 @@ func CredentialsChanged(existing, incoming *Auth) bool {
 	if existing == nil || incoming == nil {
 		return false
 	}
-	if authAccessToken(existing) != authAccessToken(incoming) || authOuterAccessToken(existing) != authOuterAccessToken(incoming) {
+	if outerCredentialsChanged(existing, incoming) || siwcCredentialsChanged(existing, incoming) ||
+		IsCodexUseSIWC(existing) != IsCodexUseSIWC(incoming) {
+		return true
+	}
+	existingUseSIWC, existingHasUseSIWC := parseBoolAny(existing.Metadata["use_siwc"])
+	incomingUseSIWC, incomingHasUseSIWC := parseBoolAny(incoming.Metadata["use_siwc"])
+	return existingHasUseSIWC != incomingHasUseSIWC || existingUseSIWC != incomingUseSIWC
+}
+
+// activeCredentialsChanged reports changes to the credential selected for requests.
+func activeCredentialsChanged(existing, incoming *Auth) bool {
+	if IsCodexUseSIWC(existing) != IsCodexUseSIWC(incoming) {
+		return true
+	}
+	if IsCodexUseSIWC(incoming) {
+		return siwcCredentialsChanged(existing, incoming)
+	}
+	return outerCredentialsChanged(existing, incoming)
+}
+
+func outerCredentialsChanged(existing, incoming *Auth) bool {
+	if authOuterAccessToken(existing) != authOuterAccessToken(incoming) {
 		return true
 	}
 	if authRefreshToken(existing) != authRefreshToken(incoming) {
@@ -471,21 +497,14 @@ func CredentialsChanged(existing, incoming *Auth) bool {
 	if incomingKey == "" {
 		incomingKey = authMetadataString(incoming, "api_key")
 	}
-	if existingKey != incomingKey {
-		return true
-	}
-	if authSIWCTokenField(existing, "access_token") != authSIWCTokenField(incoming, "access_token") ||
+	return existingKey != incomingKey
+}
+
+func siwcCredentialsChanged(existing, incoming *Auth) bool {
+	return authSIWCTokenField(existing, "access_token") != authSIWCTokenField(incoming, "access_token") ||
 		authSIWCTokenField(existing, "refresh_token") != authSIWCTokenField(incoming, "refresh_token") ||
 		authSIWCTokenField(existing, "id_token") != authSIWCTokenField(incoming, "id_token") ||
-		authSIWCTokenField(existing, "client_id") != authSIWCTokenField(incoming, "client_id") {
-		return true
-	}
-	existingUseSIWC, existingHasUseSIWC := parseBoolAny(existing.Metadata["use_siwc"])
-	incomingUseSIWC, incomingHasUseSIWC := parseBoolAny(incoming.Metadata["use_siwc"])
-	if existingHasUseSIWC != incomingHasUseSIWC || existingUseSIWC != incomingUseSIWC {
-		return true
-	}
-	return false
+		authSIWCTokenField(existing, "client_id") != authSIWCTokenField(incoming, "client_id")
 }
 
 func authSIWCTokenField(auth *Auth, key string) string {
@@ -1019,16 +1038,18 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	}
 	updated.LastRefreshedAt = now
 	updated.NextRefreshAfter = time.Time{}
-	updated.LastError = nil
-	updated.StatusMessage = ""
-	updated.Unavailable = false
-	updated.RefreshFailures = 0
-	updated.RejectedAccessToken = ""
-	if updated.Status == StatusError || updated.Status == "" {
-		updated.Status = StatusActive
+	if activeCredentialRefreshed(updated) {
+		updated.LastError = nil
+		updated.StatusMessage = ""
+		updated.Unavailable = false
+		updated.RefreshFailures = 0
+		updated.RejectedAccessToken = ""
+		if updated.Status == StatusError || updated.Status == "" {
+			updated.Status = StatusActive
+		}
+		_ = clearUnauthorizedModelStates(updated, now)
 	}
 	updated.UpdatedAt = now
-	_ = clearUnauthorizedModelStates(updated, now)
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}

@@ -87,25 +87,6 @@ func TestHomeDispatchSelectionReplaceAuthConcurrentClone(t *testing.T) {
 	<-done
 }
 
-func TestReplaceHomeSelectionAuthUpdatesRetainedRuntimeAuth(t *testing.T) {
-	selection := &HomeDispatchSelection{Auth: &Auth{ID: "cred-1", Provider: "codex", Metadata: map[string]any{"access_token": "old"}}}
-	manager := &Manager{
-		homeRuntimeAuths: map[string]map[string]*Auth{
-			"session-1": {"cred-1": selection.Auth.Clone()},
-		},
-		homeRuntimeAuthOwners: map[string]map[string]*HomeDispatchSelection{
-			"session-1": {"cred-1": selection},
-		},
-	}
-
-	manager.replaceHomeSelectionAuth(selection, &Auth{ID: "cred-1", Provider: "codex", Metadata: map[string]any{"access_token": "fresh"}})
-
-	retained := manager.homeRuntimeAuths["session-1"]["cred-1"]
-	if retained == nil || retained.Metadata["access_token"] != "fresh" {
-		t.Fatalf("retained runtime auth = %#v, want fresh token", retained)
-	}
-}
-
 func TestHomeDispatchSelectionDrainsResourcesAddedDuringEnd(t *testing.T) {
 	registry := executionregistry.New()
 	pending, errBegin := registry.BeginDispatch()

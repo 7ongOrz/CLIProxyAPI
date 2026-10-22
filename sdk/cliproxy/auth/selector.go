@@ -831,7 +831,12 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 
 // IsAuthAvailableForModel reports whether auth is eligible for selection on model at now.
 func IsAuthAvailableForModel(auth *Auth, model string, now time.Time) bool {
-	blocked, _, _ := isAuthBlockedForModel(auth, model, now)
+	return IsAuthAvailableForModelForRequest(nil, auth, model, now)
+}
+
+// IsAuthAvailableForModelForRequest checks availability using the request's credential track.
+func IsAuthAvailableForModelForRequest(ctx context.Context, auth *Auth, model string, now time.Time, clientHeaders ...http.Header) bool {
+	blocked, _, _ := isAuthBlockedForModelForRequest(ctx, auth, model, now, clientHeaders...)
 	return !blocked
 }
 

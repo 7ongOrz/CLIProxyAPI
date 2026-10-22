@@ -229,7 +229,31 @@ func optimizeCodexMultiAgentV2RequestDoc(doc *ojson.Doc, ctx context.Context, he
 	if optimized {
 		changed = true
 	}
+	if optimized {
+		optimizeCodexCollaborationHistoryDoc(doc)
+	}
 	return changed, optimized
+}
+
+func optimizeCodexCollaborationHistoryDoc(doc *ojson.Doc) {
+	input := doc.Get("input")
+	if !input.IsArray() {
+		return
+	}
+	for index, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType != "function_call" && itemType != "custom_tool_call" {
+			continue
+		}
+		itemPath := fmt.Sprintf("input.%d", index)
+		if strings.TrimSpace(item.Get("namespace").String()) == codexCollaborationNamespace {
+			_ = doc.Set(itemPath+".namespace", codexOptimizedCollaborationNamespace)
+		}
+		name := strings.TrimSpace(item.Get("name").String())
+		if strings.HasPrefix(name, codexCollaborationNamespace+"__") {
+			_ = doc.Set(itemPath+".name", codexOptimizedCollaborationNamePrefix+strings.TrimPrefix(name, codexCollaborationNamespace+"__"))
+		}
+	}
 }
 
 func codexMultiAgentV2Enabled(ctx context.Context, headers http.Header, cfg *config.Config) bool {
@@ -410,16 +434,6 @@ func codexSpawnAgentModelsAndMarkdownForRequest(ctx context.Context, headers htt
 	return models, formatted
 }
 
-func codexSpawnAgentModelsForRequest(ctx context.Context, headers http.Header, homeEnabled bool) []codexSpawnAgentModel {
-	models, _ := codexSpawnAgentModelsAndMarkdownForRequest(ctx, headers, homeEnabled)
-	return models
-}
-
-func formatCodexSpawnAgentModelsForRequest(ctx context.Context, headers http.Header, homeEnabled bool) string {
-	_, formatted := codexSpawnAgentModelsAndMarkdownForRequest(ctx, headers, homeEnabled)
-	return formatted
-}
-
 func codexHomeAvailableModels(ctx context.Context, headers http.Header) []map[string]any {
 	client := home.Current()
 	if client == nil {
@@ -479,31 +493,6 @@ func decodeCodexHomeAvailableModels(raw []byte) []map[string]any {
 		return mapString(models[i], "id") < mapString(models[j], "id")
 	})
 	return models
-}
-
-func codexSpawnAgentModelsFromSources(availableModels []map[string]any, catalogJSON []byte, lookupModel func(string) *registry.ModelInfo) []codexSpawnAgentModel {
-	var catalog codexClientModelsCatalog
-	if err := json.Unmarshal(catalogJSON, &catalog); err != nil || len(catalog.Models) == 0 {
-		return nil
-	}
-
-	templates := make(map[string]map[string]any, len(catalog.Models))
-	var defaultTemplate map[string]any
-	for _, model := range catalog.Models {
-		modelID := mapString(model, "slug")
-		if modelID == "" {
-			continue
-		}
-		templates[modelID] = model
-		if defaultTemplate == nil || modelID == "gpt-5.5" {
-			defaultTemplate = model
-		}
-	}
-	if defaultTemplate == nil {
-		return nil
-	}
-
-	return codexSpawnAgentModelsFromTemplates(availableModels, templates, defaultTemplate, lookupModel)
 }
 
 func codexSpawnAgentModelsFromTemplates(availableModels []map[string]any, templates map[string]map[string]any, defaultTemplate map[string]any, lookupModel func(string) *registry.ModelInfo) []codexSpawnAgentModel {
@@ -688,14 +677,6 @@ func mapInt(values map[string]any, key string) int {
 	}
 }
 
-func rewriteCodexSpawnAgentDescription(payload []byte, models []codexSpawnAgentModel) []byte {
-	return rewriteCodexSpawnAgentTools(payload, codexSpawnAgentToolPaths(payload), models)
-}
-
-func rewriteCodexSpawnAgentTools(payload []byte, toolPaths []string, models []codexSpawnAgentModel) []byte {
-	return rewriteCodexCollaborationTools(payload, toolPaths, toolPaths, models, "")
-}
-
 func rewriteCodexCollaborationTools(payload []byte, messageToolPaths, spawnAgentToolPaths []string, models []codexSpawnAgentModel, modelList string) []byte {
 	if len(payload) == 0 || (len(messageToolPaths) == 0 && len(spawnAgentToolPaths) == 0) {
 		return payload
@@ -835,7 +816,47 @@ func optimizeCodexCollaborationNamespaceDoc(doc *ojson.Doc, toolPaths []string) 
 		}
 		optimized = true
 	}
+	if optimized {
+		if errMetadata := optimizeCodexCollaborationToolMetadataDoc(doc); errMetadata != nil {
+			return false
+		}
+	}
 	return optimized
+}
+
+func optimizeCodexCollaborationToolMetadataDoc(doc *ojson.Doc) error {
+	turnMetadataResult := doc.Get("client_metadata.x-codex-turn-metadata")
+	if turnMetadataResult.Type != ojson.String {
+		return nil
+	}
+	turnMetadata := turnMetadataResult.String()
+	namespacePath := "tool_namespaces_info." + codexCollaborationNamespace
+	namespace := ojson.Get(turnMetadata, namespacePath)
+	if !namespace.IsObject() {
+		return nil
+	}
+	namespaceDoc := ojson.NewDocString(namespace.Raw)
+	if errSet := namespaceDoc.Set("name", codexOptimizedCollaborationNamespace); errSet != nil {
+		return errSet
+	}
+	for functionName, function := range namespace.Get("functions").Map() {
+		codeModeName := strings.TrimSpace(function.Get("code_mode_name").String())
+		if !strings.HasPrefix(codeModeName, codexCollaborationNamespace+"__") {
+			continue
+		}
+		codeModePath := "functions." + functionName + ".code_mode_name"
+		if errSet := namespaceDoc.Set(codeModePath, codexOptimizedCollaborationNamePrefix+strings.TrimPrefix(codeModeName, codexCollaborationNamespace+"__")); errSet != nil {
+			return errSet
+		}
+	}
+	metadataDoc := ojson.NewDocString(turnMetadata)
+	if errDelete := metadataDoc.Delete(namespacePath); errDelete != nil {
+		return errDelete
+	}
+	if errSet := metadataDoc.SetRawBytes("tool_namespaces_info."+codexOptimizedCollaborationNamespace, namespaceDoc.Bytes()); errSet != nil {
+		return errSet
+	}
+	return doc.Set("client_metadata.x-codex-turn-metadata", string(metadataDoc.Bytes()))
 }
 
 // RestoreCodexMultiAgentV2Response restores optimized collaboration namespace

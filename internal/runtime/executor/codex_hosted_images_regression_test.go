@@ -260,6 +260,7 @@ func TestCodexHostedImageValidationUsesFinalPayload(t *testing.T) {
 		check     func(*testing.T, []byte)
 	}{
 		{name: "forced", reject: true},
+		{name: "lite_metadata_additional_tools", model: "gpt-5.4", body: `{"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"image_generation","complexity":"high"}]},{"role":"user","content":"draw a cat"}],"tool_choice":{"type":"image_generation"},"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`, reject: true},
 		{name: "legacy_hosted_images", model: "gpt-5.4", check: func(t *testing.T, body []byte) {
 			if ojson.GetBytes(body, "tools.0.type").String() != "image_generation" || ojson.GetBytes(body, "tools.0.complexity").Exists() {
 				t.Fatalf("legacy hosted image normalization changed: %s", body)

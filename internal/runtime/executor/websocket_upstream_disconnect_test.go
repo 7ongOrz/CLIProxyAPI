@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -54,25 +55,17 @@ func TestWebsocketActivationAfterUpstreamDisconnect(t *testing.T) {
 				readerConn: conn,
 			}
 			sess.configureConn(conn)
-			go test.readLoop(sess, conn)
+			readerDone := make(chan struct{})
+			go func() {
+				defer close(readerDone)
+				test.readLoop(sess, conn)
+			}()
 
 			<-serverClosed
-			deadline := time.NewTimer(time.Second)
-			ticker := time.NewTicker(time.Millisecond)
-			defer deadline.Stop()
-			defer ticker.Stop()
-			for {
-				sess.connMu.Lock()
-				invalidated := sess.conn == nil
-				sess.connMu.Unlock()
-				if invalidated {
-					break
-				}
-				select {
-				case <-ticker.C:
-				case <-deadline.C:
-					t.Fatal("upstream disconnect was not processed")
-				}
+			select {
+			case <-readerDone:
+			case <-time.After(time.Second):
+				t.Fatal("upstream disconnect was not processed")
 			}
 
 			readCh := sess.activate(conn)
@@ -80,6 +73,12 @@ func TestWebsocketActivationAfterUpstreamDisconnect(t *testing.T) {
 			case event := <-readCh:
 				if event.err == nil {
 					t.Fatalf("expected terminal upstream error, got event %#v", event)
+				}
+				if test.name == "codex" {
+					var reset codexWebsocketUpstreamResetError
+					if !errors.As(event.err, &reset) {
+						t.Fatalf("activation must preserve the recoverable upstream reset: %v", event.err)
+					}
 				}
 			case <-time.After(time.Second):
 				t.Fatal("activation after upstream disconnect blocked forever")

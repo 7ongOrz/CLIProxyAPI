@@ -313,6 +313,7 @@ routing: {strategy: fill-first, session-affinity: true}
 oauth:
   providers:
     codex:
+      identity-confuse: true
       disable-codex-cloaking: true
       retired-setting: {mode: old}
 `)
@@ -331,15 +332,18 @@ oauth:
 	if err = yaml.Unmarshal(migrated, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if yamlPath(doc.Content[0], "oauth.providers.codex.retired-setting") != nil || !strings.Contains(string(migrated), "# oauth.providers.codex.retired-setting:") {
-		t.Fatalf("unknown nested field was not preserved as a comment: %s", migrated)
+	for _, field := range []string{"identity-confuse", "retired-setting"} {
+		path := "oauth.providers.codex." + field
+		if yamlPath(doc.Content[0], path) != nil || !strings.Contains(string(migrated), "# "+path+":") {
+			t.Fatalf("retired field %s should be preserved as a comment: %s", path, migrated)
+		}
 	}
 	cfg, err := ParseConfigBytes(migrated)
 	if err != nil || cfg.Routing.Strategy != "fill-first" || !cfg.Routing.SessionAffinity || !cfg.Codex.DisableCodexCloaking {
 		t.Fatalf("migration changed known settings: cfg=%+v error=%v", cfg, err)
 	}
 	remigrated, _, err := NormalizeConfigLayout(migrated, true)
-	if err != nil || strings.Count(string(remigrated), "# oauth.providers.codex.retired-setting:") != 1 {
+	if err != nil || strings.Count(string(remigrated), "# oauth.providers.codex.retired-setting:") != 1 || strings.Count(string(remigrated), "# oauth.providers.codex.identity-confuse:") != 1 {
 		t.Fatalf("repeated migration lost or duplicated the comment: %v\n%s", err, remigrated)
 	}
 }

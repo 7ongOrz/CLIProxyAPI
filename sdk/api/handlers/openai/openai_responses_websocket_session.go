@@ -7,7 +7,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -42,30 +44,23 @@ func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, met
 	return false
 }
 
-func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputForModel(modelName string) bool {
-	auths, _ := h.responsesWebsocketAvailableAuthsForModel(modelName)
-	for _, auth := range auths {
-		if responsesWebsocketAuthSupportsIncrementalInput(auth) {
-			return true
-		}
+func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsCompactionReplayForModel(ctx context.Context, modelName string, payload []byte) bool {
+	if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		return false
 	}
-	return false
-}
-
-func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsCompactionReplayForModel(modelName string) bool {
-	auths, _ := h.responsesWebsocketAvailableAuthsForModel(modelName)
+	auths, _ := h.responsesWebsocketAvailableAuthsForModel(ctx, modelName)
 	if len(auths) == 0 {
 		return false
 	}
 	for _, auth := range auths {
-		if !responsesWebsocketAuthSupportsCompactionReplay(auth) {
+		if !responsesWebsocketAuthSupportsCompactionReplay(auth, payload) {
 			return false
 		}
 	}
 	return true
 }
 
-func (h *OpenAIResponsesAPIHandler) responsesWebsocketAvailableAuthsForModel(modelName string) ([]*coreauth.Auth, string) {
+func (h *OpenAIResponsesAPIHandler) responsesWebsocketAvailableAuthsForModel(ctx context.Context, modelName string) ([]*coreauth.Auth, string) {
 	if h == nil || h.AuthManager == nil {
 		return nil, ""
 	}
@@ -80,7 +75,7 @@ func (h *OpenAIResponsesAPIHandler) responsesWebsocketAvailableAuthsForModel(mod
 	auths := h.AuthManager.List()
 	available := make([]*coreauth.Auth, 0, len(auths))
 	for _, auth := range auths {
-		if !responsesWebsocketAuthMatchesModel(auth, providerSet, modelKey, registryRef, now) {
+		if !responsesWebsocketAuthMatchesModel(ctx, auth, providerSet, modelKey, registryRef, now) {
 			continue
 		}
 		available = append(available, auth)
@@ -95,16 +90,12 @@ func (h *OpenAIResponsesAPIHandler) responsesWebsocketHasAlternativeReplayTarget
 	return h.HasAlternativeExecutionTarget(ctx, h.HandlerType(), modelName, rawJSON, failedAuthID)
 }
 
-func (h *OpenAIResponsesAPIHandler) responsesWebsocketUsesCodexWebsocketPassthrough(modelName string) bool {
-	return h.responsesWebsocketUsesUpstreamWebsocketPassthrough(modelName)
-}
-
-func (h *OpenAIResponsesAPIHandler) responsesWebsocketUsesUpstreamWebsocketPassthrough(modelName string) bool {
+func (h *OpenAIResponsesAPIHandler) responsesWebsocketUsesUpstreamWebsocketPassthrough(ctx context.Context, modelName string) bool {
 	modelName = strings.TrimSpace(modelName)
 	if h == nil || h.AuthManager == nil || modelName == "" {
 		return false
 	}
-	auths, _ := h.responsesWebsocketAvailableAuthsForModel(modelName)
+	auths, _ := h.responsesWebsocketAvailableAuthsForModel(ctx, modelName)
 	if len(auths) == 0 {
 		return false
 	}
@@ -139,23 +130,20 @@ func responsesWebsocketAuthSupportsIncrementalInput(auth *coreauth.Auth) bool {
 	return websocketUpstreamSupportsIncrementalInput(auth.Attributes, auth.Metadata)
 }
 
-func responsesWebsocketPinnedAuthMatchesModel(auth *coreauth.Auth, modelName string, pinnedModelKey string, homeRuntime bool) bool {
+func responsesWebsocketPinnedAuthMatchesModel(ctx context.Context, auth *coreauth.Auth, modelName string, pinnedModelKey string, homeRuntime bool) bool {
 	if auth == nil {
 		return false
 	}
 	providerSet, modelKey := responsesWebsocketProviderSetForModel(responsesWebsocketResolvedModelName(modelName))
-	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if !homeRuntime || len(providerSet) > 0 {
-		if _, ok := providerSet[providerKey]; !ok {
-			return false
-		}
-	}
-	if !responsesWebsocketAuthAvailableForModel(auth, modelKey, time.Now()) {
+	if !coreauth.IsAuthAvailableForModelForRequest(ctx, auth, modelKey, time.Now()) {
 		return false
 	}
-
 	if homeRuntime {
 		return strings.EqualFold(strings.TrimSpace(pinnedModelKey), strings.TrimSpace(modelKey))
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if _, ok := providerSet[providerKey]; !ok {
+		return false
 	}
 	return registry.GetGlobalRegistry().ClientSupportsModel(auth.ID, modelKey)
 }
@@ -194,7 +182,7 @@ func responsesWebsocketProviderSetForModel(resolvedModelName string) (map[string
 	return providerSet, modelKey
 }
 
-func responsesWebsocketAuthMatchesModel(auth *coreauth.Auth, providerSet map[string]struct{}, modelKey string, registryRef *registry.ModelRegistry, now time.Time) bool {
+func responsesWebsocketAuthMatchesModel(ctx context.Context, auth *coreauth.Auth, providerSet map[string]struct{}, modelKey string, registryRef *registry.ModelRegistry, now time.Time) bool {
 	if auth == nil {
 		return false
 	}
@@ -205,16 +193,38 @@ func responsesWebsocketAuthMatchesModel(auth *coreauth.Auth, providerSet map[str
 	if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(auth.ID, modelKey) {
 		return false
 	}
-	return responsesWebsocketAuthAvailableForModel(auth, modelKey, now)
+	return coreauth.IsAuthAvailableForModelForRequest(ctx, auth, modelKey, now)
 }
 
-func responsesWebsocketAuthSupportsCompactionReplay(auth *coreauth.Auth) bool {
+func responsesWebsocketAuthSupportsCompactionReplay(auth *coreauth.Auth, payload []byte) bool {
 	if auth == nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
+	return responsesWebsocketProviderSupportsCompactionReplay(auth.Provider, payload)
 }
 
-func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {
-	return coreauth.IsAuthAvailableForModel(auth, modelName, now)
+func responsesWebsocketProviderSupportsCompactionReplay(provider string, payload []byte) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if strings.HasPrefix(provider, "openai-compatible-") {
+		provider = "openai-compatibility"
+	}
+	switch provider {
+	case "codex":
+		return true
+	case "claude", "kimi", "meta", "openai-compatibility":
+		// These executors expand CPA capsules into request history.
+		hasCapsule := false
+		for _, item := range ojson.GetBytes(payload, "input").Array() {
+			itemType := item.Get("type").String()
+			if isResponsesWebsocketCompactionReplayItemType(itemType) {
+				if itemType != "compaction" || !helps.RecognizedAntigravityCompactionCapsule(item.Get("encrypted_content").String()) {
+					return false
+				}
+				hasCapsule = true
+			}
+		}
+		return hasCapsule
+	default:
+		return false
+	}
 }

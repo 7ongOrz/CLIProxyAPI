@@ -1236,8 +1236,8 @@ func TestManager_StaleRefreshFailureDoesNotPoisonReloggedCredential_Issue5783(t 
 		t.Fatal("new credential version must not inherit InferenceVerified from superseded in-flight VerifyInference")
 	}
 
-	// Also verify that if Store.Save blocks during a non-secret Update while a terminal refresh failure is recorded concurrently,
-	// the terminal RequiresSignIn and RejectedRefreshToken state is preserved when Store.Save completes.
+	// A refresh failure arriving during Store.Save must survive the non-secret Update.
+	// Credential mutations serialize, so release the save before waiting for refresh publication.
 	saveStarted := make(chan struct{})
 	releaseSave := make(chan struct{})
 	var saveOnce sync.Once
@@ -1250,9 +1250,11 @@ func TestManager_StaleRefreshFailureDoesNotPoisonReloggedCredential_Issue5783(t 
 		},
 	}
 	mWithStore := NewManager(blockingStore, nil, nil)
+	terminalRefreshStarted := make(chan struct{})
 	termExec := &unauthorizedRefreshExecutor{
 		id:         "codex",
 		refreshErr: errors.New(`token refresh failed with status 401: {"error":{"code":"refresh_token_reused","message":"reused"}}`),
+		onRefresh:  func() { close(terminalRefreshStarted) },
 	}
 	mWithStore.RegisterExecutor(termExec)
 	persistAuth := &Auth{
@@ -1281,11 +1283,17 @@ func TestManager_StaleRefreshFailureDoesNotPoisonReloggedCredential_Issue5783(t 
 	}()
 
 	<-saveStarted
-	mWithStore.refreshAuth(ctx, persistAuth.ID)
+	terminalRefreshDone := make(chan struct{})
+	go func() {
+		defer close(terminalRefreshDone)
+		mWithStore.refreshAuth(ctx, persistAuth.ID)
+	}()
+	<-terminalRefreshStarted
 	close(releaseSave)
 	if errU := <-updateDone; errU != nil {
 		t.Fatalf("concurrent non-secret Update error: %v", errU)
 	}
+	<-terminalRefreshDone
 
 	afterPersistRace, _ := mWithStore.GetByID(persistAuth.ID)
 	if !afterPersistRace.RequiresSignIn || afterPersistRace.RefreshError == nil || afterPersistRace.RejectedRefreshToken != "persist-rt" {

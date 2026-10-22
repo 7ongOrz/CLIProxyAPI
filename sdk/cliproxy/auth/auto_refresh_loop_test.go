@@ -589,3 +589,7 @@ func TestNextRefreshCheckAtIncludesSIWCWhenClassifiedAsAPIKey(t *testing.T) {
 		t.Fatalf("nextRefreshCheckAt = (%v, %v), want (%v, true)", due, ok, wantDue)
 	}
 }
+
+func (m *Manager) refreshAuth(ctx context.Context, id string) {
+	_, _ = m.refreshAuthForRequest(ctx, id, "")
+}

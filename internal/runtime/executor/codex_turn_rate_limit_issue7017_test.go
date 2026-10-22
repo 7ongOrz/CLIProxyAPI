@@ -148,7 +148,7 @@ func TestIssue7017TurnRateLimitTerminalAndBootstrap(t *testing.T) {
 		`{"type":"error","error":{"type":"rate_limit_error","code":"turn_rate_limit_exceeded","message":"Codex is at capacity, please try again later"}}`,
 		`{"type":"response.failed","response":{"error":{"type":"rate_limit_error","code":"turn_rate_limit_exceeded","message":"Codex is at capacity, please try again later"}}}`,
 	} {
-		errTerminal, body, ok := codexTerminalStreamErr([]byte(payload))
+		errTerminal, body, ok := codexTerminalFailureErr([]byte(payload))
 		if !ok {
 			t.Fatalf("terminal turn rate limit must be handled: %s", payload)
 		}

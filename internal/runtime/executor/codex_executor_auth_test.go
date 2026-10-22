@@ -891,8 +891,8 @@ func TestCodexWebsocketsExecutorUseSIWCExecuteAndStream(t *testing.T) {
 	if got := gotHeaders.Get("User-Agent"); got != codexSIWCUserAgent(cfgWithRules) {
 		t.Fatalf("User-Agent = %q, want %q", got, codexSIWCUserAgent(cfgWithRules))
 	}
-	if got := gotHeaders.Get("session_id"); got != "ws-sess-456" {
-		t.Fatalf("session_id = %q, want ws-sess-456", got)
+	if got := gotHeaders.Get("Session-Id"); got != "ws-sess-456" {
+		t.Fatalf("Session-Id = %q, want ws-sess-456", got)
 	}
 	if got := gotHeaders.Get("X-Client-Request-Id"); got != "ws-sess-456" {
 		t.Fatalf("X-Client-Request-Id = %q, want ws-sess-456", got)

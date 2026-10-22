@@ -369,90 +369,9 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	} else {
 		auth.Generation++
 	}
-	existingVersion := existing.CredentialVersion
-	if existingVersion == 0 {
-		existingVersion = 1
-	}
-	credChanged := CredentialsChanged(existing, auth)
-	if credChanged {
-		auth.CredentialVersion = max(auth.CredentialVersion, existingVersion) + 1
-	} else {
-		auth.CredentialVersion = existingVersion
-	}
-	cooldownStateChanged := false
-	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-		if isFileSnapshot {
-			auth.ModelStates = existing.ModelStates
-			auth.LastRefreshedAt = existing.LastRefreshedAt
-			auth.NextRefreshAfter = existing.NextRefreshAfter
-			auth.RefreshFailures = existing.RefreshFailures
-		} else if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-			auth.ModelStates = existing.ModelStates
-		}
-		if isFileSnapshot {
-			if (auth.Status == "" || auth.Status == StatusActive) && existing.Status != "" {
-				auth.Status = existing.Status
-			}
-			if auth.StatusMessage == "" {
-				auth.StatusMessage = existing.StatusMessage
-			}
-			auth.Unavailable = existing.Unavailable
-			auth.NextRetryAfter = existing.NextRetryAfter
-			if auth.LastError == nil && existing.LastError != nil {
-				auth.LastError = cloneError(existing.LastError)
-			}
-			observation := mergeQuotaObservation(auth.Quota, existing.Quota)
-			auth.Quota = existing.Quota.Clone()
-			auth.Quota.ObservedAt = observation.ObservedAt
-			auth.Quota.Signals = observation.Signals
-			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
-		}
-		if credChanged || mode == updateModeRefresh {
-			applyPreservedRejectedTokens(existing, auth, mode == updateModeRefresh)
-			if auth.RejectedAccessToken == "" || authAccessToken(auth) != auth.RejectedAccessToken {
-				if hasUnauthorizedAuthFailure(existing) || (auth.LastError != nil && isUnauthorizedError(auth.LastError)) {
-					auth.Unavailable = false
-					auth.NextRetryAfter = time.Time{}
-					auth.cooldownRecordedSeq = 0
-					auth.LastError = nil
-					auth.StatusMessage = ""
-					auth.Status = StatusActive
-					cooldownStateChanged = true
-				}
-				resumed := clearUnauthorizedModelStates(auth, time.Now())
-				if len(resumed) > 0 {
-					cooldownStateChanged = true
-				}
-			}
-		} else {
-			applyPreservedRejectedTokens(existing, auth, false)
-		}
-		// A refresh that confirms quota restoration (issue #6690) releases the
-		// credential-wide cooldown early; otherwise the active credential
-		// quota below is preserved exactly as before.
-		devinQuotaRestored := mode == updateModeRefresh && applyDevinQuotaRestoration(auth, existing, time.Now())
-		if devinQuotaRestored {
-			cooldownStateChanged = true
-		} else if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {
-			auth.Unavailable = existing.Unavailable
-			auth.NextRetryAfter = existing.NextRetryAfter
-			// Preserve cooldown fields; keep the newest observation snapshot.
-			observation := mergeQuotaObservation(auth.Quota, existing.Quota)
-			auth.Quota = existing.Quota
-			auth.Quota.ObservedAt = observation.ObservedAt
-			auth.Quota.Signals = observation.Signals
-			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
-			if auth.Status == StatusActive {
-				auth.Status = existing.Status
-			}
-		}
-	}
-	now := time.Now()
-	auth.UpdatedAt = now
-	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
-	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
-	}
+	existingVersion := max(existing.CredentialVersion, 1)
+	auth.CredentialVersion = max(auth.CredentialVersion, existingVersion)
+	auth.UpdatedAt = time.Now()
 	if existing.Metadata != nil {
 		if persistedHints, hasHints := existing.Metadata["antigravity_capability_hints"]; hasHints {
 			if auth.Metadata == nil {
@@ -465,7 +384,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	// Save before publication, including the transactional Meta mint path.
 	// Runtime-only changes made during I/O are merged below, never overwritten.
 	existingBeforeSave := existing.Clone()
-	refreshPatchBeforeSave := auth.CodexRefreshPatch
+	refreshPatch := auth.CodexRefreshPatch
 	persistMetaMint := (mode == updateModePrepare || mode == updateModeRefresh) && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta")
 	if errPersist := m.persistLocked(ctx, auth); errPersist != nil {
 		// A minted Meta key must reach the store before requests can use it.
@@ -480,14 +399,91 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		m.mu.Unlock()
 		return nil, false, false, fmt.Errorf("auth %s changed registration during persistence", auth.ID)
 	}
-	mergeAuthSaveDelta(auth, existingBeforeSave, existing, false)
-	if (auth.RejectedAccessToken == "" && existing.RejectedAccessToken != "") || (auth.RejectedSIWCAccessToken == "" && existing.RejectedSIWCAccessToken != "") {
-		probe := auth.Clone()
-		probe.CodexRefreshPatch = refreshPatchBeforeSave
-		applyPreservedRejectedTokens(existing, probe, mode == updateModeRefresh)
-		auth.RejectedAccessToken = probe.RejectedAccessToken
-		auth.RejectedSIWCAccessToken = probe.RejectedSIWCAccessToken
+	// The store can load newer disk credentials. Recover and version the final snapshot.
+	credChanged := CredentialsChanged(existingBeforeSave, auth)
+	if credChanged {
+		auth.CredentialVersion = max(auth.CredentialVersion, existingVersion) + 1
+	} else {
+		auth.CredentialVersion = existingVersion
 	}
+	activeRefreshed := mode == updateModeRefresh && (refreshPatch == nil ||
+		refreshPatch.RefreshedCredential(auth.Metadata, credentialRecoveryUsesSIWC(existingBeforeSave, auth)))
+	applyPreservedRejectedTokens(existing, auth, activeRefreshed)
+	credentialsRecovered := activeCredentialsChanged(existingBeforeSave, auth) || activeRefreshed
+	cooldownStateChanged := false
+	if !existingBeforeSave.Disabled && existingBeforeSave.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+		if isFileSnapshot {
+			auth.ModelStates = cloneModelStates(existingBeforeSave.ModelStates)
+			auth.LastRefreshedAt = existingBeforeSave.LastRefreshedAt
+			auth.NextRefreshAfter = existingBeforeSave.NextRefreshAfter
+			auth.RefreshFailures = existingBeforeSave.RefreshFailures
+		} else if len(auth.ModelStates) == 0 && len(existingBeforeSave.ModelStates) > 0 {
+			auth.ModelStates = cloneModelStates(existingBeforeSave.ModelStates)
+		}
+		if isFileSnapshot {
+			if (auth.Status == "" || auth.Status == StatusActive) && existingBeforeSave.Status != "" {
+				auth.Status = existingBeforeSave.Status
+			}
+			if auth.StatusMessage == "" {
+				auth.StatusMessage = existingBeforeSave.StatusMessage
+			}
+			auth.Unavailable = existingBeforeSave.Unavailable
+			auth.NextRetryAfter = existingBeforeSave.NextRetryAfter
+			if auth.LastError == nil && existingBeforeSave.LastError != nil {
+				auth.LastError = cloneError(existingBeforeSave.LastError)
+			}
+			observation := mergeQuotaObservation(auth.Quota, existingBeforeSave.Quota)
+			auth.Quota = existingBeforeSave.Quota.Clone()
+			auth.Quota.ObservedAt = observation.ObservedAt
+			auth.Quota.Signals = observation.Signals
+			auth.cooldownRecordedSeq = existingBeforeSave.cooldownRecordedSeq
+		}
+		if credentialsRecovered && !authMatchesTokenPartition(auth, auth.RejectedAccessToken) {
+			if hasUnauthorizedAuthFailure(existingBeforeSave) || (auth.LastError != nil && isUnauthorizedError(auth.LastError)) {
+				auth.Unavailable = false
+				auth.NextRetryAfter = time.Time{}
+				auth.cooldownRecordedSeq = 0
+				auth.LastError = nil
+				auth.StatusMessage = ""
+				auth.Status = StatusActive
+				cooldownStateChanged = true
+			}
+			resumed := clearUnauthorizedModelStates(auth, time.Now())
+			if len(resumed) > 0 {
+				cooldownStateChanged = true
+			}
+		} else if hasUnauthorizedAuthFailure(existingBeforeSave) {
+			auth.Status = existingBeforeSave.Status
+			auth.StatusMessage = existingBeforeSave.StatusMessage
+			auth.Unavailable = existingBeforeSave.Unavailable
+			auth.LastError = cloneError(existingBeforeSave.LastError)
+			auth.NextRefreshAfter = existingBeforeSave.NextRefreshAfter
+			auth.NextRetryAfter = existingBeforeSave.NextRetryAfter
+		}
+		// Apply quota restoration to the persisted snapshot alongside credential recovery.
+		devinQuotaRestored := mode == updateModeRefresh && applyDevinQuotaRestoration(auth, existingBeforeSave, time.Now())
+		if devinQuotaRestored {
+			cooldownStateChanged = true
+		} else if existingBeforeSave.Quota.Exceeded && existingBeforeSave.Quota.Reason == "credential_quota" && existingBeforeSave.Quota.NextRecoverAt.After(time.Now()) {
+			auth.Unavailable = existingBeforeSave.Unavailable
+			auth.NextRetryAfter = existingBeforeSave.NextRetryAfter
+			// Preserve cooldown fields and the newest quota observation.
+			observation := mergeQuotaObservation(auth.Quota, existingBeforeSave.Quota)
+			auth.Quota = existingBeforeSave.Quota
+			auth.Quota.ObservedAt = observation.ObservedAt
+			auth.Quota.Signals = observation.Signals
+			auth.cooldownRecordedSeq = existingBeforeSave.cooldownRecordedSeq
+			if auth.Status == StatusActive {
+				auth.Status = existingBeforeSave.Status
+			}
+		}
+	}
+	now := time.Now()
+	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
+	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
+		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
+	}
+	mergeAuthSaveDelta(auth, existingBeforeSave, existing, false)
 	if existing.Generation >= auth.Generation {
 		auth.Generation = existing.Generation + 1
 	}

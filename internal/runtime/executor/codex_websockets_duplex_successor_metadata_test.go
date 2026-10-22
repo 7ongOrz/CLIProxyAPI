@@ -14,6 +14,7 @@ import (
 	core "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	translator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // Explicit creates can arrive before pending notifications. They must not
@@ -125,13 +126,15 @@ func TestCodexDuplexAutomaticSuccessorMetadata(t *testing.T) {
 			cfg := &config.Config{}
 			cfg.Codex.ResponseSteering = true
 			cfg.CodexResponseSteering = true
+			cfg.Routing.SessionAffinity = true
 			executor := NewCodexWebsocketsExecutor(cfg)
 			executor.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 			credential := &auth.Auth{ID: t.Name(), Provider: "codex", Attributes: map[string]string{"api_key": "test", "base_url": upstream.URL, "websockets": "true"}}
 			request := func(key string) []byte {
 				return []byte(fmt.Sprintf(`{"type":"response.create","model":"gpt-6-astra","prompt_cache_key":%q,"previous_response_id":"first","input":[]}`, key))
 			}
-			result, err := executor.ExecuteStream(ctx, credential, core.Request{Model: "gpt-6-astra", Payload: request("first-key")}, core.Options{SourceFormat: translator.FromString("codex"), Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}})
+			initialRequest, _ := sjson.DeleteBytes(request("first-key"), "previous_response_id")
+			result, err := executor.ExecuteStream(ctx, credential, core.Request{Model: "gpt-6-astra", Payload: initialRequest}, core.Options{SourceFormat: translator.FromString("codex"), Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}})
 			if err != nil {
 				t.Fatal(err)
 			}

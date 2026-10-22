@@ -82,6 +82,10 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 	if !updated.NextRefreshAfter.IsZero() || (base != nil && !base.NextRefreshAfter.IsZero()) {
 		merged.NextRefreshAfter = updated.NextRefreshAfter
 	}
+	// Partial refreshes retain the active credential's current failure state.
+	if !activeCredentialRefreshed(current, merged) {
+		return merged
+	}
 
 	// 2. Error and Status recovery
 	baseErrMsg := ""
@@ -134,7 +138,7 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 			merged.Unavailable = current.Unavailable
 			merged.Status = current.Status
 			merged.StatusMessage = current.StatusMessage
-		} else if (updated.Status == StatusActive || updated.Status == "") && (merged.RejectedAccessToken == "" || authAccessToken(merged) != merged.RejectedAccessToken) {
+		} else if (updated.Status == StatusActive || updated.Status == "") && !authMatchesTokenPartition(merged, merged.RejectedAccessToken) {
 			// Successful refresh clears previous auth error and restores active
 			merged.Status = StatusActive
 			merged.Unavailable = false

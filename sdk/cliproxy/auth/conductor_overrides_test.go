@@ -1899,6 +1899,87 @@ func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.
 	}
 }
 
+func TestManager_MarkResult_UpgradeRequiredDoesNotCooldownAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-5-codex"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusUpgradeRequired,
+			Message:    "websocket upgrade required",
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to be present")
+	}
+	if updated.Unavailable {
+		t.Fatal("expected websocket upgrade failure to keep auth available")
+	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected websocket upgrade failure to keep auth cooldown unset, got %v", updated.NextRetryAfter)
+	}
+	if state := updated.ModelStates[model]; state != nil {
+		t.Fatalf("expected websocket upgrade failure to avoid model cooldown state, got %#v", state)
+	}
+}
+
+func TestManager_MarkResult_UpgradeRequiredUsesResultPolicy(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	for _, tt := range []struct {
+		name       string
+		inputCode  int
+		policyCode int
+	}{
+		{"upgrade_preserved", http.StatusUpgradeRequired, http.StatusUpgradeRequired},
+		{"upgrade_to_quota", http.StatusUpgradeRequired, http.StatusTooManyRequests},
+		{"quota_to_upgrade", http.StatusTooManyRequests, http.StatusUpgradeRequired},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m, auth := newCooldownMonotonicManager(t, "model-policy")
+			hook := &recordingHook{}
+			m.hook = hook
+			calls := 0
+			m.SetResultPolicy(ResultPolicyFunc(func(_ context.Context, result Result) Result {
+				calls++
+				result.Error = &Error{HTTPStatus: tt.policyCode, Message: "policy result"}
+				return result
+			}))
+			m.MarkResult(context.Background(), Result{
+				AuthID: auth.ID, Provider: auth.Provider, Model: "model-policy",
+				Error: &Error{HTTPStatus: tt.inputCode},
+			})
+			if calls != 1 {
+				t.Fatalf("policy calls = %d, want 1", calls)
+			}
+			updated, _ := m.GetByID(auth.ID)
+			blocked, _, _ := isAuthBlockedForModel(updated, "model-policy", time.Now())
+			if want := tt.policyCode == http.StatusTooManyRequests; blocked != want {
+				t.Fatalf("model blocked = %v, want %v", blocked, want)
+			}
+			if result := hook.lastResult.Load(); result == nil || statusCodeFromResult(result.Error) != tt.policyCode {
+				t.Fatalf("hook result = %#v, want status %d", result, tt.policyCode)
+			}
+		})
+	}
+}
+
 func TestManager_ExecuteCount_GenericRouteNotFoundDoesNotSuspendModel(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)

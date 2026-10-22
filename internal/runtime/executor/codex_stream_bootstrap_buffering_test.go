@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -46,12 +47,12 @@ func codexTestAuth(baseURL string) *cliproxyauth.Auth {
 
 func codexTestRequest() (cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	return cliproxyexecutor.Request{
-		Model:   "gpt-5.6-terra",
-		Payload: []byte(`{"model":"gpt-5.6-terra","input":"hello"}`),
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai-response"),
-		Stream:       true,
-	}
+			Model:   "gpt-5.6-terra",
+			Payload: []byte(`{"model":"gpt-5.6-terra","input":"hello"}`),
+		}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FromString("openai-response"),
+			Stream:       true,
+		}
 }
 
 // codexSSEServer streams the supplied event payloads as an HTTP 200 SSE response.
@@ -92,11 +93,11 @@ func codexWebsocketServer(t *testing.T, frames ...string) *httptest.Server {
 
 func codexWebsocketRequest() (cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	return cliproxyexecutor.Request{
-		Model:   "gpt-5.6-terra",
-		Payload: []byte(`{"model":"gpt-5.6-terra","input":[{"type":"message","role":"user","content":"hello"}]}`),
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai-response"),
-	}
+			Model:   "gpt-5.6-terra",
+			Payload: []byte(`{"model":"gpt-5.6-terra","input":[{"type":"message","role":"user","content":"hello"}]}`),
+		}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FromString("openai-response"),
+		}
 }
 
 // drainChunks collects every payload and the first error from a stream result.
@@ -1176,6 +1177,29 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_NonOverloadStaysInStream(t *
 	}
 }
 
+func TestCodexWebsocketsExecutor_BootstrapBuffering_StatusRequestFaultStaysInStream(t *testing.T) {
+	statusError := `{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid input."}}`
+	server := codexWebsocketServer(t, codexCreatedEvent, codexInProgressEvent, statusError)
+	defer server.Close()
+
+	req, opts := codexWebsocketRequest()
+	result, err := NewCodexWebsocketsExecutor(codexBufferingConfig(true)).ExecuteStream(context.Background(), codexTestAuth(server.URL), req, opts)
+
+	if err != nil {
+		t.Fatalf("request fault must stay in-stream: %v", err)
+	}
+	combined, streamErr := drainChunks(result)
+	if streamErr == nil {
+		t.Fatal("expected the request fault as an in-stream error")
+	}
+	if !strings.Contains(combined, "response.created") {
+		t.Fatalf("buffered handshake must precede the request fault: %s", combined)
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
+	}
+}
+
 func TestCodexWebsocketsExecutor_BootstrapBuffering_FlushesInOrderOnFirstOutput(t *testing.T) {
 	server := codexWebsocketServer(t,
 		codexCreatedEvent,
@@ -1272,6 +1296,9 @@ func TestIsCodexOverloadBootstrapFailureRejectsRequestFaults(t *testing.T) {
 	if !isCodexOverloadBootstrapFailure([]byte(capacityErrorShort)) {
 		t.Fatal("short model capacity error should be eligible for bootstrap failover")
 	}
+	if !isCodexOverloadBootstrapFailure([]byte(`{"error":{"code":"slow_down"}}`)) {
+		t.Fatal("slow down rejections should be eligible for bootstrap failover")
+	}
 }
 
 // codexWebsocketServerHoldingConnection behaves like codexWebsocketServer but keeps the upstream
@@ -1349,6 +1376,36 @@ func TestCodexWebsocketsExecutor_BootstrapOverload_DoesNotNotifyDownstreamDiscon
 	}
 	if notified {
 		t.Fatal("bootstrap overload must not signal a downstream disconnect: the conductor still has to retry on another credential, and signalling closes the client connection with zero frames delivered")
+	}
+}
+
+func TestCodexWebsocketsExecutor_BootstrapReadResetRequiresTranscriptReplay(t *testing.T) {
+	server := codexWebsocketServer(t)
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(codexBufferingConfig(true))
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+
+	const sessionID = "bootstrap-read-reset-session"
+	req, opts := codexWebsocketRequest()
+	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
+	_, err := exec.ExecuteStream(
+		cliproxyexecutor.WithDownstreamWebsocket(context.Background()),
+		codexTestAuth(server.URL),
+		req,
+		opts,
+	)
+	if err == nil {
+		t.Fatal("expected a transcript-replay error")
+	}
+	var replayRequired interface {
+		CodexWebsocketReplayRequired() bool
+	}
+	if !errors.As(err, &replayRequired) || replayRequired == nil || !replayRequired.CodexWebsocketReplayRequired() {
+		t.Fatalf("ExecuteStream() error = %v, want transcript-replay marker", err)
+	}
+	if got := exec.UpstreamGeneration(sessionID); got != 1 {
+		t.Fatalf("upstream generation = %d, want 1", got)
 	}
 }
 

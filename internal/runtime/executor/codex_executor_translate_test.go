@@ -57,3 +57,8 @@ func TestTranslateCodexRequestPairTranslatesDifferentPayloads(t *testing.T) {
 		t.Fatalf("body = %s, want %s", body, payload)
 	}
 }
+
+func translateCodexRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool, preserveEmptyThinkingBlocks ...bool) ([]byte, []byte) {
+	original, body, _, _ := translateCodexRequestPairWithUpdateIntent(from, to, model, originalPayload, payload, stream, preserveEmptyThinkingBlocks...)
+	return original, body
+}

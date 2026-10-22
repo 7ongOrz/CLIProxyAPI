@@ -102,19 +102,6 @@ func (m *Manager) localExecutionAllowed() bool {
 	return m != nil && !m.HomeEnabled()
 }
 
-func (m *Manager) localFallbackAuth(authID string) *Auth {
-	if !m.localExecutionAllowed() {
-		return nil
-	}
-	m.mu.RLock()
-	auth := m.auths[strings.TrimSpace(authID)]
-	m.mu.RUnlock()
-	if auth == nil {
-		return nil
-	}
-	return auth.Clone()
-}
-
 type homeErrorEnvelope struct {
 	Error *homeErrorDetail `json:"error"`
 }
@@ -829,28 +816,6 @@ func (m *Manager) rememberHomeSelectionRuntimeAuth(sessionID string, selection *
 	m.mu.Unlock()
 }
 
-func (m *Manager) replaceHomeSelectionAuth(selection *HomeDispatchSelection, auth *Auth) {
-	if m == nil || selection == nil || auth == nil {
-		return
-	}
-	m.mu.Lock()
-	selection.ReplaceAuth(auth)
-	updated := selection.CloneAuth()
-	if updated == nil {
-		m.mu.Unlock()
-		return
-	}
-	for sessionID, owners := range m.homeRuntimeAuthOwners {
-		for authID, owner := range owners {
-			if owner != selection || m.homeRuntimeAuths[sessionID] == nil {
-				continue
-			}
-			m.homeRuntimeAuths[sessionID][authID] = updated.Clone()
-		}
-	}
-	m.mu.Unlock()
-}
-
 func (m *Manager) forgetHomeRuntimeAuth(sessionID string, authID string, owner *HomeDispatchSelection) {
 	sessionID = strings.TrimSpace(sessionID)
 	authID = strings.TrimSpace(authID)
@@ -895,34 +860,6 @@ func (m *Manager) rememberHomeRuntimeAuth(sessionID string, auth *Auth) {
 	}
 	sessionAuths[authID] = auth.Clone()
 	m.mu.Unlock()
-}
-
-func (m *Manager) homeRuntimeAuthByID(sessionID string, authID string) (*Auth, ProviderExecutor, string, bool) {
-	sessionID = strings.TrimSpace(sessionID)
-	authID = strings.TrimSpace(authID)
-	if m == nil || sessionID == "" || authID == "" {
-		return nil, nil, "", false
-	}
-	m.mu.RLock()
-	sessionAuths := m.homeRuntimeAuths[sessionID]
-	auth := sessionAuths[authID]
-	m.mu.RUnlock()
-	if auth == nil || !authWebsocketsEnabled(auth) {
-		return nil, nil, "", false
-	}
-	logicalProvider := strings.ToLower(strings.TrimSpace(auth.Provider))
-	executorKey := executorKeyFromAuth(auth)
-	if logicalProvider == "" || executorKey == "" {
-		return nil, nil, "", false
-	}
-	executor, ok := m.Executor(executorKey)
-	if !ok && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["base_url"]) != "" {
-		executor, ok = m.Executor("openai-compatibility")
-	}
-	if !ok {
-		return nil, nil, "", false
-	}
-	return auth.Clone(), executor, logicalProvider, true
 }
 
 func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
@@ -1486,7 +1423,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 			continue
 		}
 		creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
-		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
+		result, errStream := m.executeStreamWithModelPool(creditsCtx, creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
 		if errStream != nil {
 			continue
 		}

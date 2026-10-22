@@ -278,10 +278,6 @@ func (f *xaiInternalXSearchResponseFilter) filterCompletedOutput(eventData []byt
 	return updated
 }
 
-func normalizeXAIInputNamespaceToolCalls(body []byte) []byte {
-	return normalizeXAIInputNamespaceToolCallsWithFold(body, xaiShouldFoldNamespaceTools(body, false))
-}
-
 func normalizeXAIInputNamespaceToolCallsWithFold(body []byte, shouldFold bool) []byte {
 	if !gjson.ValidBytes(body) {
 		return body
@@ -515,11 +511,6 @@ func unwrapXAIDispatcherArguments(rawArgs string, namespaceName string, refs map
 	return childName, childArgs, true
 }
 
-func restoreXAINamespaceToolCalls(data []byte, refs map[string]xaiNamespaceToolRef) []byte {
-	restorer := newXAINamespaceRestorer(refs)
-	return restorer.restore(data)
-}
-
 // restoreXAIClientWebSearchName rewrites the given alias
 // back to the original client tool name "web_search" across event items and
 // completed outputs. Only unnamespaced tool calls are restored so namespaced
@@ -675,10 +666,6 @@ func xaiFunctionParametersNeedSimplification(tool gjson.Result, namespaceName st
 		}
 	}
 	return false
-}
-
-func sanitizeXAIInputEncryptedContent(body []byte) []byte {
-	return sanitizeXAIInputEncryptedContentWithOptions(body, false)
 }
 
 func sanitizeXAIInputEncryptedContentForBaseURL(body []byte, baseURL string) []byte {
@@ -1139,6 +1126,16 @@ func xaiStatusErr(code int, body []byte) statusErr {
 		err.retryAfter = &d
 	}
 	return err
+}
+
+func parseXAIResponseTerminalError(payload []byte) (error, bool) {
+	if gjson.GetBytes(payload, "type").String() == "response.failed" {
+		streamErr, body, ok := codexTerminalFailureErr(payload)
+		if ok {
+			return xaiStatusErr(streamErr.StatusCode(), body), true
+		}
+	}
+	return parseXAIWebsocketError(payload)
 }
 
 // isXAIBadCredentialsBody reports whether an xAI error body indicates an

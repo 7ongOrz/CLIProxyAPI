@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	requestlogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	log "github.com/sirupsen/logrus"
@@ -195,24 +196,6 @@ func writeWebsocketTimelineBuilder(builder *strings.Builder, data []byte) {
 	builder.Write(data)
 }
 
-func appendWebsocketEvent(builder *strings.Builder, eventType string, payload []byte) {
-	if builder == nil {
-		return
-	}
-	trimmedPayload := bytes.TrimSpace(payload)
-	if len(trimmedPayload) == 0 {
-		return
-	}
-	if builder.Len() > 0 {
-		builder.WriteString("\n")
-	}
-	builder.WriteString("websocket.")
-	builder.WriteString(eventType)
-	builder.WriteString("\n")
-	builder.Write(trimmedPayload)
-	builder.WriteString("\n")
-}
-
 func websocketPayloadEventType(payload []byte) string {
 	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 	if eventType == "" {
@@ -229,6 +212,15 @@ func websocketPayloadPreview(payload []byte) string {
 	previewText := strings.ReplaceAll(string(trimmedPayload), "\n", "\\n")
 	previewText = strings.ReplaceAll(previewText, "\r", "\\r")
 	return previewText
+}
+
+func logResponsesWebsocketDownstreamError(sessionID string, payload []byte) {
+	log.WithFields(log.Fields{
+		"id":     sessionID,
+		"type":   websocket.TextMessage,
+		"event":  websocketPayloadEventType(payload),
+		"status": int(gjson.GetBytes(payload, "status").Int()),
+	}).Info("responses websocket: downstream_out")
 }
 
 func isResponsesWebsocketCompletionEvent(eventType string) bool {
@@ -255,12 +247,31 @@ func (e *responsesWebsocketPayloadError) StatusCode() int {
 }
 
 func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.ErrorMessage {
-	status := int(gjson.GetBytes(payload, "status").Int())
-	if status <= 0 {
-		status = int(gjson.GetBytes(payload, "status_code").Int())
+	status, hasExplicitStatus := responsesWebsocketExplicitErrorStatus(payload)
+	errText := strings.TrimSpace(gjson.GetBytes(payload, "error.message").String())
+	if errText == "" {
+		errText = strings.TrimSpace(gjson.GetBytes(payload, "response.error.message").String())
+	}
+	if errText == "" {
+		errText = strings.TrimSpace(gjson.GetBytes(payload, "body.error.message").String())
+	}
+	if errText == "" {
+		errText = strings.TrimSpace(gjson.GetBytes(payload, "message").String())
+	}
+	if errText == "" {
+		errText = strings.TrimSpace(gjson.GetBytes(payload, "error.code").String())
+	}
+	if errText == "" {
+		errText = strings.TrimSpace(gjson.GetBytes(payload, "response.error.code").String())
+	}
+	if errText == "" {
+		errText = strings.TrimSpace(gjson.GetBytes(payload, "body.error.code").String())
+	}
+	if !hasExplicitStatus {
+		status = responsesWebsocketInferredErrorStatus(payload, errText)
 	}
 	if status <= 0 {
-		status = http.StatusInternalServerError
+		status = http.StatusBadGateway
 	}
 
 	trimmedPayload := bytes.TrimSpace(payload)
@@ -274,6 +285,88 @@ func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.Error
 		}
 	}
 	return &interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", http.StatusText(status))}
+}
+
+func responsesWebsocketIncompleteErrorMessageFromPayload(payload []byte) *interfaces.ErrorMessage {
+	reason := strings.TrimSpace(gjson.GetBytes(payload, "response.incomplete_details.reason").String())
+	if reason == "" {
+		reason = "unknown"
+	}
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      fmt.Errorf("Incomplete response returned, reason: %s", reason),
+	}
+}
+
+func responsesWebsocketExplicitErrorStatus(payload []byte) (int, bool) {
+	for _, path := range []string{
+		"status",
+		"status_code",
+		"response.status_code",
+		"response.error.status",
+		"response.error.status_code",
+		"error.status",
+		"error.status_code",
+		"body.error.status",
+		"body.error.status_code",
+	} {
+		status := int(gjson.GetBytes(payload, path).Int())
+		if status > 0 {
+			return status, true
+		}
+	}
+	return 0, false
+}
+
+func responsesWebsocketInferredErrorStatus(payload []byte, errText string) int {
+	if clienterror.ClassifyCodexWebsocketError(string(payload)) == clienterror.CodexPreviousResponseNotFound {
+		return http.StatusBadRequest
+	}
+
+	errType := responsesWebsocketLowerPayloadString(payload, "error.type", "response.error.type", "body.error.type")
+	errCode := responsesWebsocketLowerPayloadString(payload, "error.code", "response.error.code", "body.error.code", "code")
+	switch {
+	case errType == "usage_limit_reached" ||
+		errType == "insufficient_quota" ||
+		errType == "rate_limit_error" ||
+		errCode == "insufficient_quota" ||
+		errCode == "rate_limit_exceeded" ||
+		errCode == "usage_not_included" ||
+		responsesWebsocketErrorTextIndicatesModelCapacity(errText):
+		return http.StatusTooManyRequests
+	case errType == "authentication_error":
+		return http.StatusUnauthorized
+	case errType == "permission_error":
+		return http.StatusForbidden
+	case errType == "invalid_request_error" ||
+		errCode == "invalid_request_error" ||
+		errCode == "previous_response_not_found" ||
+		errCode == "context_length_exceeded" ||
+		errCode == "context_too_large" ||
+		errCode == "invalid_prompt" ||
+		errCode == "bio_policy" ||
+		errCode == "cyber_policy" ||
+		errCode == "misalignment_policy_violation":
+		return http.StatusBadRequest
+	default:
+		return 0
+	}
+}
+
+func responsesWebsocketLowerPayloadString(payload []byte, paths ...string) string {
+	for _, path := range paths {
+		value := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, path).String()))
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func responsesWebsocketErrorTextIndicatesModelCapacity(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "selected model is at capacity") ||
+		strings.Contains(lower, "model is at capacity. please try a different model")
 }
 
 func setWebsocketTimelineBody(c *gin.Context, body string) {
@@ -306,6 +399,32 @@ func writeResponsesWebsocketPayload(writer *responsesWebsocketWriter, wsTimeline
 	return writer.conn.WriteMessage(websocket.TextMessage, payload)
 }
 
+func startResponsesWebsocketHeartbeat(conn *websocket.Conn, done <-chan struct{}, sessionID string) {
+	startResponsesWebsocketHeartbeatWithInterval(conn, done, sessionID, wsHeartbeatInterval)
+}
+
+func startResponsesWebsocketHeartbeatWithInterval(conn *websocket.Conn, done <-chan struct{}, sessionID string, interval time.Duration) {
+	if conn == nil || interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if errWrite := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Time{}); errWrite != nil {
+					log.Debugf("responses websocket: heartbeat ping failed id=%s error=%v", strings.TrimSpace(sessionID), errWrite)
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+}
+
 func appendWebsocketTimelineDisconnect(timeline websocketTimelineAppender, err error, timestamp time.Time) {
 	if err == nil {
 		return
@@ -313,13 +432,6 @@ func appendWebsocketTimelineDisconnect(timeline websocketTimelineAppender, err e
 	if timeline != nil {
 		timeline.Append("disconnect", []byte(err.Error()), timestamp)
 	}
-}
-
-func appendWebsocketTimelineEvent(builder *strings.Builder, eventType string, payload []byte, timestamp time.Time) {
-	if builder == nil {
-		return
-	}
-	writeWebsocketTimelineBuilder(builder, formatWebsocketTimelineEvent(eventType, payload, timestamp))
 }
 
 func formatWebsocketTimelineEvent(eventType string, payload []byte, timestamp time.Time) []byte {

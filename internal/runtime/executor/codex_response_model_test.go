@@ -3,13 +3,18 @@ package executor
 import (
 	"bytes"
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 const codexResponseModelTestStream = `event: response.created
@@ -103,5 +108,56 @@ func TestCodexUsageRecordsCarryResponseModelPerModel(t *testing.T) {
 	}
 	if imageRecord.ResponseModel != "" {
 		t.Fatalf("image record response model = %q, want empty", imageRecord.ResponseModel)
+	}
+}
+
+func TestCodexExecutePreservesModelUsageWithImageTool(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		responseUsage string
+		wantInput     int64
+		wantOutput    int64
+	}{
+		{name: "response_and_tool_usage", responseUsage: `,"usage":{"input_tokens":5,"output_tokens":7,"total_tokens":12}`, wantInput: 5, wantOutput: 7},
+		{name: "tool_usage_only"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_image","model":"gpt-5.4-mini","output":[{"type":"image_generation_call","id":"img_1","status":"completed","result":"AA=="}],"tool_usage":{"image_gen":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`+tc.responseUsage+"}}\n\n")
+			}))
+			defer upstream.Close()
+
+			capture := &codexResponseModelUsageCapture{alias: t.Name(), records: make(chan coreusage.Record, 4)}
+			coreusage.RegisterNamedPlugin(t.Name(), capture)
+			t.Cleanup(func() {
+				coreusage.RegisterNamedPlugin(t.Name(), codexResponseModelNoopUsagePlugin{})
+			})
+			ctx := coreusage.WithRequestedModelAlias(t.Context(), t.Name())
+			auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "test", "base_url": upstream.URL}}
+			req := cliproxyexecutor.Request{
+				Model:   "gpt-5.4-mini",
+				Payload: []byte(`{"model":"gpt-5.4-mini","input":[],"tools":[{"type":"image_generation","model":"gpt-image-2"}]}`),
+			}
+			_, errExecute := NewCodexExecutor(&config.Config{}).Execute(ctx, auth, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+			if errExecute != nil {
+				t.Fatal(errExecute)
+			}
+
+			attempt := capture.await(t)
+			if attempt.Failed || attempt.Model != req.Model || attempt.ResponseModel != req.Model {
+				t.Fatalf("unexpected model usage record: %+v", attempt)
+			}
+			if got := attempt.Detail; got.InputTokens != tc.wantInput || got.OutputTokens != tc.wantOutput || got.TotalTokens != tc.wantInput+tc.wantOutput {
+				t.Errorf("model usage = %+v, want input=%d output=%d", got, tc.wantInput, tc.wantOutput)
+			}
+			image := capture.await(t)
+			if image.Failed || image.Model != "gpt-image-2" || image.ResponseModel != "" {
+				t.Fatalf("unexpected image usage record: %+v", image)
+			}
+			if got := image.Detail; got.InputTokens != 2 || got.OutputTokens != 3 || got.TotalTokens != 5 {
+				t.Errorf("image usage = %+v, want input=2 output=3 total=5", got)
+			}
+		})
 	}
 }

@@ -114,11 +114,6 @@ func (p *CredentialRefreshPatch) RefreshedOuter() bool {
 	return p != nil && p.outerAfter != nil
 }
 
-// RefreshedSIWC reports whether p carries a refreshed SIWC credential partition.
-func (p *CredentialRefreshPatch) RefreshedSIWC() bool {
-	return p != nil && p.siwcAfter != nil
-}
-
 // CanApplyTo reports whether at least one refreshed partition in p still matches disk's version.
 func (p *CredentialRefreshPatch) CanApplyTo(disk map[string]any) bool {
 	if p == nil {
@@ -136,6 +131,17 @@ func (p *CredentialRefreshPatch) CanApplyTo(disk map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// RefreshedCredential reports whether the selected credential matches a successful
+// refresh result, including refreshes that retain the same access token.
+func (p *CredentialRefreshPatch) RefreshedCredential(metadata map[string]any, useSIWC bool) bool {
+	after := p.outerAfter
+	if useSIWC {
+		metadata, _ = metadata["siwc"].(map[string]any)
+		after = p.siwcAfter
+	}
+	return after != nil && sameCredentialVersion(metadata, after)
 }
 
 // Apply overlays successful refreshes on the locked disk snapshot. A partition

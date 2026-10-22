@@ -9,12 +9,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const codexIncompleteStreamMessage = "stream error: stream disconnected before completion: stream closed before response.completed"
+const codexIncompleteImageStreamMessage = "stream error: image stream disconnected before completion"
 
 type codexIncompleteStreamError struct {
 	statusErr
@@ -24,6 +26,13 @@ func newCodexIncompleteStreamError() codexIncompleteStreamError {
 	return codexIncompleteStreamError{statusErr: statusErr{
 		code: http.StatusRequestTimeout,
 		msg:  codexIncompleteStreamMessage,
+	}}
+}
+
+func newCodexIncompleteImageStreamError() codexIncompleteStreamError {
+	return codexIncompleteStreamError{statusErr: statusErr{
+		code: http.StatusRequestTimeout,
+		msg:  codexIncompleteImageStreamMessage,
 	}}
 }
 
@@ -140,44 +149,29 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	return completedDataPatched
 }
 
-func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
-	streamErr, body, ok := codexTerminalStreamErr(eventData)
-	if !ok || !codexTerminalErrorIsContextLength(body) {
-		return statusErr{}, false
-	}
-	return streamErr, true
-}
-
-func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
-	return codexTerminalStreamErrWithCooling(eventData, false)
-}
-
-func codexTerminalStreamErrWithCooling(eventData []byte, modelLevelCooling bool) (statusErr, []byte, bool) {
-	body, ok := codexTerminalFailureBody(eventData)
-	if !ok || !codexTerminalStreamErrShouldHandle(body) {
-		return statusErr{}, nil, false
-	}
-	return newCodexStatusErrWithCooling(http.StatusBadRequest, body, modelLevelCooling), body, true
-}
-
 func codexTerminalFailureErr(eventData []byte) (statusErr, []byte, bool) {
 	return codexTerminalFailureErrWithCooling(eventData, false)
 }
 
 func codexTerminalFailureErrWithCooling(eventData []byte, modelLevelCooling bool) (statusErr, []byte, bool) {
-	if streamErr, body, ok := codexTerminalStreamErrWithCooling(eventData, modelLevelCooling); ok {
-		return streamErr, body, true
-	}
 	body, ok := codexTerminalFailureBody(eventData)
 	if !ok {
 		return statusErr{}, nil, false
 	}
-	return newCodexStatusErrWithCooling(codexTerminalFailureStatus(body), body, modelLevelCooling), body, true
+	return newCodexStatusErrWithCooling(codexResponseFailureStatus(eventData, body), body, modelLevelCooling), body, true
 }
 
-func codexTerminalFailureStatus(body []byte) int {
-	for _, path := range []string{"error.status_code", "error.status"} {
-		if status := int(gjson.GetBytes(body, path).Int()); status >= 400 && status <= 599 {
+func codexResponseFailureStatus(eventData, body []byte) int {
+	for _, path := range []string{
+		"status",
+		"status_code",
+		"response.status_code",
+		"response.error.status",
+		"response.error.status_code",
+		"error.status",
+		"error.status_code",
+	} {
+		if status := int(gjson.GetBytes(eventData, path).Int()); status >= 400 && status <= 599 {
 			return status
 		}
 	}
@@ -185,17 +179,30 @@ func codexTerminalFailureStatus(body []byte) int {
 	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
 	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
 	switch {
-	case errorCode == "cyber_policy":
-		return http.StatusBadRequest
-	case errorType == "not_found_error", errorCode == "not_found", errorCode == "model_not_found":
-		return http.StatusNotFound
+	case isCodexUsageLimitError(body),
+		isCodexModelCapacityError(body),
+		errorType == "rate_limit_error",
+		errorCode == "rate_limit_exceeded",
+		errorCode == "insufficient_quota",
+		errorCode == "usage_not_included":
+		return http.StatusTooManyRequests
 	case errorType == "authentication_error", errorCode == "invalid_api_key", errorCode == "unauthorized":
 		return http.StatusUnauthorized
 	case errorType == "permission_error", errorCode == "forbidden", errorCode == "permission_denied":
 		return http.StatusForbidden
-	case errorType == "rate_limit_error", errorCode == "rate_limit_exceeded":
-		return http.StatusTooManyRequests
-	case errorType == "invalid_request_error", errorType == "bad_request_error":
+	case errorType == "not_found_error", errorCode == "not_found", errorCode == "model_not_found":
+		return http.StatusNotFound
+	case errorType == "invalid_request_error",
+		errorType == "bad_request_error",
+		errorCode == "invalid_request_error",
+		errorCode == "previous_response_not_found",
+		errorCode == "context_length_exceeded",
+		errorCode == "context_too_large",
+		errorCode == "invalid_prompt",
+		errorCode == "bio_policy",
+		errorCode == "cyber_policy",
+		errorCode == "misalignment_policy_violation",
+		codexTerminalStreamErrShouldHandle(body):
 		return http.StatusBadRequest
 	default:
 		return http.StatusBadGateway
@@ -366,7 +373,7 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 		return "context_too_large", "invalid_request_error", true
 	case strings.Contains(lower, "invalid signature in thinking block") || strings.Contains(lower, "invalid_encrypted_content"):
 		return "thinking_signature_invalid", "invalid_request_error", true
-	case upstreamCode == "previous_response_not_found" || strings.Contains(lower, "previous_response_not_found") || strings.Contains(lower, "previous_response_id") && strings.Contains(lower, "not found"):
+	case clienterror.ClassifyCodexWebsocketError(string(body)) == clienterror.CodexPreviousResponseNotFound:
 		return "previous_response_not_found", "invalid_request_error", true
 	case statusCode == http.StatusUnauthorized || upstreamType == "authentication_error" || upstreamCode == "invalid_api_key" || strings.Contains(lower, "invalid or expired token") || strings.Contains(lower, "refresh_token_reused"):
 		return "auth_unavailable", "authentication_error", true
@@ -602,7 +609,7 @@ func observeCodexTokenEvent(reporter *helps.UsageReporter, payload []byte) {
 
 // newCodexBootstrapOverloadErr reports a buffered overload rejection with its real status.
 //
-// The status is deliberately produced here instead of in codexTerminalFailureStatus: that mapping
+// The status is deliberately produced here instead of in codexResponseFailureStatus: that mapping
 // is shared with the unbuffered path, where the rejection is delivered in-stream and a status
 // change would alter cooldown classification and retry-after parsing for everyone. Keeping 503
 // scoped to this path means disabling the feature restores the previous behaviour exactly.
@@ -625,7 +632,9 @@ func isCodexOverloadBootstrapFailure(body []byte) bool {
 		errorMessage = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "message").String()))
 	}
 	switch {
-	case errorType == "service_unavailable_error", errorCode == "server_is_overloaded":
+	case errorType == "service_unavailable_error",
+		errorCode == "server_is_overloaded",
+		errorCode == "slow_down":
 		return true
 	case errorType == "rate_limit_error", errorCode == "rate_limit_exceeded":
 		return true

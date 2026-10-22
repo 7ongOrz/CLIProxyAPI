@@ -35,6 +35,10 @@ func IsCodexTerminalEmptyIncomplete(eventData []byte, outputItemsCount int, sawO
 	if eventType != "response.incomplete" {
 		return false
 	}
+	// A requested interruption can finish before the first output token.
+	if gjson.GetBytes(eventData, "response.incomplete_details.reason").String() == "interrupted" {
+		return false
+	}
 	// If any non-empty text delta, reasoning delta, or tool argument delta was emitted, content was produced.
 	if sawOutputDelta {
 		return false

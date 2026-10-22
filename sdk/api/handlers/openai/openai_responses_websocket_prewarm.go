@@ -14,10 +14,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-func shouldHandleResponsesWebsocketPrewarmLocally(rawJSON []byte, allowIncrementalInputWithPreviousResponseID bool) bool {
-	if allowIncrementalInputWithPreviousResponseID {
-		return false
-	}
+func shouldHandleResponsesWebsocketPrewarmLocally(rawJSON []byte) bool {
 	if strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String()) != wsRequestTypeCreate {
 		return false
 	}
@@ -61,7 +58,7 @@ func writeResponsesWebsocketSyntheticPrewarm(
 // A synthetic warm-up acknowledges input that never reached the upstream.
 // Materialize that input before compacted-history detection can mistake the
 // client's remaining delta for a complete replacement transcript.
-func normalizeResponsesWebsocketPrewarmFollowup(rawJSON, warmupRequest []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
+func normalizeResponsesWebsocketPrewarmFollowup(rawJSON, warmupRequest []byte, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
 	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
 	if requestType != wsRequestTypeCreate && requestType != wsRequestTypeAppend {
 		return nil, warmupRequest, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("unsupported websocket request type: %s", requestType)}
@@ -80,7 +77,7 @@ func normalizeResponsesWebsocketPrewarmFollowup(rawJSON, warmupRequest []byte) (
 	if errSet != nil {
 		return nil, warmupRequest, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errSet}
 	}
-	return normalized, normalized, nil
+	return normalizeResponseCreateRequest(normalized, true, allowCompactionReplayBypass)
 }
 
 func syntheticResponsesWebsocketPrewarmPayloads(requestJSON []byte) ([][]byte, error) {
@@ -138,37 +135,18 @@ func inputContainsFullTranscript(input gjson.Result) bool {
 		return false
 	}
 	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
+		if isResponsesWebsocketCompactionReplayItemType(item.Get("type").String()) {
 			return true
 		}
 	}
 	return false
 }
 
-func inputWithoutCompactionItems(input gjson.Result) string {
-	if !input.IsArray() {
-		return normalizeJSONArrayRaw([]byte(input.Raw))
+func isResponsesWebsocketCompactionReplayItemType(t string) bool {
+	switch strings.TrimSpace(t) {
+	case "compaction", "compaction_summary", "context_compaction":
+		return true
+	default:
+		return false
 	}
-	filtered := make([]string, 0, len(input.Array()))
-	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
-			continue
-		}
-		filtered = append(filtered, item.Raw)
-	}
-	return "[" + strings.Join(filtered, ",") + "]"
-}
-
-func normalizeJSONArrayRaw(raw []byte) string {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
-		return "[]"
-	}
-	result := gjson.Parse(trimmed)
-	if result.Type == gjson.JSON && result.IsArray() {
-		return trimmed
-	}
-	return "[]"
 }

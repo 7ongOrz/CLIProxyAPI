@@ -506,8 +506,8 @@ func TestCodexExecutorExecuteStreamSurfacesTerminalStreamError(t *testing.T) {
 	assertCodexErrorCode(t, streamErr.Error(), "invalid_request_error", "context_too_large")
 }
 
-func TestCodexTerminalStreamContextLengthErrFromResponseFailed(t *testing.T) {
-	err, ok := codexTerminalStreamContextLengthErr([]byte(`{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}`))
+func TestCodexTerminalFailureErrFromResponseFailedContextLength(t *testing.T) {
+	err, _, ok := codexTerminalFailureErr([]byte(`{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}`))
 	if !ok {
 		t.Fatal("expected context length terminal error")
 	}
@@ -517,8 +517,8 @@ func TestCodexTerminalStreamContextLengthErrFromResponseFailed(t *testing.T) {
 	assertCodexErrorCode(t, err.Error(), "invalid_request_error", "context_too_large")
 }
 
-func TestCodexTerminalStreamContextLengthErrFromTopLevelError(t *testing.T) {
-	err, ok := codexTerminalStreamContextLengthErr([]byte(`{"type":"error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","sequence_number":2}`))
+func TestCodexTerminalFailureErrFromTopLevelContextLength(t *testing.T) {
+	err, _, ok := codexTerminalFailureErr([]byte(`{"type":"error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","sequence_number":2}`))
 	if !ok {
 		t.Fatal("expected top-level context length terminal error")
 	}
@@ -528,20 +528,6 @@ func TestCodexTerminalStreamContextLengthErrFromTopLevelError(t *testing.T) {
 	assertCodexErrorCode(t, err.Error(), "invalid_request_error", "context_too_large")
 	if !strings.Contains(err.Error(), "Your input exceeds the context window") {
 		t.Fatalf("error message missing upstream context text: %v", err)
-	}
-}
-
-func TestCodexTerminalStreamContextLengthErrIgnoresOtherTerminalErrors(t *testing.T) {
-	_, ok := codexTerminalStreamContextLengthErr([]byte(`{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit reached."}}`))
-	if ok {
-		t.Fatal("rate limit terminal error should not be handled by context length fix")
-	}
-}
-
-func TestCodexTerminalStreamErrIgnoresRateLimitTerminalErrors(t *testing.T) {
-	_, _, ok := codexTerminalStreamErr([]byte(`{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit reached."}}`))
-	if ok {
-		t.Fatal("rate limit terminal error should not be handled by replay terminal error path")
 	}
 }
 
@@ -560,6 +546,36 @@ func TestCodexTerminalFailureErrClassifiesStatus(t *testing.T) {
 			name:       "cyber policy",
 			event:      `{"type":"error","error":{"type":"invalid_request","code":"cyber_policy","message":"This content was flagged for possible cybersecurity risk."}}`,
 			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "misalignment policy",
+			event:      `{"type":"error","error":{"code":"misalignment_policy_violation","message":"This request violated the misalignment policy."}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "invalid prompt without type",
+			event:      `{"type":"response.failed","response":{"error":{"code":"invalid_prompt","message":"Invalid prompt."}}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "bio policy without type",
+			event:      `{"type":"response.failed","response":{"error":{"code":"bio_policy","message":"This content was flagged for biological risk."}}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "insufficient quota without type",
+			event:      `{"type":"response.failed","response":{"error":{"code":"insufficient_quota","message":"Quota exceeded."}}}`,
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
+			name:       "usage not included without type",
+			event:      `{"type":"response.failed","response":{"error":{"code":"usage_not_included","message":"Upgrade to Plus to use Codex."}}}`,
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
+			name:       "explicit response status wins",
+			event:      `{"type":"response.failed","response":{"error":{"status_code":403,"code":"context_length_exceeded","message":"Forbidden."}}}`,
+			wantStatus: http.StatusForbidden,
 		},
 		{
 			name:       "authentication",
@@ -603,8 +619,8 @@ func TestCodexTerminalFailureErrClassifiesStatus(t *testing.T) {
 	}
 }
 
-func TestCodexTerminalStreamErrHandlesUsageLimitErrorEvent(t *testing.T) {
-	streamErr, _, ok := codexTerminalStreamErr([]byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_in_seconds":300}}`))
+func TestCodexTerminalFailureErrHandlesUsageLimitErrorEvent(t *testing.T) {
+	streamErr, _, ok := codexTerminalFailureErr([]byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_in_seconds":300}}`))
 	if !ok {
 		t.Fatal("expected usage_limit_reached terminal error to be handled")
 	}
@@ -620,8 +636,8 @@ func TestCodexTerminalStreamErrHandlesUsageLimitErrorEvent(t *testing.T) {
 	}
 }
 
-func TestCodexTerminalStreamErrHandlesUsageLimitResponseFailed(t *testing.T) {
-	streamErr, _, ok := codexTerminalStreamErr([]byte(`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":60}}}`))
+func TestCodexTerminalFailureErrHandlesUsageLimitResponseFailed(t *testing.T) {
+	streamErr, _, ok := codexTerminalFailureErr([]byte(`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":60}}}`))
 	if !ok {
 		t.Fatal("expected usage_limit_reached response.failed terminal error to be handled")
 	}

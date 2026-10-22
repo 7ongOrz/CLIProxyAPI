@@ -20,8 +20,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// A delayed control frame must not queue an error for the next create, nor
-// cancel its response when the old response ID is repeated during that turn.
+// A delayed control frame acknowledges its terminal response while the next
+// response continues on the retained upstream socket.
 func TestResponsesLateInterruptDoesNotPoisonNextCreate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var connections atomic.Int32
@@ -146,15 +146,17 @@ func TestResponsesLateInterruptDoesNotPoisonNextCreate(t *testing.T) {
 	send(`{"type":"response.interrupt","response_id":"unknown"}`)
 	expect("error", "")
 	send(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}`)
+	readResponsesInterruptAcknowledgement(t, client, "r1")
 	send(fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"r1","input":[]}`, model))
 	expect("response.created", "r2")
 	for i := 0; i < 2; i++ {
 		send(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}`)
+		readResponsesInterruptAcknowledgement(t, client, "r1")
 	}
 	send(`{"type":"response.interrupt","response_id":"r2","mode":"discard_partial_items"}`)
 	expect("response.completed", "r2")
 	// Switching the next turn to HTTP leaves an idle websocket cached. A
-	// terminal r1 interrupt must be a no-op, while r-http must cancel locally.
+	// terminal r1 interrupt acknowledges completion, while r-http cancels locally.
 	auth, _ := manager.GetByID(authID)
 	auth.Attributes["websockets"] = "false"
 	if _, errUpdate := manager.Update(context.Background(), auth); errUpdate != nil {
@@ -163,8 +165,9 @@ func TestResponsesLateInterruptDoesNotPoisonNextCreate(t *testing.T) {
 	send(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"role":"user","content":"next turn"}]}`, model))
 	expect("response.created", "r-http")
 	send(`{"type":"response.interrupt","response_id":"r1"}`)
+	readResponsesInterruptAcknowledgement(t, client, "r1")
 	send(`{"type":"response.interrupt","response_id":"r-http"}`)
-	expect("response.incomplete", "r-http")
+	readResponsesLocalInterruptCompletion(t, client, "r-http")
 	select {
 	case <-httpCanceled:
 	case <-time.After(3 * time.Second):

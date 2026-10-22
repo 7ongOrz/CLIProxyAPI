@@ -75,8 +75,8 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	applyClaudePreservedThinkingBindingDoc(doc)
 	finalize := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslatedForPayload, req, opts)
 	ctx = helps.WithPayloadFinalizer(ctx, finalize)
-	helps.FinalizePayloadDoc(ctx, doc)
 	stripPromptCacheOptionsDoc(doc)
+	helps.FinalizePayloadDoc(ctx, doc)
 	body = doc.Bytes()
 	if errValidate := validateClaudeTokenCountRequest(body); errValidate != nil {
 		return cliproxyexecutor.Response{}, errValidate
@@ -226,10 +226,6 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 		normalizeCacheControlTTLDoc(doc)
 	}
 
-	// Extract betas from body and convert to header (for count_tokens too)
-	extraBetas, _ := extractAndRemoveBetasDoc(doc)
-	// Claude Code 2.1.220's beta.messages.countTokens() always appends this beta.
-	extraBetas = append(extraBetas, claudeTokenCountingBeta)
 	if fp.MCPAlias && cloaked {
 		mcpAliases := resolveClaudeMCPAliasOptions(ctx, opts.Metadata, req.Metadata)
 		prepareClaudeOAuthToolNamesForUpstreamDoc(doc, mcpAliases)
@@ -266,12 +262,16 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 	// that is about to be sent.
 	finalize := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslatedForPayload, req, opts)
 	ctx = helps.WithPayloadFinalizer(ctx, finalize)
-	helps.FinalizePayloadDoc(ctx, doc)
 	stripPromptCacheOptionsDoc(doc)
+	helps.FinalizePayloadDoc(ctx, doc)
 	body = doc.Bytes()
 	if errMidSystem := validateClaudeMidSystemMessageModel(body, confirmedClaudeCode, directAnthropic); errMidSystem != nil {
 		return cliproxyexecutor.Response{}, errMidSystem
 	}
+	// Serialize the final body betas as headers for count_tokens.
+	extraBetas, _ := extractAndRemoveBetasDoc(doc)
+	extraBetas = append(extraBetas, claudeTokenCountingBeta)
+	body = doc.Bytes()
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return cliproxyexecutor.Response{}, err

@@ -145,7 +145,11 @@ func TestInterruptExecutionSessionAfterTerminal(t *testing.T) {
 			sess.connCloser = newWebsocketConnectionCloser(client)
 			sess.configureConn(client)
 			readCh := sess.activate(client)
-			go exec.readUpstreamLoop(sess, client)
+			readDone := make(chan struct{})
+			go func() {
+				defer close(readDone)
+				exec.readUpstreamLoop(sess, client)
+			}()
 			read := func() codexWebsocketRead {
 				t.Helper()
 				select {
@@ -186,13 +190,23 @@ func TestInterruptExecutionSessionAfterTerminal(t *testing.T) {
 					t.Fatalf("earlier terminal %s = %v", id, errLate)
 				}
 			}
+			generation := exec.UpstreamGeneration(sessionID)
 			if errWrite := client.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "test disconnect")); errWrite != nil {
 				t.Fatal(errWrite)
 			}
 			select {
-			case <-sess.upstreamDisconnectCh:
+			case <-readDone:
 			case <-time.After(3 * time.Second):
-				t.Fatal("real disconnect was not reported")
+				t.Fatal("upstream read loop stayed active after disconnect")
+			}
+			// Recoverable disconnects advance the generation for transcript replay.
+			if got := exec.UpstreamGeneration(sessionID); got != generation+1 {
+				t.Fatalf("generation after disconnect = %d, want %d", got, generation+1)
+			}
+			select {
+			case event := <-sess.upstreamDisconnectCh:
+				t.Fatalf("recoverable disconnect requested downstream termination: %v", event)
+			default:
 			}
 			if errDisconnected := exec.InterruptExecutionSession(context.Background(), sessionID, []byte(`{"type":"response.interrupt","response_id":"r2"}`)); !errors.Is(errDisconnected, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) {
 				t.Fatalf("disconnected interrupt = %v, want ErrNoActiveUpstreamWebsocket", errDisconnected)

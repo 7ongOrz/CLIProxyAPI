@@ -890,19 +890,6 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2ToolsDoc(c *gin.Cont
 	return changed
 }
 
-func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2Tools(c *gin.Context, payload []byte) []byte {
-	if len(payload) == 0 {
-		doc := ojson.NewDoc(nil)
-		h.prepareCodexMultiAgentV2ToolsDoc(c, doc)
-		return payload
-	}
-	doc := ojson.NewDoc(payload)
-	if !h.prepareCodexMultiAgentV2ToolsDoc(c, doc) {
-		return payload
-	}
-	return doc.Bytes()
-}
-
 func (h *OpenAIResponsesAPIHandler) prepareCodexOrphanDelegationDoc(c *gin.Context, doc *ojson.Doc) bool {
 	if h == nil || doc == nil {
 		return false
@@ -919,17 +906,6 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexOrphanDelegationDoc(c *gin.Conte
 	}
 	requestCtx = context.WithValue(requestCtx, "gin", c)
 	return multiagentv2.RewriteCodexOrphanDelegationInputDoc(doc, requestCtx, requestHeaders, true)
-}
-
-func (h *OpenAIResponsesAPIHandler) prepareCodexOrphanDelegation(c *gin.Context, payload []byte) []byte {
-	if len(payload) == 0 {
-		return payload
-	}
-	doc := ojson.NewDoc(payload)
-	if !h.prepareCodexOrphanDelegationDoc(c, doc) {
-		return payload
-	}
-	return doc.Bytes()
 }
 
 func (h *OpenAIResponsesAPIHandler) prepareCodexRequestPayload(c *gin.Context, payload []byte) []byte {
@@ -1261,17 +1237,18 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 }
 
-// isCodexResponsesClientRequest limits the alternate terminal event to official Codex clients.
+// isCodexResponsesClientRequest identifies clients that support Codex Responses extensions.
 func isCodexResponsesClientRequest(c *gin.Context) bool {
 	if c == nil || c.Request == nil {
 		return false
 	}
-	if multiagentv2.IsCodexClientUserAgent(c.GetHeader("User-Agent")) {
+	userAgent := strings.TrimSpace(c.GetHeader("User-Agent"))
+	if multiagentv2.IsCodexClientUserAgent(userAgent) || strings.HasPrefix(userAgent, "codex_vscode/") {
 		return true
 	}
 
 	switch originator := strings.ToLower(strings.TrimSpace(c.GetHeader("Originator"))); originator {
-	case "codex desktop", "codex-tui", "codex_cli_rs":
+	case "codex desktop", "codex-tui", "codex_cli_rs", "codex_vscode":
 		return true
 	default:
 		return strings.HasPrefix(originator, "codex desktop/") || strings.HasPrefix(originator, "codex-tui/") || strings.HasPrefix(originator, "codex_cli_rs/")

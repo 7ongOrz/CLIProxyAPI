@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -268,13 +269,6 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if replayAccumulator != nil {
-				replayAccumulator.ObserveSSELine(line)
-			}
-
-			// Capture accounting before the client-facing filter renames usage.
-			streamUsage.ObserveAntigravityStream(line)
-
 			payload := helps.JSONPayload(line)
 			if len(pendingJSON) > 0 {
 				trimmedLine := bytes.TrimSpace(line)
@@ -285,10 +279,12 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 					pendingJSON = append(pendingJSON, '\n')
 					pendingJSON = append(pendingJSON, trimmedLine...)
 				}
-				if !ojson.ValidBytes(pendingJSON) {
+				var compact bytes.Buffer
+				if errCompact := json.Compact(&compact, pendingJSON); errCompact != nil {
 					continue
 				}
-				payload = pendingJSON
+				line = append([]byte("data: "), compact.Bytes()...)
+				payload = helps.JSONPayload(line)
 				pendingJSON = nil
 			} else if payload != nil && !ojson.ValidBytes(payload) {
 				pendingJSON = append([]byte(nil), payload...)
@@ -297,7 +293,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 			if payload == nil {
 				continue
 			}
-			if errorResult := ojson.GetBytesNoCopy(payload, "error"); errorResult.Exists() {
+			// Process complete events for replay, accounting, and translation.
+			if replayAccumulator != nil {
+				replayAccumulator.ObserveSSELine(line)
+			}
+			// Capture accounting before the client-facing filter renames usage.
+			streamUsage.ObserveAntigravityStream(line)
+			if errorResult := ojson.GetBytes(payload, "error"); errorResult.Exists() {
 				statusCode := int(errorResult.Get("code").Int())
 				if statusCode < http.StatusBadRequest || statusCode > 599 {
 					statusCode = http.StatusBadGateway

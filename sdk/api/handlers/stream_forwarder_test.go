@@ -23,12 +23,16 @@ func TestPendingStreamErrorReturnsBufferedError(t *testing.T) {
 	}
 }
 
-func TestValidateSSEDataJSONAllowsMultilinePayload(t *testing.T) {
+func TestSSEJSONValidationStateAllowsMultilinePayload(t *testing.T) {
 	chunk := []byte("event: response.completed\n" +
 		"data: {\"type\":\"response.completed\",\n" +
 		"data: \"response\":{\"status\":\"completed\"}}\n\n")
-	if err := validateSSEDataJSON(chunk); err != nil {
-		t.Fatalf("validateSSEDataJSON() error = %v, want nil", err)
+	state := &sseJSONValidationState{}
+	if _, errAdd := state.AddChunk(chunk); errAdd != nil {
+		t.Fatalf("AddChunk() error = %v, want nil", errAdd)
+	}
+	if errFinish := state.Finish(); errFinish != nil {
+		t.Fatalf("Finish() error = %v, want nil", errFinish)
 	}
 }
 

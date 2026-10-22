@@ -13,16 +13,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func shouldHandleResponsesWebsocketPrewarmLocally(rawJSON []byte, allowIncrementalInputWithPreviousResponseID bool) bool {
-	if allowIncrementalInputWithPreviousResponseID {
+func shouldHandleResponsesWebsocketPrewarmLocally(rawJSON []byte) bool {
+	if strings.TrimSpace(ojson.GetBytes(rawJSON, "type").String()) != wsRequestTypeCreate {
 		return false
 	}
-	var fieldsBuf [2]ojson.Result
-	fields := ojson.GetManyBytesNoCopy(fieldsBuf[:0], rawJSON, "type", "generate")
-	if strings.TrimSpace(fields[0].String()) != wsRequestTypeCreate {
-		return false
-	}
-	generateResult := fields[1]
+	generateResult := ojson.GetBytesNoCopy(rawJSON, "generate")
 	return generateResult.Exists() && !generateResult.Bool()
 }
 
@@ -62,14 +57,12 @@ func writeResponsesWebsocketSyntheticPrewarm(
 // A synthetic warm-up acknowledges input that never reached the upstream.
 // Materialize that input before compacted-history detection can mistake the
 // client's remaining delta for a complete replacement transcript.
-func normalizeResponsesWebsocketPrewarmFollowup(rawJSON, warmupRequest []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
-	var fieldsBuf [2]ojson.Result
-	fields := ojson.GetManyBytesNoCopy(fieldsBuf[:0], rawJSON, "type", "input")
-	requestType := strings.TrimSpace(fields[0].String())
+func normalizeResponsesWebsocketPrewarmFollowup(rawJSON, warmupRequest []byte, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+	requestType := strings.TrimSpace(ojson.GetBytes(rawJSON, "type").String())
 	if requestType != wsRequestTypeCreate && requestType != wsRequestTypeAppend {
 		return nil, warmupRequest, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("unsupported websocket request type: %s", requestType)}
 	}
-	input := fields[1]
+	input := ojson.GetBytesNoCopy(rawJSON, "input")
 	if !input.IsArray() {
 		return nil, warmupRequest, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("websocket request requires array field: input")}
 	}
@@ -82,8 +75,7 @@ func normalizeResponsesWebsocketPrewarmFollowup(rawJSON, warmupRequest []byte) (
 	if errSet := doc.SetRawBytes("input", merged); errSet != nil {
 		return nil, warmupRequest, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errSet}
 	}
-	normalized := doc.Bytes()
-	return normalized, normalized, nil
+	return normalizeResponseCreateRequest(doc.Bytes(), allowCompactionReplayBypass)
 }
 
 func syntheticResponsesWebsocketPrewarmPayloads(requestJSON []byte) ([][]byte, error) {
@@ -133,37 +125,18 @@ func inputContainsFullTranscript(input ojson.Result) bool {
 		return false
 	}
 	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
+		if isResponsesWebsocketCompactionReplayItemType(item.Get("type").String()) {
 			return true
 		}
 	}
 	return false
 }
 
-func inputWithoutCompactionItems(input ojson.Result) string {
-	if !input.IsArray() {
-		return normalizeJSONArrayRaw([]byte(input.Raw))
+func isResponsesWebsocketCompactionReplayItemType(t string) bool {
+	switch strings.TrimSpace(t) {
+	case "compaction", "compaction_summary", "context_compaction":
+		return true
+	default:
+		return false
 	}
-	filtered := make([]string, 0, len(input.Array()))
-	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
-			continue
-		}
-		filtered = append(filtered, item.Raw)
-	}
-	return "[" + strings.Join(filtered, ",") + "]"
-}
-
-func normalizeJSONArrayRaw(raw []byte) string {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
-		return "[]"
-	}
-	result := ojson.Parse(trimmed)
-	if result.Type == ojson.JSON && result.IsArray() {
-		return trimmed
-	}
-	return "[]"
 }

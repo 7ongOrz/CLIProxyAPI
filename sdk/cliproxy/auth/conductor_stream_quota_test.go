@@ -20,9 +20,18 @@ func (e streamQuotaError) IsCredentialScoped() bool { return e.credentialScoped 
 
 func TestExecuteStreamQuotaFailurePreservesCooldownAndScope(t *testing.T) {
 	withQuotaCooldownEnabled(t)
-	for _, credentialScoped := range []bool{true, false} {
+	for _, test := range []struct {
+		credentialScoped bool
+		resultError      bool
+	}{
+		{credentialScoped: true},
+		{},
+		{credentialScoped: true, resultError: true},
+		{resultError: true},
+	} {
+		credentialScoped := test.credentialScoped
 		for _, weighted := range []bool{false, true} {
-			name := fmt.Sprintf("credential_scope=%t/weighted=%t", credentialScoped, weighted)
+			name := fmt.Sprintf("credential_scope=%t/result_error=%t/weighted=%t", credentialScoped, test.resultError, weighted)
 			t.Run(name, func(t *testing.T) {
 				var selector Selector = &RoundRobinSelector{}
 				if weighted {
@@ -55,6 +64,7 @@ func TestExecuteStreamQuotaFailurePreservesCooldownAndScope(t *testing.T) {
 				if !credentialScoped {
 					quotaErr.msg = `{"error":{"type":"rate_limit_error","message":"Model rate limit exceeded"}}`
 				}
+				terminalPayload := `{"type":"response.failed","response":` + quotaErr.Error() + `}`
 				var attempts []string
 				manager.RegisterExecutor(&customStreamMockExecutor{
 					identifier: "codex",
@@ -62,7 +72,14 @@ func TestExecuteStreamQuotaFailurePreservesCooldownAndScope(t *testing.T) {
 						attempts = append(attempts, selected.ID)
 						chunks := make(chan cliproxyexecutor.StreamChunk, 2)
 						chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.created\"}\n\n")}
-						chunks <- cliproxyexecutor.StreamChunk{Err: quotaErr}
+						terminal := cliproxyexecutor.StreamChunk{Err: quotaErr}
+						if test.resultError {
+							terminal = cliproxyexecutor.StreamChunk{
+								Payload:   []byte(terminalPayload),
+								ResultErr: quotaErr,
+							}
+						}
+						chunks <- terminal
 						close(chunks)
 						return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 					},
@@ -74,8 +91,16 @@ func TestExecuteStreamQuotaFailurePreservesCooldownAndScope(t *testing.T) {
 				}
 				var payloads, failures int
 				for chunk := range result.Chunks {
+					if chunk.ResultErr != nil {
+						t.Fatal("result error must be consumed for accounting")
+					}
 					if len(chunk.Payload) != 0 {
 						payloads++
+						if test.resultError && payloads == 2 {
+							if string(chunk.Payload) != terminalPayload || chunk.ResultStatusCode != http.StatusTooManyRequests {
+								t.Fatalf("terminal chunk = %+v, want original payload with status 429", chunk)
+							}
+						}
 					}
 					if chunk.Err != nil {
 						failures++
@@ -84,7 +109,11 @@ func TestExecuteStreamQuotaFailurePreservesCooldownAndScope(t *testing.T) {
 						}
 					}
 				}
-				if payloads != 1 || failures != 1 || len(attempts) != 1 || attempts[0] != highID {
+				wantPayloads, wantFailures := 1, 1
+				if test.resultError {
+					wantPayloads, wantFailures = 2, 0
+				}
+				if payloads != wantPayloads || failures != wantFailures || len(attempts) != 1 || attempts[0] != highID {
 					t.Fatalf("started stream must retain its payload and error without replay: payloads=%d failures=%d attempts=%v", payloads, failures, attempts)
 				}
 				high, _ := manager.GetByID(highID)

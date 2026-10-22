@@ -36,7 +36,7 @@ func TestPrepareCodexMultiAgentV2ToolsAtResponsesBoundary(t *testing.T) {
             {"type":"function","name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}
         ]}]
     }`)
-	got := handler.prepareCodexMultiAgentV2Tools(ginContext, payload)
+	got := handler.prepareCodexRequestPayload(ginContext, payload)
 
 	if namespace := ojson.GetBytesNoCopy(got, "tools.0.name").String(); namespace != "collaboration" {
 		t.Fatalf("namespace = %q, want collaboration", namespace)
@@ -144,7 +144,7 @@ func newResponsesMultiAgentTestHandler(t *testing.T, executor *responsesMultiAge
 	return NewOpenAIResponsesAPIHandler(base), modelID
 }
 
-func TestResponsesWebsocketPreparesCodexMultiAgentV2Tools(t *testing.T) {
+func TestResponsesWebsocketPreparesCodexRequestAndReplay(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &websocketDirectCaptureExecutor{provider: "codex"}
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -173,7 +173,7 @@ func TestResponsesWebsocketPreparesCodexMultiAgentV2Tools(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	request := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","description":"Spawns an agent.","parameters":{"properties":{"message":{"encrypted":true}}}}]}]}`, modelID)
+	request := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"function_call_output","output":"page context"},{"type":"custom_tool_call_output","name":"custom_ctx","output":"custom context"}],"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","description":"Spawns an agent.","parameters":{"properties":{"message":{"encrypted":true}}}}]}]}`, modelID)
 	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(request)); errWrite != nil {
 		t.Fatalf("write websocket request: %v", errWrite)
 	}
@@ -192,6 +192,35 @@ func TestResponsesWebsocketPreparesCodexMultiAgentV2Tools(t *testing.T) {
 	if namespace := ojson.GetBytesNoCopy(captured, "tools.0.name").String(); namespace != "collaboration" {
 		t.Fatalf("namespace = %q, want collaboration", namespace)
 	}
+
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.append","input":[{"type":"message","role":"user","content":"continue"}]}`)); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if _, _, errRead := conn.ReadMessage(); errRead != nil {
+		t.Fatal(errRead)
+	}
+	payloads = executor.Payloads()
+	if len(payloads) != 2 {
+		t.Fatalf("captured %d requests, want initial request and replay", len(payloads))
+	}
+	for index, body := range payloads {
+		input := ojson.GetBytesNoCopy(body, "input").Array()
+		wantItems := 2
+		if index == 1 {
+			wantItems = 4
+		}
+		if len(input) != wantItems {
+			t.Fatalf("request %d input = %s, want context followed by current input", index, body)
+		}
+		for item, want := range []string{"Tool output from tool:\npage context", "Tool output from custom_ctx:\ncustom context"} {
+			if input[item].Get("type").String() != "message" || input[item].Get("content.0.text").String() != want {
+				t.Fatalf("request %d context item = %s, want %q", index, input[item].Raw, want)
+			}
+		}
+		if index == 1 && (input[2].Get("id").String() != "out-1" || input[3].Get("content").String() != "continue") {
+			t.Fatalf("replay input = %s, want prior response followed by current user message", body)
+		}
+	}
 }
 
 func TestPrepareCodexMultiAgentV2ToolsAtResponsesBoundarySkipsOtherClients(t *testing.T) {
@@ -205,7 +234,7 @@ func TestPrepareCodexMultiAgentV2ToolsAtResponsesBoundarySkipsOtherClients(t *te
 	ginContext.Request = request
 
 	payload := []byte(`{"tools":[{"type":"function","name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}]}`)
-	got := handler.prepareCodexMultiAgentV2Tools(ginContext, payload)
+	got := handler.prepareCodexRequestPayload(ginContext, payload)
 
 	if string(got) != string(payload) {
 		t.Fatalf("other client payload changed: %s", got)
@@ -228,8 +257,7 @@ func TestClientMultiAgentPreparationDoesNotWaitForOAuthCredential(t *testing.T) 
 	ginContext, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ginContext.Request = request
 	payload := []byte(`{"input":[{"type":"function_call_output","name":"create_thread","namespace":"codex_app","output":"<codex_delegation>task</codex_delegation>"}],"tools":[{"type":"function","name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}]}`)
-	got := handler.prepareCodexMultiAgentV2Tools(ginContext, payload)
-	got = handler.prepareCodexOrphanDelegation(ginContext, got)
+	got := handler.prepareCodexRequestPayload(ginContext, payload)
 	if ojson.GetBytesNoCopy(got, "tools.0.parameters.properties.message.encrypted").Exists() {
 		t.Fatalf("client preparation did not remove encryption: %s", got)
 	}
@@ -331,7 +359,7 @@ func TestResponsesOrphanCodexDelegationCompatibility(t *testing.T) {
 	}
 }
 
-func TestResponsesSanitizesOrphanToolOutputsThroughHTTPAndCompact(t *testing.T) {
+func TestResponsesSanitizesOrphanToolOutputsAtRequestBoundaries(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	const modelID = "test-responses-orphan-tool-output-model"
@@ -359,6 +387,9 @@ func TestResponsesSanitizesOrphanToolOutputsThroughHTTPAndCompact(t *testing.T) 
 	router := gin.New()
 	router.POST("/v1/responses", responsesHandler.Responses)
 	router.POST("/v1/responses/compact", responsesHandler.Compact)
+	router.GET("/v1/responses/ws", responsesHandler.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	defer server.Close()
 
 	payload := fmt.Sprintf(`{
 		"model": %q,
@@ -376,12 +407,28 @@ func TestResponsesSanitizesOrphanToolOutputsThroughHTTPAndCompact(t *testing.T) 
 		]
 	}`, modelID)
 
-	for idx, path := range []string{"/v1/responses", "/v1/responses/compact"} {
-		req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(payload))
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("%s status = %d, want 200; body=%s", path, rec.Code, rec.Body.String())
+	for idx, path := range []string{"/v1/responses", "/v1/responses/compact", "/v1/responses/ws"} {
+		if path == "/v1/responses/ws" {
+			conn, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+path, nil)
+			if errDial != nil {
+				t.Fatal(errDial)
+			}
+			defer func() { _ = conn.Close() }()
+			doc := ojson.NewDocString(payload)
+			_ = doc.Set("type", "response.create")
+			if errWrite := conn.WriteMessage(websocket.TextMessage, doc.Bytes()); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			if _, response, errRead := conn.ReadMessage(); errRead != nil || ojson.GetBytes(response, "type").String() != "response.completed" {
+				t.Fatalf("websocket response = %s, error = %v; want response.completed", response, errRead)
+			}
+		} else {
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(payload))
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s status = %d, want 200; body=%s", path, rec.Code, rec.Body.String())
+			}
 		}
 		payloads := executor.Payloads()
 		if len(payloads) != idx+1 {

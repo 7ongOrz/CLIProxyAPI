@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1218,8 +1219,8 @@ func TestCodexExecutor_IsCompatCompactionValidationAndUsage_Issue7406(t *testing
 	}
 	wsCtx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 	_, errWSInc := wsExecutor.ExecuteStream(wsCtx, auth, cliproxyexecutor.Request{Model: "deepseek-v4.1-flash", Payload: incTrigger}, opts)
-	if !cliproxyexecutor.IsUpstreamWebsocketTurnError(errWSInc) {
-		t.Fatalf("expected UpstreamWebsocketTurnError on websocket incremental trigger, got %v", errWSInc)
+	if !cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errWSInc) {
+		t.Fatalf("expected replay-required error on websocket incremental trigger, got %v", errWSInc)
 	}
 
 	// 2. Empty conversation input (only compaction_trigger + additional_tools) must fail closed.
@@ -1233,8 +1234,8 @@ func TestCodexExecutor_IsCompatCompactionValidationAndUsage_Issue7406(t *testing
 	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "deepseek-v4.1-flash", Payload: synthCont}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: synthCont}); err == nil {
 		t.Fatal("expected synthetic previous_response_id on HTTP Execute to fail")
 	}
-	if _, err := wsExecutor.ExecuteStream(wsCtx, auth, cliproxyexecutor.Request{Model: "deepseek-v4.1-flash", Payload: synthCont}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: synthCont}); !cliproxyexecutor.IsUpstreamWebsocketTurnError(err) {
-		t.Fatalf("expected UpstreamWebsocketTurnError for synthetic previous_response_id on WS, got %v", err)
+	if _, err := wsExecutor.ExecuteStream(wsCtx, auth, cliproxyexecutor.Request{Model: "deepseek-v4.1-flash", Payload: synthCont}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: synthCont}); !cliproxyexecutor.IsUpstreamWebsocketReplayRequired(err) {
+		t.Fatalf("expected replay-required error for synthetic previous_response_id on WS, got %v", err)
 	}
 	if upstreamHits != 0 {
 		t.Fatalf("upstreamHits = %d, want 0 for rejected validation cases", upstreamHits)
@@ -1736,20 +1737,18 @@ func TestCodexExecutor_IsCompatCompactionDuplexEOFCancelsHTTP_Issue7406(t *testi
 		t.Fatal("upstream WS EOF did not cancel in-flight duplex HTTP compaction")
 	}
 
-	var gotTurnErr *cliproxyexecutor.UpstreamWebsocketTurnError
+	var connectionErr *codexDuplexConnectionError
 	for chunk := range streamRes.Chunks {
 		if chunk.Err != nil {
-			if uErr, ok := chunk.Err.(*cliproxyexecutor.UpstreamWebsocketTurnError); ok {
-				gotTurnErr = uErr
+			if !errors.As(chunk.Err, &connectionErr) {
+				t.Fatalf("expected request-scoped connection error, got %v", chunk.Err)
 			}
 		}
 	}
-	if gotTurnErr == nil {
-		t.Fatal("expected UpstreamWebsocketTurnError on duplex WS EOF during compaction")
+	if connectionErr == nil {
+		t.Fatal("expected connection failure on duplex WS EOF during compaction")
 	}
-	if len(gotTurnErr.Abandoned) != 1 || gotTurnErr.Abandoned[0].EventID != "ev_compact_eof" || !gotTurnErr.Abandoned[0].NotSent {
-		t.Fatalf("expected correlated NotSent abandoned error for ev_compact_eof, got idle=%t abandoned=%+v", gotTurnErr.Idle, gotTurnErr.Abandoned)
-	}
+
 }
 
 func TestCodexExecutor_IsCompatCompactionDuplexDeliveryOrder_Issue7406(t *testing.T) {

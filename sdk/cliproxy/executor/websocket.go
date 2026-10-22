@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"sync/atomic"
 )
 
 // UpstreamWebsocketReplayRequiredError indicates that an incremental request
@@ -86,54 +85,14 @@ func InheritedWebsocketInstructions(ctx context.Context) string {
 	return raw
 }
 
-type websocketInputLossState struct {
-	epoch        *atomic.Uint64
-	messageEpoch uint64
+type rebuiltWebsocketContinuationKey struct{}
+
+// WithRebuiltWebsocketContinuation records that the handler reconstructed an incremental frame.
+func WithRebuiltWebsocketContinuation(ctx context.Context, rebuilt bool) context.Context {
+	return context.WithValue(ctx, rebuiltWebsocketContinuationKey{}, rebuilt)
 }
 
-type websocketInputLossContextKey struct{}
-
-// WithWebsocketInputEpoch attaches the session's loss epoch counter and the current
-// message's read epoch so executors can advance the epoch on upstream loss and reject
-// messages that were read before an upstream loss.
-func WithWebsocketInputEpoch(ctx context.Context, epoch *atomic.Uint64, messageEpoch uint64) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, websocketInputLossContextKey{}, websocketInputLossState{
-		epoch:        epoch,
-		messageEpoch: messageEpoch,
-	})
-}
-
-// NotifyWebsocketInputLoss advances the session's loss epoch if present.
-func NotifyWebsocketInputLoss(ctx context.Context) {
-	if ctx == nil {
-		return
-	}
-	if state, ok := ctx.Value(websocketInputLossContextKey{}).(websocketInputLossState); ok && state.epoch != nil {
-		state.epoch.Add(1)
-	}
-}
-
-// WebsocketInputPredatesLoss reports whether the current turn's input was read before
-// an upstream websocket loss.
-func WebsocketInputPredatesLoss(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	state, ok := ctx.Value(websocketInputLossContextKey{}).(websocketInputLossState)
-	return ok && state.epoch != nil && state.messageEpoch < state.epoch.Load()
-}
-
-// WebsocketInputLossError returns the turn error for a downstream websocket
-// frame whose input epoch predates the latest upstream connection loss.
-func WebsocketInputLossError(ctx context.Context) error {
-	if !WebsocketInputPredatesLoss(ctx) {
-		return nil
-	}
-	if RequiredUpstreamWebsocket(ctx) {
-		return &UpstreamWebsocketTurnError{FullContextRequired: true}
-	}
-	return &UpstreamWebsocketTurnError{NotSent: true}
+func RebuiltWebsocketContinuation(ctx context.Context) bool {
+	rebuilt, _ := ctx.Value(rebuiltWebsocketContinuationKey{}).(bool)
+	return rebuilt
 }

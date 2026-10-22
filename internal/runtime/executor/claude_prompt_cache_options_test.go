@@ -1017,3 +1017,30 @@ func TestClaudeExecutor_CountTokensUpstream_OAuthRelocatesAffectedSystemPrompts(
 		})
 	}
 }
+
+func TestClaudeExecutor_CountTokens_PayloadConditionsSeeCleanedBody(t *testing.T) {
+	cfg := &config.Config{Payload: config.PayloadConfig{
+		Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{
+				Name:  "*",
+				Match: []map[string]any{{"prompt_cache_options.mode": "explicit"}},
+			}},
+			Params: map[string]any{"messages": []any{}},
+		}},
+	}}
+	executor := NewClaudeExecutor(cfg)
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "test-key",
+		"base_url": "https://gateway.example",
+	}}
+	resp, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-5",
+		Payload: []byte(`{"model":"claude-opus-5","prompt_cache_options":{"mode":"explicit"},"messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("CountTokens() error = %v; payload conditions must observe completed option cleanup", err)
+	}
+	if got := ojson.GetBytes(resp.Payload, "input_tokens").Int(); got <= 0 {
+		t.Fatalf("input_tokens = %d, want a positive count", got)
+	}
+}

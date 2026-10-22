@@ -7,12 +7,11 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/MoeForge/moego/ojson"
 	applypatch "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/apply-patch"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	log "github.com/sirupsen/logrus"
 )
 
 type claudeToResponsesState struct {
@@ -537,19 +536,13 @@ func validateApplyPatchSnapshots(previous, current string) error {
 	return errFinishArguments
 }
 
-// finishClaudeApplyPatchArguments treats complete streamed JSON as a complete
-// snapshot, not a prefix that a later snapshot may silently extend. A partial
-// source can still be completed by a consistent full snapshot.
+// finishClaudeApplyPatchArguments selects the final snapshot for the shared decoder
+// to reconcile with the streamed input.
 func finishClaudeApplyPatchArguments(call *translatorcommon.ApplyPatchCallState, arguments, snapshot string) (string, string, error) {
-	if snapshot == "" {
-		return call.FinishArguments(arguments)
+	if snapshot != "" {
+		arguments = snapshot
 	}
-	if ojson.Valid(arguments) {
-		if _, _, errFinishArguments := call.FinishArguments(arguments); errFinishArguments != nil {
-			return "", "", errFinishArguments
-		}
-	}
-	return call.FinishArguments(snapshot)
+	return call.FinishArguments(arguments)
 }
 
 func (st *claudeToResponsesState) failToolInput(err error, nextSeq func() int) [][]byte {

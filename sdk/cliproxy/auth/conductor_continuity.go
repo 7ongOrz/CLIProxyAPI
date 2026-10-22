@@ -436,7 +436,7 @@ func isPositiveQuotaRejectionError(err error) bool {
 		return false
 	}
 	if isRequestInvalidError(err) || isRequestStopError(err) || isRequestTerminatedError(err) || isCredentialTerminatedError(err) ||
-		isStreamTruncatedError(err) || cliproxyexecutor.IsUpstreamWebsocketTurnError(err) ||
+		isStreamTruncatedError(err) ||
 		IsTerminalAuthError(err) {
 		return false
 	}

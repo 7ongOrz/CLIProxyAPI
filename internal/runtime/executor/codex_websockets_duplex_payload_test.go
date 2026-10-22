@@ -324,13 +324,9 @@ func TestCodexDuplexPayloadDefaultInstructionsAcrossTurns(t *testing.T) {
 }
 
 func TestCodexDuplexPayloadInstructionFallback(t *testing.T) {
-	for _, route := range []string{"standard", "lite", "siwc"} {
+	for _, route := range []string{"standard", "siwc"} {
 		for _, scenario := range []string{"missing", "explicit_empty", "explicit_null", "explicit_whitespace", "clear_with_default", "default", "default_raw", "override_once"} {
 			t.Run(route+"/"+scenario, func(t *testing.T) {
-				headers := make(http.Header)
-				if route == "lite" {
-					headers.Set(codexResponsesLiteHeader, "true")
-				}
 				rules := config.PayloadConfig{}
 				middle := ojson.NewDocString(`{"type":"response.create","previous_response_id":"$previous","input":[]}`)
 				wantFirst := `"hero"`
@@ -382,7 +378,7 @@ func TestCodexDuplexPayloadInstructionFallback(t *testing.T) {
 					middle.String(),
 					`{"type":"response.append","input":[]}`,
 					`{"type":"response.append","input":[]}`,
-				}, false, route == "siwc", headers)
+				}, false, route == "siwc")
 				for turn, want := range []string{wantFirst, wantMiddle, wantAppend, wantAppend} {
 					if got := ojson.GetBytes(bodies[turn], "instructions").Raw; got != want {
 						t.Errorf("turn %d: instructions=%s, want %s; body=%s", turn, got, want, bodies[turn])
@@ -390,6 +386,35 @@ func TestCodexDuplexPayloadInstructionFallback(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestCodexDuplexPayloadResponsesLiteInstructions(t *testing.T) {
+	for _, configured := range []bool{false, true} {
+		t.Run(fmt.Sprintf("payload_override=%t", configured), func(t *testing.T) {
+			rules := config.PayloadConfig{}
+			want := ""
+			if configured {
+				rules.Override = []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "*"}}, Params: map[string]any{"instructions": "configured"}}}
+				want = `"configured"`
+			}
+			headers := make(http.Header)
+			headers.Set(codexResponsesLiteHeader, "true")
+			// Lite carries instructions in input; user payload rules run after cleanup.
+			bodies := runCodexDuplexPayloadTurns(t, rules, []string{
+				`{"instructions":"initial","input":[{"role":"developer","content":"native instructions"}]}`,
+				`{"type":"response.append","instructions":"updated","input":[]}`,
+				`{"type":"response.append","input":[]}`,
+			}, false, false, headers)
+			for turn, body := range bodies {
+				if got := ojson.GetBytes(body, "instructions").Raw; got != want {
+					t.Errorf("turn %d: instructions=%s, want %s", turn, got, want)
+				}
+			}
+			if got := ojson.GetBytes(bodies[0], "input.0.content").String(); got != "native instructions" {
+				t.Errorf("Lite developer message = %q, want native instructions", got)
+			}
+		})
 	}
 }
 
@@ -455,9 +480,9 @@ func TestCodexWebsocketUnconfiguredInstructionsSnapshot(t *testing.T) {
 		from       sdktranslator.Format
 		body, want string
 	}{
-		{"native", sdktranslator.FormatCodex, `{"instructions":"hero","input":[]}`, `"hero"`},
-		{"native_absent", sdktranslator.FormatCodex, `{"input":[]}`, ""},
-		{"native_null", sdktranslator.FormatCodex, `{"instructions":null,"input":[]}`, `null`},
+		{"responses_lite", sdktranslator.FormatCodex, `{"instructions":"hero","input":[]}`, ""},
+		{"responses_lite_absent", sdktranslator.FormatCodex, `{"input":[]}`, ""},
+		{"responses_lite_null", sdktranslator.FormatCodex, `{"instructions":null,"input":[]}`, ""},
 		{"responses_absent", sdktranslator.FormatOpenAIResponse, `{"input":[]}`, ""},
 		{"responses_empty", sdktranslator.FormatOpenAIResponse, `{"instructions":"","input":[]}`, `""`},
 		{"responses_null", sdktranslator.FormatOpenAIResponse, `{"instructions":null,"input":[]}`, `""`},
@@ -470,7 +495,7 @@ func TestCodexWebsocketUnconfiguredInstructionsSnapshot(t *testing.T) {
 			if tc.from == sdktranslator.FormatCodex {
 				headers.Set(codexResponsesLiteHeader, "true")
 			}
-			prepared, errPrepare := exec.prepareCodexWebsocketStream(t.Context(), &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test", "base_url": "https://example.invalid"}}, req, core.Options{SourceFormat: tc.from, Headers: headers})
+			prepared, errPrepare := exec.prepareCodexWebsocketStream(t.Context(), &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test", "base_url": "https://example.invalid"}}, req, core.Options{SourceFormat: tc.from, Headers: headers}, newEphemeralCodexWebsocketSession())
 			if errPrepare != nil {
 				t.Fatal(errPrepare)
 			}

@@ -138,14 +138,15 @@ func TestResponsesSteeringFullDuplexIntegration(t *testing.T) {
 			for {
 				_, b, err := c.ReadMessage()
 				if err != nil {
+					// The fork closes transport failures so the client reconnects with its transcript.
+					if strings.HasPrefix(scenario, "disconnect_") && websocket.IsCloseError(err, websocket.CloseAbnormalClosure) {
+						break
+					}
 					t.Fatalf("downstream read before expected terminal event: %v", err)
 				}
 				kind := ojson.GetBytesNoCopy(b, "type").String()
 				if kind == "error" {
-					if !strings.HasPrefix(scenario, "disconnect_") || ojson.GetBytesNoCopy(b, "error.code").String() != "upstream_websocket_lost" {
-						t.Fatalf("unexpected downstream error: %s", b)
-					}
-					break
+					t.Fatalf("unexpected downstream error: %s", b)
 				}
 				if kind == "response.created" && ojson.GetBytesNoCopy(b, "response.id").String() == "r1" {
 					send(control1)
@@ -186,7 +187,7 @@ func TestResponsesSteeringFullDuplexIntegration(t *testing.T) {
 			if connections.Load() != 1 {
 				t.Fatalf("unexpected reconnect/replay: %d", connections.Load())
 			}
-			// An upstream disconnect can leave the downstream ready for another turn.
+			// End successful scenarios too, then verify connection-scoped logging cleanup.
 			_ = c.Close()
 			select {
 			case n := <-deferredCount:
@@ -276,7 +277,7 @@ func TestResponsesWebsocketIsCompatLocalCompactionIntegration_Issue7406(t *testi
 			downstream := httptest.NewServer(router)
 			defer downstream.Close()
 
-			conn, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", nil)
+			conn, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", http.Header{"Session-Id": {t.Name()}})
 			if errDial != nil {
 				t.Fatal(errDial)
 			}
@@ -306,7 +307,14 @@ func TestResponsesWebsocketIsCompatLocalCompactionIntegration_Issue7406(t *testi
 			}
 
 			// Turn 1: First turn is local compaction_trigger; socket must stay open even when steering=true.
-			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"PRE_COMPACT_RAW_TEXT"}]},{"type":"compaction_trigger"}]}`, modelID))); errWrite != nil {
+			compactRequest := fmt.Sprintf(`{"type":"response.create","model":%q,
+				"input":[
+					{"type":"message","role":"user","content":[{"type":"input_text","text":"PRE_COMPACT_RAW_TEXT"}]},
+					{"type":"function_call","id":"fc_before_compact","call_id":"call_before_compact","name":"shell","arguments":"{\"command\":\"PRE_COMPACT_TOOL_ARGUMENTS\"}"},
+					{"type":"function_call_output","call_id":"call_before_compact","output":"PRE_COMPACT_TOOL_RESULT"},
+					{"type":"compaction_trigger"}
+				]}`, modelID)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(compactRequest)); errWrite != nil {
 				t.Fatal(errWrite)
 			}
 			compactedEv := readUntil("response.completed")
@@ -314,7 +322,10 @@ func TestResponsesWebsocketIsCompatLocalCompactionIntegration_Issue7406(t *testi
 			if !strings.HasPrefix(synthID, "resp_ag_compact_") {
 				t.Fatalf("expected synthetic compaction response ID, got %q (%s)", synthID, compactedEv.Raw)
 			}
-			<-httpReceived
+			summaryRequest := <-httpReceived
+			if !bytes.Contains(summaryRequest, []byte("PRE_COMPACT_TOOL_ARGUMENTS")) {
+				t.Fatalf("summary request lost the pre-compaction tool history: %s", summaryRequest)
+			}
 
 			// Turn 2a: Bogus synthetic previous_response_id is rejected locally without hitting upstream.
 			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"resp_ag_compact_wrong","input":[{"type":"message","role":"user","content":"next"}]}`, modelID))); errWrite != nil {
@@ -325,8 +336,13 @@ func TestResponsesWebsocketIsCompatLocalCompactionIntegration_Issue7406(t *testi
 				t.Fatalf("expected previous_response_not_found for wrong synthetic ID, got %s", bogusErr.Raw)
 			}
 
-			// Turn 2b: Valid synthetic previous_response_id starts a fresh root WS turn with expanded summary and NO pre-compaction raw text or synthetic ID.
-			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","previous_response_id":%q,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Post-compaction question"}]}]}`, synthID))); errWrite != nil {
+			// Turn 2b: A valid summary parent starts a fresh WS root. Late results from the compacted history stay outside this new transcript.
+			nextRequest := fmt.Sprintf(`{"type":"response.create","previous_response_id":%q,
+				"input":[
+					{"type":"message","role":"user","content":[{"type":"input_text","text":"Post-compaction question"}]},
+					{"type":"function_call_output","call_id":"call_before_compact","output":"Late pre-compaction result"}
+				]}`, synthID)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(nextRequest)); errWrite != nil {
 				t.Fatal(errWrite)
 			}
 			turn2Done := readUntil("response.completed")
@@ -336,6 +352,9 @@ func TestResponsesWebsocketIsCompatLocalCompactionIntegration_Issue7406(t *testi
 			wsRoot := <-wsReceived
 			if ojson.GetBytes(wsRoot, "previous_response_id").Exists() {
 				t.Fatalf("synthetic previous_response_id leaked to upstream WS: %s", wsRoot)
+			}
+			if bytes.Contains(wsRoot, []byte("call_before_compact")) {
+				t.Fatalf("pre-compaction tool item survived the compact boundary: %s", wsRoot)
 			}
 			if bytes.Contains(wsRoot, []byte("PRE_COMPACT_RAW_TEXT")) {
 				t.Fatalf("pre-compaction history leaked alongside summary capsule: %s", wsRoot)

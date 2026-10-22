@@ -16,14 +16,13 @@ import (
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/MoeForge/moego/regexp"
-	log "github.com/sirupsen/logrus"
-
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	log "github.com/sirupsen/logrus"
 )
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
@@ -1244,7 +1243,12 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 
 // IsAuthAvailableForModel reports whether auth is eligible for selection on model at now.
 func IsAuthAvailableForModel(auth *Auth, model string, now time.Time) bool {
-	blocked, _, _ := isAuthBlockedForModel(auth, model, now)
+	return IsAuthAvailableForModelForRequest(nil, auth, model, now)
+}
+
+// IsAuthAvailableForModelForRequest checks availability using the request's credential track.
+func IsAuthAvailableForModelForRequest(ctx context.Context, auth *Auth, model string, now time.Time, clientHeaders ...http.Header) bool {
+	blocked, _, _ := isAuthBlockedForModelForRequest(ctx, auth, model, now, clientHeaders...)
 	return !blocked
 }
 

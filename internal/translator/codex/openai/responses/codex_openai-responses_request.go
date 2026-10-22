@@ -125,34 +125,6 @@ func setCodexRequiredBoolDoc(rawJSON []byte, ensureDoc func() *ojson.Doc, path s
 	_ = ensureDoc().Set(path, value)
 }
 
-func setCodexRequiredIncludeDoc(rawJSON []byte, ensureDoc func() *ojson.Doc) {
-	current := ojson.GetBytesNoCopy(rawJSON, "include")
-	includeSources := false
-	if current.IsArray() {
-		values := current.Array()
-		for _, value := range values {
-			if value.Type == ojson.String && value.String() == "web_search_call.action.sources" {
-				includeSources = true
-				break
-			}
-		}
-		if !includeSources && len(values) == 1 && values[0].Type == ojson.String && values[0].String() == "reasoning.encrypted_content" {
-			return
-		}
-		if includeSources && len(values) == 2 &&
-			values[0].Type == ojson.String && values[0].String() == "reasoning.encrypted_content" &&
-			values[1].Type == ojson.String && values[1].String() == "web_search_call.action.sources" {
-			return
-		}
-	}
-
-	encoded := []byte(`["reasoning.encrypted_content"]`)
-	if includeSources {
-		encoded = []byte(`["reasoning.encrypted_content","web_search_call.action.sources"]`)
-	}
-	_ = ensureDoc().SetRawBytes("include", encoded)
-}
-
 func deleteCodexRequestFieldsDoc(rawJSON []byte, ensureDoc func() *ojson.Doc, paths ...string) {
 	for _, path := range paths {
 		if !ojson.GetBytesNoCopy(rawJSON, path).Exists() {

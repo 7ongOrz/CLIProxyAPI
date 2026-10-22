@@ -26,7 +26,7 @@ func TestResponsesSteerRejectedWhenDisabled(t *testing.T) {
 	raw := []byte(`{"type":"response.steer","previous_response_id":"resp-1","input":"Keep the scope small."}`)
 	lastRequest := []byte(`{"model":"gpt-6-astra","stream":true,"input":[]}`)
 
-	_, _, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, []byte("[]"))
+	_, _, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, []byte("[]"), true)
 	if errMsg == nil {
 		t.Fatal("expected response.steer to be rejected when steering is disabled")
 	}

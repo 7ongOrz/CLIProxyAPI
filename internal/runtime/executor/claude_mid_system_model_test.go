@@ -173,20 +173,28 @@ func sendMidSystemCountTokens(t *testing.T, ex *ClaudeExecutor, ctx context.Cont
 
 // Read-only validation rejects an incompatible final model/messages pairing.
 func TestClaudeExecutor_PayloadOverrideCannotSmuggleLegacyMidSystemMessage(t *testing.T) {
-	upstream := &midSystemUpstream{}
-	cfg := midSystemConfig()
-	cfg.Payload.Override = []config.PayloadRule{{
-		Models: []config.PayloadModelRule{{Name: "*"}},
-		Params: map[string]any{"model": "claude-haiku-4-5-20251001"},
-	}}
-	ex := NewClaudeExecutor(cfg)
+	for _, path := range []struct {
+		name string
+		send func(*testing.T, *ClaudeExecutor, context.Context, string) error
+	}{
+		{name: "execute", send: sendMidSystemExecute},
+		{name: "stream", send: sendMidSystemStream},
+		{name: "count tokens", send: sendMidSystemCountTokens},
+	} {
+		t.Run(path.name, func(t *testing.T) {
+			upstream := &midSystemUpstream{}
+			cfg := midSystemConfig()
+			cfg.Payload.Override = []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{Name: "*"}},
+				Params: map[string]any{"model": "claude-haiku-4-5-20251001"},
+			}}
+			ex := NewClaudeExecutor(cfg)
 
-	// The caller addresses a model that accepts the turn; only the payload rule
-	// selects the otherwise incompatible pairing.
-	_, err := ex.Execute(upstream.context(t, nil), midSystemAuth(), cliproxyexecutor.Request{
-		Model: "claude-sonnet-5", Payload: midSystemLegacyPayload("claude-sonnet-5"),
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
-	assertMidSystemRejected(t, err, upstream)
+			// The payload rule selects the legacy model for a caller-owned system turn.
+			err := path.send(t, ex, upstream.context(t, nil), "claude-sonnet-5")
+			assertMidSystemRejected(t, err, upstream)
+		})
+	}
 }
 
 // A caller may already have the exact role=system turn that cloaking would
@@ -482,6 +490,7 @@ func TestClaudeExecutorPayloadRepairsLegacyMidSystemMessage(t *testing.T) {
 	}{
 		{name: "execute", send: sendMidSystemExecute},
 		{name: "stream", send: sendMidSystemStream},
+		{name: "count tokens", send: sendMidSystemCountTokens},
 	} {
 		for _, repair := range []struct {
 			name       string

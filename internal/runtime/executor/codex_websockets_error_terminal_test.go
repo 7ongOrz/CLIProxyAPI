@@ -20,6 +20,22 @@ import (
 // for other responses' failures, and must let the next response.created
 // reopen it.
 func TestInterruptExecutionSessionErrorTerminalShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{"typed", `{"type":"error","response_id":"r1","error":{"message":"boom"}}`},
+		{"untyped_response_id", `{"response_id":"r1","error":{"message":"boom"}}`},
+		{"untyped_idless", `{"error":{"message":"boom"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testInterruptExecutionSessionErrorTerminalShape(t, tc.payload)
+		})
+	}
+}
+
+func testInterruptExecutionSessionErrorTerminalShape(t *testing.T, terminalPayload string) {
+	t.Helper()
 	received := make(chan string, 8)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
@@ -58,11 +74,12 @@ func TestInterruptExecutionSessionErrorTerminalShapes(t *testing.T) {
 		if !readFrame() {
 			return
 		}
-		// r1 ends with a top-level response_id error. The rejected checks
-		// write nothing upstream, so after r2 is created the next frame
-		// read here must be the r2 interrupt; reading it before r2's
-		// id-less failure is sent keeps the checks deterministic.
-		if !write(`{"type":"error","response_id":"r1","error":{"message":"boom"}}`) {
+		// Wait for the post-error checks before opening the next response's
+		// interrupt window. The advance frame is a deterministic barrier.
+		if !write(terminalPayload) {
+			return
+		}
+		if !readFrame() {
 			return
 		}
 		if !write(`{"type":"response.created","response":{"id":"r2"}}`) {
@@ -133,6 +150,9 @@ func TestInterruptExecutionSessionErrorTerminalShapes(t *testing.T) {
 	read() // error r1
 	wantRejected(`{"type":"response.interrupt","response_id":"unknown"}`, "unknown interrupt after r1 error")
 	wantRejected(`{"type":"response.interrupt","response_id":"r1"}`, "interrupt r1 after its error")
+	if errWrite := client.WriteMessage(websocket.TextMessage, []byte("advance")); errWrite != nil {
+		t.Fatal(errWrite)
+	}
 
 	read() // response.created r2
 	if errInterrupt := interrupt(`{"type":"response.interrupt","response_id":"r2"}`); errInterrupt != nil {
@@ -166,6 +186,7 @@ loop:
 	}
 	want := []string{
 		`{"type":"response.interrupt","response_id":"r1"}`,
+		"advance",
 		`{"type":"response.interrupt","response_id":"r2"}`,
 		"barrier",
 	}

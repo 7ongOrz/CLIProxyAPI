@@ -9,6 +9,7 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -19,6 +20,7 @@ type capturedCodexRequest struct {
 	path        string
 	model       ojson.Result
 	routingHint string
+	sessionID   string
 	hasHint     bool
 	serviceTier ojson.Result
 }
@@ -31,6 +33,7 @@ func newCodexRoutingHintServer(t *testing.T, captured *capturedCodexRequest) *ht
 		captured.model = ojson.GetBytes(body, "model")
 		_, captured.hasHint = r.Header[http.CanonicalHeaderKey(codexRoutingHintHeader)]
 		captured.routingHint = r.Header.Get(codexRoutingHintHeader)
+		captured.sessionID = codexSessionHeaderValue(r.Header)
 		captured.serviceTier = ojson.GetBytes(body, "service_tier")
 		if r.URL.Path == "/responses/compact" {
 			w.Header().Set("Content-Type", "application/json")
@@ -134,12 +137,25 @@ func TestCodexExecutorRoutingHintCarriesRequestedTier(t *testing.T) {
 	}
 }
 
-func TestCodexExecutorCompactRoutingHintCarriesRequestedTier(t *testing.T) {
+func TestCodexExecutorCompactHeadersFollowFinalModel(t *testing.T) {
+	const finalModel = "compact-header-test-model"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(t.Name(), "codex", []*registry.ModelInfo{{
+		ID:     finalModel,
+		Config: &registry.ModelConfig{OverrideHeader: map[string]string{"Session-Id": "model-session"}},
+	}})
+	t.Cleanup(func() { reg.UnregisterClient(t.Name()) })
+
 	var captured capturedCodexRequest
 	server := newCodexRoutingHintServer(t, &captured)
 	defer server.Close()
 
-	executor := NewCodexExecutor(&config.Config{})
+	executor := NewCodexExecutor(&config.Config{Payload: config.PayloadConfig{
+		Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{Name: "gpt-5.5", Protocol: "openai-response"}},
+			Params: map[string]any{"model": finalModel},
+		}},
+	}})
 	_, err := executor.Execute(context.Background(), codexOAuthTestAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "gpt-5.5(low)",
 		Payload: []byte(`{"model":"client-alias","service_tier":"priority","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`),
@@ -153,14 +169,17 @@ func TestCodexExecutorCompactRoutingHintCarriesRequestedTier(t *testing.T) {
 	if captured.path != "/responses/compact" {
 		t.Fatalf("upstream path = %q, want /responses/compact", captured.path)
 	}
-	if captured.model.Type != ojson.String || captured.model.String() != "gpt-5.5" {
-		t.Fatalf("body model = %s, want gpt-5.5", captured.model.Raw)
+	if captured.model.String() != finalModel {
+		t.Fatalf("body model = %s, want %s", captured.model.Raw, finalModel)
 	}
 	if captured.serviceTier.String() != "priority" {
 		t.Fatalf("body service_tier = %q, want priority", captured.serviceTier.String())
 	}
 	if captured.routingHint != "model="+captured.model.String()+";tier="+captured.serviceTier.String() {
-		t.Fatalf("routing hint = %q, does not match body model %q and tier %q", captured.routingHint, captured.model.String(), captured.serviceTier.String())
+		t.Errorf("routing hint = %q, want model=%s;tier=priority", captured.routingHint, finalModel)
+	}
+	if captured.sessionID != "model-session" {
+		t.Errorf("session ID = %q, want model-session", captured.sessionID)
 	}
 }
 

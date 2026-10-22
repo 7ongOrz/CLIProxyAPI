@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
@@ -101,8 +102,14 @@ func TestCodexSessionInstructionsHTTP(t *testing.T) {
 			check(req, opts, http.StatusConflict)
 			unreconstructed := opts
 			unreconstructed.OriginalRequest = req.Payload
-			req.Payload = []byte(`{"instructions":"B","input":[],"client_metadata":{"cpa_session_instructions":"reuse"}}`)
+			req.Payload = []byte(`{"event_id":"rebuilt","instructions":"B","input":[],"client_metadata":{"cpa_session_instructions":"reuse"}}`)
 			check(req, unreconstructed, http.StatusConflict)
+			rebuilt := core.WithRebuiltWebsocketContinuation(t.Context(), true)
+			_, err := exec.Execute(rebuilt, tcAuth(server.URL), req, opts)
+			var turnErr *core.UpstreamWebsocketTurnError
+			if !errors.As(err, &turnErr) || !turnErr.FullContextRequired || turnErr.EventID != "rebuilt" {
+				t.Fatalf("rebuilt continuation error = %#v, want full context for event rebuilt", err)
+			}
 			req.Payload = []byte(`{"input":[],"client_metadata":{"other":"ok"},"client_metadata":{"cpa_session_instructions":"reuse"}}`)
 			check(req, opts, http.StatusBadRequest)
 		})
@@ -130,6 +137,9 @@ func newManagedInstructionsWSServer(t *testing.T) (*httptest.Server, <-chan []by
 				return
 			}
 			captured <- frame
+			if ojson.GetBytesNoCopy(frame, "event_id").String() == "drop-after-read" {
+				return
+			}
 			for _, event := range []string{"response.created", "response.completed"} {
 				msg := fmt.Sprintf(`{"type":%q,"response":{"id":"r%d","status":"completed","output":[]}}`, event, i)
 				if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(msg)); errWrite != nil {
@@ -164,9 +174,10 @@ func TestCodexSessionInstructionsWebsocket(t *testing.T) {
 				ctx = core.WithWebsocketInput(core.WithDownstreamWebsocket(ctx), input)
 			}
 			auth := codexAPIKeyTestAuth(server.URL)
-			turn := func(payload string, opts core.Options, reject bool) {
+			turn := func(payload string, opts core.Options, reject bool) *core.UpstreamWebsocketTurnError {
 				t.Helper()
 				req := core.Request{Model: "gpt-5.4", Payload: []byte(payload)}
+				eventID := ojson.Get(payload, "event_id").String()
 				var err error
 				switch {
 				case mode == "nonstream":
@@ -187,13 +198,16 @@ func TestCodexSessionInstructionsWebsocket(t *testing.T) {
 								if !reject || ojson.GetBytes(chunk.Payload, "error.code").String() != "previous_response_not_found" {
 									t.Fatalf("unexpected error %s", chunk.Payload)
 								}
-								return
+								if got := ojson.GetBytes(chunk.Payload, "error.event_id").String(); got != eventID {
+									t.Fatalf("error.event_id = %q, want %q", got, eventID)
+								}
+								return nil
 							}
 							if kind == "response.completed" {
 								if reject {
 									t.Fatal("invalid delta reached upstream")
 								}
-								return
+								return nil
 							}
 						}
 						t.Fatal("duplex stream ended early")
@@ -204,18 +218,26 @@ func TestCodexSessionInstructionsWebsocket(t *testing.T) {
 					if err == nil {
 						for chunk := range result.Chunks {
 							if chunk.Err != nil {
-								t.Fatal(chunk.Err)
+								err = chunk.Err
+								break
 							}
 						}
 					}
 				}
 				if reject {
-					if !core.IsUpstreamWebsocketTurnError(err) {
-						t.Fatalf("want full replay error, got %v", err)
+					var turnErr *core.UpstreamWebsocketTurnError
+					if !errors.As(err, &turnErr) {
+						t.Fatalf("want websocket turn error, got %v", err)
 					}
-				} else if err != nil {
+					if turnErr.EventID != eventID {
+						t.Fatalf("error.event_id = %q, want %q", turnErr.EventID, eventID)
+					}
+					return turnErr
+				}
+				if err != nil {
 					t.Fatal(err)
 				}
+				return nil
 			}
 			turn(`{"type":"response.create","input":"root","instructions":"A","client_metadata":{"cpa_session_instructions":"start"}}`, opts, false)
 			root := ojson.NewDoc(<-captured)
@@ -226,7 +248,7 @@ func TestCodexSessionInstructionsWebsocket(t *testing.T) {
 			if root.Get("input.0.role").String() != "developer" || root.Get("input.0.content.0.text").String() != wantPrefix || root.Get("instructions").String() != "" || root.Get("client_metadata.cpa_session_instructions").Exists() {
 				t.Fatalf("root was not rewritten: %s", root.Bytes())
 			}
-			delta := `{"type":"response.append","input":"next","client_metadata":{"cpa_session_instructions":"reuse"},"instructions":"B"}`
+			delta := `{"type":"response.append","event_id":"append","input":"next","client_metadata":{"cpa_session_instructions":"reuse"},"instructions":"B"}`
 			unsafe := mode == "filtered-prefix" || mode == "filtered-parent"
 			turn(delta, opts, unsafe)
 			if !unsafe {
@@ -248,18 +270,35 @@ func TestCodexSessionInstructionsWebsocket(t *testing.T) {
 					turn(`{"type":"response.create","previous_response_id":"r2","input":"cross session"}`, other, true)
 				}
 			}
-			turn(`{"type":"response.create","previous_response_id":"unknown","input":"next"}`, opts, true)
-			if mode == "stream" {
+			turn(`{"type":"response.create","event_id":"stale-parent","previous_response_id":"unknown","input":"next"}`, opts, true)
+			if mode == "stream" || mode == "nonstream" {
 				sess := exec.getOrCreateSession(t.Name())
 				sess.connMu.Lock()
 				original := sess.conn
 				sess.connMu.Unlock()
-				exec.invalidateUpstreamConnWithoutDisconnectNotify(sess, original, "test_reconnect", nil)
+				// The proven parent is live at preparation time. Fail the actual write.
+				sess.writeMu.Lock()
+				errDeadline := original.SetWriteDeadline(time.Now().Add(-time.Hour))
+				sess.writeMu.Unlock()
+				if errDeadline != nil {
+					t.Fatal(errDeadline)
+				}
+				errWrite := turn(`{"type":"response.create","event_id":"lost-write","previous_response_id":"r2","input":"next"}`, opts, true)
+				if !errWrite.FullContextRequired {
+					t.Fatalf("lost write: %#v", errWrite)
+				}
 				turn(`{"type":"response.create","previous_response_id":"r2","input":"next"}`, opts, true)
 				turn(`{"type":"response.create","input":"replay","client_metadata":{"cpa_session_instructions":"reuse"}}`, opts, false)
 				body := ojson.NewDoc(<-captured)
 				if body.Get("input.0.content.0.text").String() != "A" || body.Get("previous_response_id").Exists() {
 					t.Fatalf("full replay did not restore the baseline: %s", body.Bytes())
+				}
+				errRead := turn(`{"type":"response.create","event_id":"drop-after-read","previous_response_id":"r0","input":"next"}`, opts, true)
+				if errRead.StatusCode() != http.StatusBadGateway {
+					t.Fatalf("lost acknowledgement: %#v", errRead)
+				}
+				if got := ojson.GetBytesNoCopy(<-captured, "event_id").String(); got != "drop-after-read" {
+					t.Fatalf("upstream received event %q", got)
 				}
 			}
 			select {
@@ -273,5 +312,37 @@ func TestCodexSessionInstructionsWebsocket(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCodexSessionInstructionsResponsesLite(t *testing.T) {
+	server, captured := newManagedInstructionsWSServer(t)
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	defer exec.CloseExecutionSession(t.Name())
+	auth := codexAPIKeyTestAuth(server.URL)
+	opts := managedInstructionsOptions(t)
+	opts.Headers.Set(codexResponsesLiteHeader, "true")
+	send := func(payload string) error {
+		_, err := exec.Execute(t.Context(), auth, core.Request{Model: "gpt-5.4", Payload: []byte(payload)}, opts)
+		return err
+	}
+	if err := send(`{"input":"root","instructions":"baseline","client_metadata":{"cpa_session_instructions":"start"}}`); err != nil {
+		t.Fatal(err)
+	}
+	root := ojson.NewDoc(<-captured)
+	if root.Get("instructions").Exists() || root.Get("input.0.content.0.text").String() != "baseline" {
+		t.Fatalf("unexpected Lite root: %s", root.Bytes())
+	}
+	err := send(`{"type":"response.append","instructions":"one turn","input":"next"}`)
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a turn-scoped top-level override, got %v", err)
+	}
+	if err := send(`{"type":"response.append","input":[{"role":"developer","content":[{"type":"input_text","text":"updated"}]},{"role":"user","content":"next"}]}`); err != nil {
+		t.Fatal(err)
+	}
+	delta := ojson.NewDoc(<-captured)
+	if delta.Get("instructions").Exists() || delta.Get("previous_response_id").String() != "r0" || delta.Get("input.0.content.0.text").String() != "updated" {
+		t.Fatalf("unexpected Lite continuation: %s", delta.Bytes())
 	}
 }

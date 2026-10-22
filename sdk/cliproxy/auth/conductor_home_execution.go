@@ -484,6 +484,13 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 				continue
 			}
 			lastErr = keepPreferredCandidateError(lastErr, errExecute)
+			if cliproxyexecutor.DownstreamWebsocket(ctx) && selection.Retained() && isRequestScopedError(errExecute) {
+				releaseAttempt()
+				if !m.retainHomeWebsocketSelection(ctx, opts, routeModel, selection) {
+					selection.End("request_replay_retain_failed")
+				}
+				return cliproxyexecutor.Response{}, errExecute
+			}
 			if isRequestInvalidError(errExecute) || cliproxyexecutor.IsUpstreamWebsocketTurnError(errExecute) {
 				releaseAttempt()
 				selection.End("request_invalid")
@@ -575,10 +582,10 @@ func sanitizeDownstreamWebsocketFallbackRequest(ctx context.Context, auth *Auth,
 	if !cliproxyexecutor.DownstreamWebsocket(ctx) || authWebsocketsEnabled(auth) || len(req.Payload) == 0 {
 		return req
 	}
-	updated, errDelete := ojson.DeleteBytes(req.Payload, "generate")
-	if errDelete != nil {
+	doc := ojson.NewDoc(req.Payload)
+	if errDelete := doc.Delete("generate"); errDelete != nil {
 		return req
 	}
-	req.Payload = updated
+	req.Payload = doc.Bytes()
 	return req
 }

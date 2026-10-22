@@ -141,6 +141,7 @@ func TestIssue7745_ExecuteStreamWithModelPool_CancelsAbandonedAttemptOnModelFail
 	go func() {
 		res, errStream := m.executeStreamWithModelPool(
 			outerCtx,
+			outerCtx,
 			exec,
 			auth,
 			"issue7745-pool",
@@ -461,6 +462,7 @@ func TestIssue7745_ExecuteStreamWithModelPool_CancelsAbandonedAttemptOn401Refres
 		go func() {
 			res, errStream := m.executeStreamWithModelPool(
 				outerCtx,
+				outerCtx,
 				exec,
 				auth,
 				provider,
@@ -616,6 +618,7 @@ func TestIssue7745_ExecuteStreamWithModelPool_CancelsAbandonedAttemptOn401Refres
 		go func() {
 			res, errStream := m.executeStreamWithModelPool(
 				outerCtx,
+				outerCtx,
 				exec,
 				auth,
 				provider,
@@ -751,6 +754,7 @@ func TestIssue7745_ExecuteStreamWithModelPool_CancelsAbandonedAttemptOnEmptyStre
 			go func() {
 				res, errStream := m.executeStreamWithModelPool(
 					outerCtx,
+					outerCtx,
 					exec,
 					auth,
 					"issue7745-empty",
@@ -836,6 +840,7 @@ func TestIssue7745_WrapStreamResult_CancelsAttemptContextOnHandoffExit(t *testin
 		auth := &Auth{ID: "auth-7745-handoff-cancel", Provider: "issue7745-handoff-cancel", Status: StatusActive}
 		res, errStream := m.executeStreamWithModelPool(
 			outerCtx,
+			outerCtx,
 			exec,
 			auth,
 			"issue7745-handoff-cancel",
@@ -906,6 +911,7 @@ func TestIssue7745_WrapStreamResult_CancelsAttemptContextOnHandoffExit(t *testin
 		m := NewManager(nil, nil, nil)
 		auth := &Auth{ID: "auth-7745-handoff-ok", Provider: "issue7745-handoff-ok", Status: StatusActive}
 		res, errStream := m.executeStreamWithModelPool(
+			outerCtx,
 			outerCtx,
 			exec,
 			auth,
@@ -982,6 +988,7 @@ func TestIssue7745_WrapStreamResult_CancelsAttemptContextOnHandoffExit(t *testin
 		m := NewManager(nil, nil, nil)
 		auth := &Auth{ID: "auth-7745-handoff-err", Provider: "issue7745-handoff-err", Status: StatusActive}
 		res, errStream := m.executeStreamWithModelPool(
+			outerCtx,
 			outerCtx,
 			exec,
 			auth,

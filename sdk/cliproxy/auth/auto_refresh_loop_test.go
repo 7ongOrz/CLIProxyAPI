@@ -634,3 +634,7 @@ func TestAuthAutoRefreshLoop_HandleDueAuth_NonRefreshingPastNextBacksOff(t *test
 		t.Fatalf("nextWait() = %v, want %v (must not spin with 0s wait when shouldRefresh is false)", wait, interval)
 	}
 }
+
+func (m *Manager) refreshAuth(ctx context.Context, id string) {
+	_, _ = m.refreshAuthForRequest(ctx, id, "")
+}

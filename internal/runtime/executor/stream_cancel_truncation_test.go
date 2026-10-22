@@ -638,6 +638,12 @@ func TestXAIStream_UpstreamErrorEventDoesNotEmitTruncatedError(t *testing.T) {
 		if chunk.Err != nil {
 			errs = append(errs, chunk.Err)
 		}
+		if chunk.ResultErr != nil {
+			errs = append(errs, chunk.ResultErr)
+			if !strings.Contains(string(chunk.Payload), `"type":"response.failed"`) {
+				t.Fatalf("terminal result payload = %q, want response.failed", chunk.Payload)
+			}
+		}
 	}
 	if len(errs) != 1 {
 		t.Fatalf("expected exactly 1 upstream error chunk, got %d: %v", len(errs), errs)

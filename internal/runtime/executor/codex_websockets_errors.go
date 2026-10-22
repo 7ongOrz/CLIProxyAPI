@@ -2,20 +2,75 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
+	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
 type statusErrWithHeaders struct {
 	statusErr
 	headers http.Header
+}
+
+type codexWebsocketTranscriptReplayRequiredError struct {
+	reason string
+	cause  error
+}
+
+func (e codexWebsocketTranscriptReplayRequiredError) Error() string {
+	reason := strings.TrimSpace(e.reason)
+	if reason == "" {
+		reason = "upstream_reset"
+	}
+	msg := "codex websocket upstream reset requires transcript replay: invalid_request_error"
+	if e.cause != nil {
+		return fmt.Sprintf("%s: %s: %v", msg, reason, e.cause)
+	}
+	return fmt.Sprintf("%s: %s", msg, reason)
+}
+
+func (e codexWebsocketTranscriptReplayRequiredError) Unwrap() error { return e.cause }
+
+func (e codexWebsocketTranscriptReplayRequiredError) StatusCode() int { return http.StatusBadRequest }
+
+func (e codexWebsocketTranscriptReplayRequiredError) IsRequestScoped() bool { return true }
+
+func (e codexWebsocketTranscriptReplayRequiredError) CodexWebsocketReplayRequired() bool {
+	return true
+}
+
+func codexMissingRequiredWebsocketError(turn helps.CodexInstructionTurn) error {
+	if err := turn.OnConnection(nil); err != nil {
+		return err
+	}
+	return cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+}
+
+func codexDownstreamWebsocketReplayError(ctx context.Context, payload []byte, cause error) (error, bool) {
+	if !cliproxyexecutor.DownstreamWebsocket(ctx) {
+		return cause, false
+	}
+	reason := clienterror.ClassifyCodexWebsocketError(string(payload))
+	if reason == "" {
+		return cause, false
+	}
+	if reason == clienterror.CodexPreviousResponseNotFound {
+		if status := codexWebsocketErrorStatusCode(cause); status > 0 && status != http.StatusBadRequest {
+			return cause, false
+		}
+	}
+	return codexWebsocketTranscriptReplayRequiredError{reason: string(reason), cause: cause}, true
 }
 
 func (e statusErrWithHeaders) Headers() http.Header {
@@ -52,6 +107,12 @@ func codexWebsocketErrorStatusWithHeaders(payload []byte, headers http.Header) i
 	if status := codexWebsocketErrorStatus(payload); status > 0 {
 		return status
 	}
+	switch clienterror.ClassifyCodexWebsocketError(string(payload)) {
+	case clienterror.CodexWebsocketConnectionLimitReached:
+		return http.StatusTooManyRequests
+	case clienterror.CodexPreviousResponseNotFound:
+		return http.StatusBadRequest
+	}
 	if len(headers) == 0 {
 		return 0
 	}
@@ -59,7 +120,7 @@ func codexWebsocketErrorStatusWithHeaders(payload []byte, headers http.Header) i
 }
 
 func inferCodexWebsocketErrorStatus(payload []byte) int {
-	if isCodexWebsocketConnectionLimitError(payload) {
+	if clienterror.ClassifyCodexWebsocketError(string(payload)) == clienterror.CodexWebsocketConnectionLimitReached {
 		return http.StatusTooManyRequests
 	}
 	body, ok := codexTerminalFailureBody(payload)
@@ -83,7 +144,7 @@ func inferCodexWebsocketErrorStatus(payload []byte) int {
 	if errorType == "service_unavailable_error" || errorCode == "server_is_overloaded" {
 		return http.StatusServiceUnavailable
 	}
-	return codexTerminalFailureStatus(body)
+	return codexResponseFailureStatus(payload, body)
 }
 
 func parseCodexWebsocketErrorWithCooling(payload []byte, modelLevelCooling bool) (error, bool) {
@@ -117,7 +178,7 @@ func parseCodexWebsocketErrorWithCooling(payload []byte, modelLevelCooling bool)
 	// immediate-retry contract, then the generic Retry-After header.
 	if retryAfter := parseCodexRetryAfter(errCode, out, time.Now()); retryAfter != nil {
 		statusError.retryAfter = retryAfter
-	} else if isCodexWebsocketConnectionLimitError(payload) {
+	} else if clienterror.ClassifyCodexWebsocketError(string(payload)) == clienterror.CodexWebsocketConnectionLimitReached {
 		retryAfter := time.Duration(0)
 		statusError.retryAfter = &retryAfter
 	} else if shouldParseCodexRetryAfterHeader(errCode) {
@@ -138,6 +199,119 @@ func clearCodexReasoningReplayOnWebsocketError(ctx context.Context, scope codexR
 		return nil
 	}
 	return clearCodexReasoningReplayOnInvalidSignature(ctx, scope, status, buildCodexWebsocketErrorPayload(payload, status))
+}
+
+func parseCodexResponseFailed(payload []byte, modelLevelCooling bool) (statusErr, bool) {
+	if len(payload) == 0 || helps.CodexResponseEventType(payload) != "response.failed" {
+		return statusErr{}, false
+	}
+
+	streamErr, _, ok := codexTerminalFailureErrWithCooling(payload, modelLevelCooling)
+	return streamErr, ok
+}
+
+func parseCodexResponseIncomplete(payload []byte) (statusErr, bool) {
+	if len(payload) == 0 || strings.TrimSpace(ojson.GetBytesNoCopy(payload, "type").String()) != "response.incomplete" {
+		return statusErr{}, false
+	}
+	reason := strings.TrimSpace(ojson.GetBytesNoCopy(payload, "response.incomplete_details.reason").String())
+	if reason == "interrupted" {
+		return statusErr{}, false
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	doc := ojson.NewDocString(`{"error":{"type":"invalid_request_error","code":"response_incomplete"}}`)
+	_ = doc.Set("error.message", fmt.Sprintf("Incomplete response returned, reason: %s", reason))
+	return newCodexStatusErr(http.StatusBadRequest, doc.Bytes()), true
+}
+
+type codexWebsocketTerminalFailure struct {
+	err              error
+	rawErr           error
+	body             []byte
+	reason           string
+	isWebsocketError bool
+	replayRequired   bool
+}
+
+func parseCodexWebsocketTerminalFailure(ctx context.Context, payload []byte, modelLevelCooling bool) (codexWebsocketTerminalFailure, bool) {
+	if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, modelLevelCooling); ok {
+		terminalErr, replayRequired := codexDownstreamWebsocketReplayError(ctx, payload, wsErr)
+		return codexWebsocketTerminalFailure{
+			err:              terminalErr,
+			rawErr:           wsErr,
+			body:             []byte(wsErr.Error()),
+			reason:           "upstream_error",
+			isWebsocketError: true,
+			replayRequired:   replayRequired,
+		}, true
+	}
+	if streamErr, terminalBody, ok := codexTerminalFailureErrWithCooling(payload, modelLevelCooling); ok {
+		reason := "terminal_failure"
+		if helps.CodexResponseEventType(payload) == "response.failed" {
+			reason = "response_failed"
+		}
+		terminalErr, replayRequired := codexDownstreamWebsocketReplayError(ctx, payload, streamErr)
+		return codexWebsocketTerminalFailure{
+			err:            terminalErr,
+			rawErr:         streamErr,
+			body:           terminalBody,
+			reason:         reason,
+			replayRequired: replayRequired,
+		}, true
+	}
+	return codexWebsocketTerminalFailure{}, false
+}
+
+func codexWebsocketUpstreamErrorDropReason(payload []byte, err error) string {
+	switch codexWebsocketErrorStatusCode(err) {
+	case http.StatusUnauthorized:
+		return "upstream_unauthorized"
+	case http.StatusPaymentRequired:
+		return "upstream_payment_required"
+	case http.StatusForbidden:
+		return "upstream_forbidden"
+	case http.StatusTooManyRequests:
+		return "upstream_rate_limited"
+	}
+	if clienterror.ClassifyCodexWebsocketError(string(payload)) == clienterror.CodexPreviousResponseNotFound {
+		return "previous_response_not_found"
+	}
+	return ""
+}
+
+func codexWebsocketErrorStatusCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var statusProvider interface{ StatusCode() int }
+	if errors.As(err, &statusProvider) && statusProvider != nil {
+		return statusProvider.StatusCode()
+	}
+	return 0
+}
+
+func codexWebsocketRequestNeedsTranscriptReplayOnReset(payload []byte) bool {
+	return strings.TrimSpace(ojson.GetBytesNoCopy(payload, "previous_response_id").String()) != ""
+}
+
+func codexWebsocketReadResetError(cause error, replayable bool, turn helps.CodexInstructionTurn) error {
+	var reset codexWebsocketUpstreamResetError
+	var closeErr *websocket.CloseError
+	if errors.As(cause, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig {
+		return nil
+	}
+	if errors.As(cause, &reset) {
+		// A completed write leaves the outcome of a connection-bound turn unknown.
+		if turn.ConnectionBound() {
+			return turn.ConnectionLost(cause)
+		}
+		if replayable {
+			return codexWebsocketTranscriptReplayRequiredError{reason: "read_error", cause: cause}
+		}
+	}
+	return nil
 }
 
 func buildCodexWebsocketErrorPayload(payload []byte, status int) []byte {
@@ -196,18 +370,6 @@ func buildCodexWebsocketErrorPayload(payload []byte, status int) []byte {
 	_ = doc.Set("error.type", "server_error")
 	_ = doc.Set("error.message", http.StatusText(status))
 	return doc.Bytes()
-}
-
-func isCodexWebsocketConnectionLimitError(payload []byte) bool {
-	if len(payload) == 0 {
-		return false
-	}
-	for _, path := range []string{"error.code", "error.type", "body.error.code", "body.error.type", "code", "error"} {
-		if strings.TrimSpace(ojson.GetBytesNoCopy(payload, path).String()) == "websocket_connection_limit_reached" {
-			return true
-		}
-	}
-	return false
 }
 
 func shouldParseCodexRetryAfterHeader(statusCode int) bool {
@@ -270,9 +432,9 @@ func parseCodexWebsocketErrorHeaders(payload []byte) http.Header {
 
 func normalizeCodexWebsocketCompletion(payload []byte) []byte {
 	if strings.TrimSpace(ojson.GetBytesNoCopy(payload, "type").String()) == "response.done" {
-		updated, err := ojson.SetBytes(payload, "type", "response.completed")
-		if err == nil && len(updated) > 0 {
-			return updated
+		doc := ojson.NewDoc(payload)
+		if err := doc.Set("type", "response.completed"); err == nil {
+			return doc.Bytes()
 		}
 	}
 	return payload

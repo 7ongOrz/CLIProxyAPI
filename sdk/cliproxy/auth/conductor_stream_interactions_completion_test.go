@@ -319,7 +319,8 @@ func TestWrapStreamResult_InteractionsSSEInferenceVerified(t *testing.T) {
 			}
 			close(remaining)
 
-			res := manager.wrapStreamResult(
+			res := manager.wrapStreamResultWithCancel(
+				ctx,
 				ctx,
 				registered,
 				registered.Provider,
@@ -332,6 +333,7 @@ func TestWrapStreamResult_InteractionsSSEInferenceVerified(t *testing.T) {
 				false,
 				cliproxyexecutor.Options{},
 				manager.nextExecutionSeq(),
+				nil,
 			)
 			for chunk := range res.Chunks {
 				if chunk.Err != nil {

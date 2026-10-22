@@ -34,7 +34,10 @@ func (*websocketMetadataExecutor) ExecuteStream(context.Context, *coreauth.Auth,
 		chunks <- coreexecutor.StreamChunk{Payload: []byte(payload)}
 	}
 	close(chunks)
-	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+	return &coreexecutor.StreamResult{
+		Headers: http.Header{http.CanonicalHeaderKey(wsTurnStateHeader): []string{"turn-1"}},
+		Chunks:  chunks,
+	}, nil
 }
 
 func TestResponsesWebsocketFiltersModerationMetadataForStandardClients(t *testing.T) {
@@ -52,12 +55,22 @@ func TestResponsesWebsocketFiltersModerationMetadataForStandardClients(t *testin
 		{
 			name:      "codex user agent",
 			headers:   http.Header{"User-Agent": []string{"codex_cli_rs/1.0"}},
-			wantTypes: []string{"response.created", "codex.response.metadata", "response.metadata", "response.completed"},
+			wantTypes: []string{"response.metadata", "response.created", "codex.response.metadata", "response.metadata", "response.completed"},
 		},
 		{
 			name:      "codex originator",
 			headers:   http.Header{"Originator": []string{"codex_cli_rs"}},
-			wantTypes: []string{"response.created", "codex.response.metadata", "response.metadata", "response.completed"},
+			wantTypes: []string{"response.metadata", "response.created", "codex.response.metadata", "response.metadata", "response.completed"},
+		},
+		{
+			name:      "codex vscode user agent",
+			headers:   http.Header{"User-Agent": []string{"codex_vscode/0.153.2"}},
+			wantTypes: []string{"response.metadata", "response.created", "codex.response.metadata", "response.metadata", "response.completed"},
+		},
+		{
+			name:      "codex vscode originator",
+			headers:   http.Header{"Originator": []string{"codex_vscode"}},
+			wantTypes: []string{"response.metadata", "response.created", "codex.response.metadata", "response.metadata", "response.completed"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

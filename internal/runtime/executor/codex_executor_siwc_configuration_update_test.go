@@ -319,7 +319,7 @@ func TestCodexWebsocketsPrepareStreamUseSIWCKeepsSuffixEffort(t *testing.T) {
 	prepared, err := executor.prepareCodexWebsocketStream(context.Background(), codexSIWCAuthForUpdateTest("http://127.0.0.1:1"), cliproxyexecutor.Request{
 		Model:   "gpt-6-astra(xhigh)",
 		Payload: []byte(codexSIWCUpdatePayload),
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}, newEphemeralCodexWebsocketSession())
 	if err != nil {
 		t.Fatalf("prepareCodexWebsocketStream error: %v", err)
 	}

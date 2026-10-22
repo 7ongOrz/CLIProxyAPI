@@ -926,7 +926,7 @@ func keepPreferredCandidateError(current, next error) error {
 
 func isRequestTerminatedError(err error) bool {
 	var terminated *cliproxyexecutor.RequestTerminatedError
-	return (errors.As(err, &terminated) && terminated != nil) || cliproxyexecutor.IsUpstreamWebsocketTurnError(err)
+	return errors.As(err, &terminated) && terminated != nil
 }
 
 // prepareRequestAfterAuth plans the upstream route before passing its format to the optional interceptor.
@@ -2203,7 +2203,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, ctx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
 		if errStream != nil {
 			if isCredentialTerminatedError(errStream) {
 				recordRequestRefusedAuth(ctx, auth.ID)
@@ -2223,7 +2223,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				continue
 			}
 			syncPreferredUpstreamError(&upstreamErr, errStream)
-			if isTerminalRequestStopError(errStream) || isTOSViolationError(errStream) || (!IsRequestScopedContinueError(errStream) && (isRequestInvalidError(errStream) || cliproxyexecutor.IsUpstreamWebsocketTurnError(errStream))) {
+			if selection != nil && cliproxyexecutor.DownstreamWebsocket(ctx) && selection.Retained() && isRequestScopedError(errStream) {
+				releaseAttempt()
+				if !m.retainHomeWebsocketSelection(ctx, opts, routeModel, selection) {
+					selection.End("request_replay_retain_failed")
+				}
+				return nil, errStream
+			}
+			if isTerminalRequestStopError(errStream) || isTOSViolationError(errStream) || cliproxyexecutor.IsUpstreamWebsocketTurnError(errStream) || (!IsRequestScopedContinueError(errStream) && isRequestInvalidError(errStream)) {
 				// Only redispatch needs a release acknowledgement. Preserve the final
 				// response even when Home cannot acknowledge the released admission.
 				if selection != nil {

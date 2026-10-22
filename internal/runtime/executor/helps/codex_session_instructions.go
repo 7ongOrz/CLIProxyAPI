@@ -237,6 +237,7 @@ func PrepareCodexSessionInstructions(ctx context.Context, doc *ojson.Doc, req cl
 	if mode == "" && !armed {
 		return turn, nil
 	}
+	turn.eventID = strings.Clone(raw.Get("event_id").String())
 	kind := strings.TrimSpace(raw.Get("type").String())
 	if (kind != "" && kind != "response.create" && kind != "response.append") ||
 		!codexInstructionFieldsUnique(raw, "type", "previous_response_id", "instructions", "input") {
@@ -244,10 +245,13 @@ func PrepareCodexSessionInstructions(ctx context.Context, doc *ojson.Doc, req cl
 	}
 	parent := strings.TrimSpace(raw.Get("previous_response_id").String())
 	incremental := parent != "" || kind == "response.append"
+	if !incremental && cliproxyexecutor.RebuiltWebsocketContinuation(ctx) {
+		return turn, turn.fullContextRequired()
+	}
 	if !incremental && len(opts.OriginalRequest) > 0 {
 		original := ojson.GetBytesNoCopy(opts.OriginalRequest, "@this")
 		if strings.TrimSpace(original.Get("previous_response_id").String()) != "" || strings.TrimSpace(original.Get("type").String()) == "response.append" {
-			return turn, codexSessionInstructionsReplay()
+			return turn, turn.fullContextRequired()
 		}
 	}
 	turn.key = codexInstructionKey(req, opts)
@@ -258,7 +262,7 @@ func PrepareCodexSessionInstructions(ctx context.Context, doc *ojson.Doc, req cl
 			parent = last.id
 		}
 		if parent == "" || parent != last.id || turn.key != last.key || (last.managed && last.digest == "") || (mode != "" && !last.managed) {
-			return turn, codexSessionInstructionsReplay()
+			return turn, turn.fullContextRequired()
 		}
 		turn.parent, turn.conn = parent, conn
 		if doc.Get("previous_response_id").String() != parent {
@@ -305,12 +309,18 @@ func PrepareCodexSessionInstructions(ctx context.Context, doc *ojson.Doc, req cl
 	}
 	turn.digest = kvstore.HashKeyPart(baseline)
 	if incremental && last.digest != turn.digest {
-		return turn, codexSessionInstructionsReplay()
+		return turn, turn.fullContextRequired()
 	}
 	if current == baseline {
 		current = ""
 	}
-	if errSet := doc.Set("instructions", current); errSet != nil {
+	// Lite carries instructions in developer input. Keep its top-level field absent.
+	if CodexResponsesLiteRequestDoc(doc, opts.Headers) {
+		if current != "" {
+			return turn, &codexSessionInstructionError{http.StatusBadRequest, "Responses Lite carries instructions in developer input; use full Responses for a turn-scoped instructions override"}
+		}
+		_ = doc.Delete("instructions")
+	} else if errSet := doc.Set("instructions", current); errSet != nil {
 		return turn, codexSessionInstructionPayload()
 	}
 	if !incremental && !codexSessionInstructionPrefix(doc.Get("input.0"), turn.digest) {
@@ -332,10 +342,6 @@ func codexSessionInstructionPayload() error {
 	return &codexSessionInstructionError{http.StatusBadRequest, "invalid session instructions payload"}
 }
 
-func codexSessionInstructionsReplay() error {
-	return &cliproxyexecutor.UpstreamWebsocketTurnError{FullContextRequired: true}
-}
-
 func codexSessionInstructionPrefix(item ojson.Result, digest string) bool {
 	if !codexInstructionFieldsUnique(item, "type", "role", "content") {
 		return false
@@ -355,9 +361,10 @@ func codexSessionInstructionPrefix(item ojson.Result, digest string) bool {
 	return text.Type == ojson.String && kvstore.HashKeyPart(text.String()) == digest
 }
 
-// CodexInstructionTurn carries only proof metadata, never baseline text.
+// CodexInstructionTurn carries parent proof and the client event ID for one request.
 type CodexInstructionTurn struct {
 	key, digest, parent  string
+	eventID              string
 	conn                 *websocket.Conn
 	managed, checkParent bool
 }
@@ -370,7 +377,7 @@ func (t *CodexInstructionTurn) CheckFinal(body []byte) error {
 	root := ojson.GetBytesNoCopy(body, "@this")
 	if !codexInstructionFieldsUnique(root, "previous_response_id", "input", "type", "instructions") ||
 		root.Get("previous_response_id").String() != t.parent {
-		return codexSessionInstructionsReplay()
+		return t.fullContextRequired()
 	}
 	if t.managed && t.parent == "" && !codexSessionInstructionPrefix(root.Get("input.0"), t.digest) {
 		t.digest = ""
@@ -378,11 +385,20 @@ func (t *CodexInstructionTurn) CheckFinal(body []byte) error {
 	return nil
 }
 
+func (t CodexInstructionTurn) fullContextRequired() error {
+	return &cliproxyexecutor.UpstreamWebsocketTurnError{FullContextRequired: true, EventID: t.eventID}
+}
+
+// ConnectionLost reports a sent turn whose upstream response was lost.
+func (t CodexInstructionTurn) ConnectionLost(cause error) error {
+	return &cliproxyexecutor.UpstreamWebsocketTurnError{Cause: cause, EventID: t.eventID}
+}
+
 func (t CodexInstructionTurn) ConnectionBound() bool { return t.conn != nil }
 
 func (t CodexInstructionTurn) OnConnection(conn *websocket.Conn) error {
 	if t.conn != nil && t.conn != conn {
-		return codexSessionInstructionsReplay()
+		return t.fullContextRequired()
 	}
 	return nil
 }

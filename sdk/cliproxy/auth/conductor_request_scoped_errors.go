@@ -244,7 +244,7 @@ func ResolveRequestScopedErrorRules(auth *Auth, cfg *internalconfig.Config) []in
 
 // MatchRequestScopedErrorRules evaluates an error against a pre-resolved rule list.
 func MatchRequestScopedErrorRules(rules []internalconfig.RequestScopedErrorRule, err error) (string, bool) {
-	if err == nil || len(rules) == 0 || cliproxyexecutor.IsUpstreamWebsocketTurnError(err) {
+	if err == nil || len(rules) == 0 || cliproxyexecutor.IsUpstreamWebsocketReplayRequired(err) || cliproxyexecutor.IsUpstreamWebsocketTurnError(err) {
 		return "", false
 	}
 
@@ -432,7 +432,7 @@ func MatchRequestScopedErrorAction(auth *Auth, err error, cfg *internalconfig.Co
 }
 
 func matchRequestScopedErrorAction(auth *Auth, err error, cfg *internalconfig.Config) (string, bool) {
-	if err == nil || cliproxyexecutor.IsUpstreamWebsocketTurnError(err) {
+	if err == nil {
 		return "", false
 	}
 	if _, rejected := errors.AsType[antigravityTargetRejectedError](err); rejected {

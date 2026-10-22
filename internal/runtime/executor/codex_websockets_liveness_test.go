@@ -218,7 +218,7 @@ func TestCodexWebsocketActiveResponseRenewsDeadlineOnPing(t *testing.T) {
 	sess.clearActive(client, readCh)
 }
 
-func TestCodexWebsocketRawConnRenewsDeadlineOnPing(t *testing.T) {
+func TestCodexWebsocketEphemeralSessionRenewsDeadlineOnPing(t *testing.T) {
 	serverConnCh := make(chan *websocket.Conn, 1)
 	pongCh := make(chan string, 4)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +250,14 @@ func TestCodexWebsocketRawConnRenewsDeadlineOnPing(t *testing.T) {
 		_ = serverConn.Close()
 	}()
 
-	configureRawCodexWebsocketConn(client, "raw-auth", wsURL)
+	exec := NewCodexWebsocketsExecutor(nil)
+	sess := newEphemeralCodexWebsocketSession()
+	sess.conn = client
+	sess.connCloser = newWebsocketConnectionCloser(client)
+	sess.configureConn(client)
+	readCh := sess.activate(client)
+	defer sess.clearActive(client, readCh)
+	go exec.readUpstreamLoop(sess, client)
 
 	type readResult struct {
 		payload []byte
@@ -258,7 +265,7 @@ func TestCodexWebsocketRawConnRenewsDeadlineOnPing(t *testing.T) {
 	}
 	resCh := make(chan readResult, 1)
 	go func() {
-		_, payload, errRead := readCodexWebsocketMessage(context.Background(), nil, client, nil)
+		_, payload, errRead := readCodexWebsocketMessage(context.Background(), sess, client, readCh)
 		resCh <- readResult{payload: payload, err: errRead}
 	}()
 
@@ -327,7 +334,11 @@ func TestCodexWebsocketCompletedIdleSessionExpiresDespitePing(t *testing.T) {
 	sess.connCloser = newWebsocketConnectionCloser(client)
 	sess.configureConn(client)
 	readCh := sess.activate(client)
-	go exec.readUpstreamLoop(sess, client)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		exec.readUpstreamLoop(sess, client)
+	}()
 
 	for _, msg := range []string{
 		`{"type":"response.created","response":{"id":"r1","status":"in_progress"}}`,
@@ -364,8 +375,14 @@ func TestCodexWebsocketCompletedIdleSessionExpiresDespitePing(t *testing.T) {
 	}
 
 	select {
-	case errDisc := <-sess.upstreamDisconnectCh:
-		assertTimeoutErr(t, errDisc)
+	case <-readerDone:
+		sess.activeMu.Lock()
+		errTerminal := sess.terminalErr
+		sess.activeMu.Unlock()
+		assertTimeoutErr(t, errTerminal)
+		if exec.UpstreamGeneration(sessionID) != 1 {
+			t.Fatal("expired connection must advance the recovery generation")
+		}
 	case <-time.After(1500 * time.Millisecond):
 		t.Fatal("completed idle session was kept alive past its deadline by upstream ping")
 	}
@@ -511,10 +528,10 @@ func TestCodexWebsocketReusedSessionRefreshesDeadlineForNewTurn(t *testing.T) {
 	drainDeadlines(observed.deadlines)
 
 	readCh2 := sess.activate(client)
-	waitForRenewedDeadline(t, observed.deadlines, shortDeadline.Add(time.Minute))
 	if errSend := writeCodexWebsocketMessage(sess, client, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); errSend != nil {
 		t.Fatalf("write turn 2 request: %v", errSend)
 	}
+	waitForRenewedDeadline(t, observed.deadlines, shortDeadline.Add(time.Minute))
 	select {
 	case <-receivedCh:
 	case <-time.After(3 * time.Second):
@@ -921,8 +938,10 @@ func TestCodexWebsocketDuplexLivenessAndIdleCleanup(t *testing.T) {
 
 	t.Run("completed_upstream_expires_under_downstream_backpressure", func(t *testing.T) {
 		serverConnCh := make(chan *websocket.Conn, 1)
+		serverReadDone := make(chan struct{})
 		pongCh := make(chan string, 8)
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(serverReadDone)
 			conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 			if errUpgrade != nil {
 				t.Errorf("upgrade: %v", errUpgrade)
@@ -1025,8 +1044,14 @@ func TestCodexWebsocketDuplexLivenessAndIdleCleanup(t *testing.T) {
 		waitForPingPong(t, serverConn, pongCh, "bp-ping-1")
 
 		select {
-		case errDisc := <-sess.upstreamDisconnectCh:
-			assertTimeoutErr(t, errDisc)
+		case <-serverReadDone:
+			sess.activeMu.Lock()
+			errTerminal := sess.terminalErr
+			sess.activeMu.Unlock()
+			assertTimeoutErr(t, errTerminal)
+			if exec.UpstreamGeneration(sessionID) != 1 {
+				t.Fatal("expired connection must advance the recovery generation")
+			}
 		case <-time.After(1500 * time.Millisecond):
 			t.Fatal("completed upstream connection was kept alive under downstream backpressure")
 		}
@@ -1152,7 +1177,11 @@ func TestCodexWebsocketUnsolicitedPongHeartbeatRespectsTurnState(t *testing.T) {
 		sess.connCloser = newWebsocketConnectionCloser(client)
 		sess.configureConn(client)
 		readCh := sess.activate(client)
-		go exec.readUpstreamLoop(sess, client)
+		readerDone := make(chan struct{})
+		go func() {
+			defer close(readerDone)
+			exec.readUpstreamLoop(sess, client)
+		}()
 
 		for _, msg := range []string{
 			`{"type":"response.created","response":{"id":"r-pong-idle","status":"in_progress"}}`,
@@ -1184,8 +1213,14 @@ func TestCodexWebsocketUnsolicitedPongHeartbeatRespectsTurnState(t *testing.T) {
 		}
 
 		select {
-		case errDisc := <-sess.upstreamDisconnectCh:
-			assertTimeoutErr(t, errDisc)
+		case <-readerDone:
+			sess.activeMu.Lock()
+			errTerminal := sess.terminalErr
+			sess.activeMu.Unlock()
+			assertTimeoutErr(t, errTerminal)
+			if exec.UpstreamGeneration(sessionID) != 1 {
+				t.Fatal("expired connection must advance the recovery generation")
+			}
 		case <-time.After(1500 * time.Millisecond):
 			t.Fatal("completed idle session was kept alive past its deadline by unsolicited pong")
 		}

@@ -5,19 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
@@ -56,7 +52,7 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	return conn, closer, resp, err
 }
 
-func writeWebsocketPayloadMessage(provider string, sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
+func writeWebsocketPayloadMessage(provider string, sess *codexWebsocketSession, conn *websocket.Conn, payload []byte, renewReadDeadline bool) error {
 	provider = strings.TrimSpace(provider)
 	if provider == "" {
 		provider = "codex"
@@ -70,7 +66,9 @@ func writeWebsocketPayloadMessage(provider string, sess *codexWebsocketSession, 
 	start := time.Now()
 	log.Debugf("%s websockets: write payload started session=%s session_object=%s bytes=%d", provider, sessionID, sessionKind, payloadBytes)
 	var errSend error
-	if sess != nil {
+	if sess != nil && renewReadDeadline {
+		errSend = sess.writeCodexMessage(conn, websocket.TextMessage, payload)
+	} else if sess != nil {
 		errSend = sess.writeMessage(conn, websocket.TextMessage, payload)
 	} else if conn == nil {
 		errSend = fmt.Errorf("%s websockets executor: websocket conn is nil", provider)
@@ -86,7 +84,7 @@ func writeWebsocketPayloadMessage(provider string, sess *codexWebsocketSession, 
 }
 
 func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
-	return writeWebsocketPayloadMessage("codex", sess, conn, payload)
+	return writeWebsocketPayloadMessage("codex", sess, conn, payload, ojson.GetBytesNoCopy(payload, "type").String() == "response.create")
 }
 
 func mapCodexWebsocketWriteError(sess *codexWebsocketSession, conn *websocket.Conn, err error) error {
@@ -106,7 +104,10 @@ func shouldRetryCodexWebsocketSend(err error) bool {
 		return false
 	}
 	var requestErr cliproxyexecutor.RequestScopedError
-	return !errors.As(err, &requestErr) || !requestErr.IsRequestScoped()
+	if errors.As(err, &requestErr) && requestErr.IsRequestScoped() {
+		return false
+	}
+	return true
 }
 
 type codexWebsocketMessageTooBigError struct {
@@ -131,69 +132,14 @@ func mapCodexWebsocketReadError(err error) error {
 	return err
 }
 
-// codexWebsocketTurnTransportError turns a transport loss (EOF, reset, close 1006) into
-// the turn error that keeps the downstream websocket open. Status, policy and other
-// close codes are returned unchanged and keep ending the downstream socket.
-func codexWebsocketTurnTransportError(err error) error {
-	if err == nil || cliproxyexecutor.IsUpstreamWebsocketTurnError(err) {
-		return err
-	}
-	var status interface{ StatusCode() int }
-	if errors.As(err, &status) && status.StatusCode() != 0 {
-		return err
-	}
-	var closeErr *websocket.CloseError
-	if errors.As(err, &closeErr) {
-		if closeErr.Code != websocket.CloseAbnormalClosure {
-			return err
-		}
-	} else if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) &&
-		!errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) &&
-		!errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.ECONNABORTED) &&
-		!errors.Is(err, syscall.EPIPE) {
-		return err
-	}
-	return &cliproxyexecutor.UpstreamWebsocketTurnError{Cause: err}
-}
-
-// codexWebsocketTurnEventID lets a lost turn's error carry the create's event_id.
-func codexWebsocketTurnEventID(err error, payload []byte) error {
-	var turnErr *cliproxyexecutor.UpstreamWebsocketTurnError
-	if !errors.As(err, &turnErr) || turnErr.EventID != "" {
-		return err
-	}
-	withID := *turnErr
-	withID.EventID = strings.Clone(ojson.GetBytesNoCopy(payload, "event_id").String())
-	return &withID
-}
-
-func normalizeCodexWebsocketParallelToolCalls(body []byte, headers http.Header) []byte {
-	if !util.IsCodexResponsesLiteRequest(body, headers) {
-		return body
-	}
-	body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
-	return body
-}
-
-func normalizeCodexWebsocketParallelToolCallsDoc(doc *ojson.Doc, headers http.Header) bool {
-	if !isCodexResponsesLiteRequestDoc(doc, headers) {
-		return false
-	}
-	return helps.SetBoolIfDifferentDoc(doc, "parallel_tool_calls", false)
-}
-
-func buildCodexWebsocketRequestBody(body []byte) []byte {
-	return frameCodexWebsocketRequestBody(helps.SanitizeCodexInputItemIDs(body))
-}
-
 // Framing must not normalize the configured business payload.
 func frameCodexWebsocketRequestBody(body []byte) []byte {
 	if len(body) == 0 {
 		return nil
 	}
-	wsReqBody, errSet := ojson.SetBytes(body, "type", "response.create")
-	if errSet == nil && len(wsReqBody) > 0 {
-		return wsReqBody
+	doc := ojson.NewDoc(body)
+	if errSet := doc.Set("type", "response.create"); errSet == nil {
+		return doc.Bytes()
 	}
 	return body
 }
@@ -213,24 +159,62 @@ func extendCodexWebsocketReadDeadline(conn *websocket.Conn) {
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
-	if sess == nil {
-		if conn == nil {
-			return 0, nil, fmt.Errorf("codex websockets executor: websocket conn is nil")
-		}
-		extendCodexWebsocketReadDeadline(conn)
-		msgType, payload, errRead := conn.ReadMessage()
-		return msgType, payload, errRead
-	}
 	if conn == nil {
 		return 0, nil, fmt.Errorf("codex websockets executor: websocket conn is nil")
 	}
 	if readCh == nil {
 		return 0, nil, fmt.Errorf("codex websockets executor: session read channel is nil")
 	}
+	readBuffered := func() (int, []byte, error, bool) {
+		for {
+			select {
+			case ev, ok := <-readCh:
+				if !ok {
+					return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed"), true
+				}
+				if ev.conn != conn {
+					continue
+				}
+				if ev.err != nil {
+					if terminalErr := sess.sessionError(); terminalErr != nil {
+						return 0, nil, terminalErr, true
+					}
+					return 0, nil, ev.err, true
+				}
+				return ev.msgType, ev.payload, nil, true
+			default:
+				return 0, nil, nil, false
+			}
+		}
+	}
+	activeDone, active := sess.activeDoneFor(readCh)
+	if !active {
+		if msgType, payload, errRead, ok := readBuffered(); ok {
+			return msgType, payload, errRead
+		}
+		if errRead := sess.closedActiveErrorFor(readCh); errRead != nil {
+			return 0, nil, errRead
+		}
+		if terminalErr := sess.sessionError(); terminalErr != nil {
+			return 0, nil, terminalErr
+		}
+		return 0, nil, fmt.Errorf("codex websockets executor: session read channel inactive")
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return 0, nil, ctx.Err()
+		case <-activeDone:
+			if msgType, payload, errRead, ok := readBuffered(); ok {
+				return msgType, payload, errRead
+			}
+			if errRead := sess.closedActiveErrorFor(readCh); errRead != nil {
+				return 0, nil, errRead
+			}
+			if terminalErr := sess.sessionError(); terminalErr != nil {
+				return 0, nil, terminalErr
+			}
+			return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed")
 		case ev, ok := <-readCh:
 			if !ok {
 				return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed")
@@ -239,6 +223,9 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 				continue
 			}
 			if ev.err != nil {
+				if terminalErr := sess.sessionError(); terminalErr != nil {
+					return 0, nil, terminalErr
+				}
 				return 0, nil, ev.err
 			}
 			return ev.msgType, ev.payload, nil

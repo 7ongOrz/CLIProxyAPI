@@ -120,6 +120,11 @@ func (m *codexChatToolMetadata) isCustomPatch(original []byte, item ojson.Result
 	return m.customPatchWinners[name]
 }
 
+type codexTextPartKey struct {
+	outputIndex  int64
+	contentIndex int64
+}
+
 // ConvertCliToOpenAIParams holds parameters for response conversion.
 type ConvertCliToOpenAIParams struct {
 	ServiceTier           string
@@ -131,6 +136,7 @@ type ConvertCliToOpenAIParams struct {
 	toolCallStates        map[string]*toolCallStreamState
 	currentToolCall       *toolCallStreamState
 	citationKeys          map[string]struct{}
+	textPartOffsets       map[codexTextPartKey]int64
 	emittedTextRunes      int64
 	HasMessageTextDelta   bool
 	messageStatesByID     map[string]*messageStreamState
@@ -162,6 +168,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			FunctionCallIndex:     -1,
 			toolCallStates:        make(map[string]*toolCallStreamState),
 			citationKeys:          make(map[string]struct{}),
+			textPartOffsets:       make(map[codexTextPartKey]int64),
 			LastImageHashByItemID: make(map[string][32]byte),
 		}
 	}
@@ -244,6 +251,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		_ = templateDoc.Set("choices.0.delta.reasoning_content", "\n\n")
 	} else if dataType == "response.output_text.delta" || dataType == "response.refusal.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
+			p.textPartOffset(rootResult.Get("output_index").Int(), rootResult.Get("content_index").Int())
 			delta := deltaResult.String()
 			_ = templateDoc.Set("choices.0.delta.role", "assistant")
 			_ = templateDoc.Set("choices.0.delta.content", delta)
@@ -253,7 +261,11 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			}
 		}
 	} else if dataType == "response.output_text.annotation.added" || dataType == "response.output_text.done" || dataType == "response.content_part.done" {
-		citations := buildCodexURLCitations(codexAnnotationsFromEvent(rootResult), p.emittedTextRunes, p.citationKeys)
+		offset := p.textPartOffset(rootResult.Get("output_index").Int(), rootResult.Get("content_index").Int())
+		if p.citationKeys == nil {
+			p.citationKeys = make(map[string]struct{})
+		}
+		citations := buildCodexURLCitations(codexAnnotationsFromEvent(rootResult), offset, p.citationKeys)
 		if len(citations) == 0 {
 			return [][]byte{}
 		}
@@ -389,31 +401,36 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		}
 		if itemResult.Get("type").String() == "message" {
 			hadMessageTextDelta := p.consumeMessageTextDelta(rootResult, itemResult)
-			var fallbackText string
-			if !hadMessageTextDelta {
-				var sb strings.Builder
-				for _, part := range itemResult.Get("content").Array() {
+			var fallback strings.Builder
+			var citations [][]byte
+			if p.citationKeys == nil {
+				p.citationKeys = make(map[string]struct{})
+			}
+			for contentIndex, part := range itemResult.Get("content").Array() {
+				offset := p.textPartOffset(rootResult.Get("output_index").Int(), int64(contentIndex))
+				citations = append(citations, buildCodexURLCitations(codexAnnotationResults(part.Get("annotations")), offset, p.citationKeys)...)
+				if !hadMessageTextDelta {
+					var text string
 					switch part.Get("type").String() {
 					case "output_text":
-						sb.WriteString(part.Get("text").String())
+						text = part.Get("text").String()
 					case "refusal":
-						if txt := part.Get("refusal").String(); txt != "" {
-							sb.WriteString(txt)
-						} else {
-							sb.WriteString(part.Get("text").String())
+						text = part.Get("refusal").String()
+						if text == "" {
+							text = part.Get("text").String()
 						}
 					}
+					fallback.WriteString(text)
+					p.emittedTextRunes += int64(utf8.RuneCountInString(text))
 				}
-				fallbackText = sb.String()
 			}
-			citations := buildCodexURLCitations(codexAnnotationsFromEvent(rootResult), p.emittedTextRunes, p.citationKeys)
+			fallbackText := fallback.String()
 			if fallbackText == "" && len(citations) == 0 {
 				return [][]byte{}
 			}
 			_ = templateDoc.Set("choices.0.delta.role", "assistant")
 			if fallbackText != "" {
 				_ = templateDoc.Set("choices.0.delta.content", fallbackText)
-				p.emittedTextRunes += int64(utf8.RuneCountInString(fallbackText))
 			}
 			if len(citations) > 0 {
 				_ = templateDoc.SetRawBytes("choices.0.delta.annotations", translatorcommon.JoinRawArray(citations))
@@ -774,6 +791,19 @@ func buildCodexFailedOpenAIError(rootResult ojson.Result) []byte {
 	return errDoc.Bytes()
 }
 
+// Responses citation indices are local to each part; Chat Completions joins the text.
+func (p *ConvertCliToOpenAIParams) textPartOffset(outputIndex, contentIndex int64) int64 {
+	if p.textPartOffsets == nil {
+		p.textPartOffsets = make(map[codexTextPartKey]int64)
+	}
+	key := codexTextPartKey{outputIndex: outputIndex, contentIndex: contentIndex}
+	if offset, exists := p.textPartOffsets[key]; exists {
+		return offset
+	}
+	p.textPartOffsets[key] = p.emittedTextRunes
+	return p.emittedTextRunes
+}
+
 func codexAnnotationResults(value ojson.Result) []ojson.Result {
 	if !value.Exists() {
 		return nil
@@ -794,15 +824,6 @@ func codexAnnotationsFromEvent(event ojson.Result) []ojson.Result {
 	for _, path := range []string{"annotation", "annotations", "part.annotations"} {
 		annotations = append(annotations, codexAnnotationResults(event.Get(path))...)
 	}
-	item := event.Get("item")
-	if item.Exists() {
-		annotations = append(annotations, codexAnnotationResults(item.Get("annotations"))...)
-		if content := item.Get("content"); content.IsArray() {
-			for _, contentItem := range content.Array() {
-				annotations = append(annotations, codexAnnotationResults(contentItem.Get("annotations"))...)
-			}
-		}
-	}
 	return annotations
 }
 
@@ -822,9 +843,9 @@ func buildCodexURLCitations(annotations []ojson.Result, runeOffset int64, seen m
 		}
 
 		url := annotation.Get("url").String()
-		key := url + "\x00" + strconv.FormatInt(rawStartIndex, 10)
+		key := url + "\x00" + strconv.FormatInt(startIndex, 10)
 		if url == "" {
-			key = annotation.Get("id").String() + "\x00" + strconv.FormatInt(rawStartIndex, 10)
+			key = annotation.Get("id").String() + "\x00" + strconv.FormatInt(startIndex, 10)
 		}
 		keys := []string{key}
 		if id := annotation.Get("id").String(); id != "" {
@@ -832,8 +853,8 @@ func buildCodexURLCitations(annotations []ojson.Result, runeOffset int64, seen m
 		}
 		if seen != nil {
 			duplicate := false
-			for _, key := range keys {
-				if _, exists := seen[key]; exists {
+			for _, candidate := range keys {
+				if _, exists := seen[candidate]; exists {
 					duplicate = true
 					break
 				}
@@ -841,16 +862,16 @@ func buildCodexURLCitations(annotations []ojson.Result, runeOffset int64, seen m
 			if duplicate {
 				continue
 			}
-			for _, key := range keys {
-				seen[strings.Clone(key)] = struct{}{}
+			for _, candidate := range keys {
+				seen[strings.Clone(candidate)] = struct{}{}
 			}
 		}
 
-		citationDoc := ojson.NewDocString(`{"type":"url_citation","url":"","title":"","start_index":0,"end_index":0}`)
-		_ = citationDoc.Set("url", url)
-		_ = citationDoc.Set("title", annotation.Get("title").String())
-		_ = citationDoc.Set("start_index", startIndex)
-		_ = citationDoc.Set("end_index", endIndex)
+		citationDoc := ojson.NewDocString(`{"type":"url_citation","url_citation":{"url":"","title":"","start_index":0,"end_index":0}}`)
+		_ = citationDoc.Set("url_citation.url", url)
+		_ = citationDoc.Set("url_citation.title", annotation.Get("title").String())
+		_ = citationDoc.Set("url_citation.start_index", startIndex)
+		_ = citationDoc.Set("url_citation.end_index", endIndex)
 		citations = append(citations, citationDoc.Bytes())
 	}
 	return citations
@@ -875,6 +896,9 @@ func (p *ConvertCliToOpenAIParams) resetMessageTextDeltaState() {
 	p.messageStatesByID = nil
 	p.messageStatesByIndex = nil
 	p.openMessageStates = nil
+	p.citationKeys = nil
+	p.textPartOffsets = nil
+	p.emittedTextRunes = 0
 }
 
 func (p *ConvertCliToOpenAIParams) findMessageState(itemID string, outputIdx int64, hasOutputIdx bool) *messageStreamState {

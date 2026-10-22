@@ -5,8 +5,11 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 func boolPtr(b bool) *bool {
@@ -29,11 +32,11 @@ func TestCodexV8HistoricalCloakingAliasAffectsBothAuthKinds(t *testing.T) {
 				t.Fatal(err)
 			}
 			oauth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "test-oauth"}}
-			if !isCodexCloakingDisabled(cfg, oauth) {
+			if codexCloakingEnabled(cfg, oauth) {
 				t.Fatal("OAuth setting was not applied")
 			}
 			key := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "test-key", "base_url": "https://example.invalid/v1"}}
-			if isCodexCloakingDisabled(cfg, key) != tc.wantAPI {
+			if codexCloakingEnabled(cfg, key) == tc.wantAPI {
 				t.Fatal("wrong API-key cloaking policy")
 			}
 			if !cfg.Codex.DisableCodexCloaking {
@@ -233,6 +236,47 @@ func TestCodexPerCredentialDisableCloaking_WebSocket_ExplicitFalseOverridesGloba
 	}
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Errorf("WebSocket Originator = %q, want %q", got, codexOriginator)
+	}
+}
+
+func TestCodexPerCredentialDisableCloaking_WebSocketSessionIdentity(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{SessionAffinity: true},
+	}
+	auth := &cliproxyauth.Auth{
+		ID: "cloaking-session-test", Provider: "codex",
+		Attributes: map[string]string{cliproxyauth.AttributeCodexDisableCloaking: "true"},
+	}
+	const userAgent = "codex_cli_rs/0.155.1 (Mac OS; arm64)"
+	for _, tc := range []struct{ name, header, want string }{
+		{"absent", "", ""},
+		{"canonical", "Session-Id", "client-session"},
+		{"legacy", "Session_id", "client-session"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientHeaders := http.Header{"User-Agent": {userAgent}, "Thread-Id": {"client-thread"}}
+			if tc.header != "" {
+				clientHeaders.Set(tc.header, tc.want)
+			}
+			ctx := context.Background()
+			req := cliproxyexecutor.Request{Payload: []byte(`{"prompt_cache_key":"cache-key"}`)}
+			doc := ojson.NewDoc(req.Payload)
+			headers, err := applyCodexPromptCacheHeadersWithContextDoc(ctx, sdktranslator.FormatOpenAIResponse, req, doc, clientHeaders)
+			if err != nil {
+				t.Fatal(err)
+			}
+			headers = applyCodexWebsocketHeaders(ctx, headers, auth, "token", cfg, true, clientHeaders)
+			finalizeCodexWebsocketHeaders(ctx, headers, auth, false, doc.Bytes(), "", clientHeaders)
+			if got := headers.Get("Session-Id"); got != tc.want {
+				t.Errorf("final Session-Id = %q, want %q", got, tc.want)
+			}
+			if got := headerValueCaseInsensitive(headers, "session_id"); got != "" {
+				t.Errorf("legacy session_id = %q, want empty", got)
+			}
+			if got := headers.Get("User-Agent"); got != userAgent {
+				t.Errorf("User-Agent = %q, want %q", got, userAgent)
+			}
+		})
 	}
 }
 

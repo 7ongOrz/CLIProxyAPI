@@ -116,7 +116,7 @@ func TestCodexSIWCNormalizesNativeResponsesEffort(t *testing.T) {
 				case "websocket":
 					_, err = NewCodexWebsocketsExecutor(cfg).Execute(context.Background(), auth, req, opts)
 				case "websocket stream preparation":
-					prepared, errPrepare := NewCodexWebsocketsExecutor(cfg).prepareCodexWebsocketStream(context.Background(), auth, req, opts)
+					prepared, errPrepare := NewCodexWebsocketsExecutor(cfg).prepareCodexWebsocketStream(context.Background(), auth, req, opts, newEphemeralCodexWebsocketSession())
 					err = errPrepare
 					if err == nil {
 						captured <- prepared.clientBody

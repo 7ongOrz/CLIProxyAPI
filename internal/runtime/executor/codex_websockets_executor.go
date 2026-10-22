@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
@@ -144,6 +145,27 @@ func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan erro
 	return e.wsExec.UpstreamDisconnectChan(sessionID)
 }
 
+func (e *CodexAutoExecutor) UpstreamDisconnectGeneration(sessionID string) uint64 {
+	if e == nil || e.wsExec == nil {
+		return 0
+	}
+	return e.wsExec.UpstreamDisconnectGeneration(sessionID)
+}
+
+func (e *CodexAutoExecutor) UpstreamGeneration(sessionID string) uint64 {
+	if e == nil || e.wsExec == nil {
+		return 0
+	}
+	return e.wsExec.UpstreamGeneration(sessionID)
+}
+
+func (e *CodexAutoExecutor) DropUpstreamSession(sessionID string, reason string) {
+	if e == nil || e.wsExec == nil {
+		return
+	}
+	e.wsExec.DropUpstreamSession(sessionID, reason)
+}
+
 func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	if auth == nil {
 		return false
@@ -226,6 +248,7 @@ func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context,
 	// Account checks may call back into the auth manager; do not hold session
 	// locks across them. Take the lifecycle snapshot only after they finish.
 	authEnabled := cliproxyexecutor.WebsocketAuthEnabled(ctx, authID)
+	acknowledge := cliproxyexecutor.WebsocketInterruptAckHandler(ctx)
 	sess.connMu.Lock()
 	if sess.conn != conn {
 		sess.connMu.Unlock()
@@ -247,6 +270,9 @@ func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context,
 	if sess.terminalConn == conn {
 		disconnectErr = sess.terminalErr
 	}
+	if active && authEnabled && disconnectErr == nil && acknowledge != nil {
+		sess.interruptAckHandler = acknowledge
+	}
 	// Terminal state and the active channel must belong to one snapshot:
 	// completion can otherwise land between the checks and produce a stale 400.
 	sess.activeMu.Unlock()
@@ -255,6 +281,12 @@ func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context,
 		return disconnectErr
 	}
 	if alreadyTerminal {
+		if acknowledge != nil {
+			ack, _ := json.Marshal(map[string]string{
+				"type": "response.interrupt.accepted", "response_id": ojson.GetBytes(payload, "response_id").String(),
+			})
+			acknowledge(ack)
+		}
 		log.WithField("outcome", "already_terminal").Debug("codex websockets: response.interrupt handled")
 		return nil
 	}

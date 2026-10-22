@@ -16,7 +16,8 @@ func TestIssue7741WrapStreamResultClosesOnCancellationDuringUpstreamStall(t *tes
 	t.Cleanup(func() { close(remaining) })
 
 	manager := NewManager(nil, nil, nil)
-	result := manager.wrapStreamResult(
+	result := manager.wrapStreamResultWithCancel(
+		ctx,
 		ctx,
 		&Auth{ID: "issue7741-auth", Provider: "issue7741"},
 		"issue7741",
@@ -29,6 +30,7 @@ func TestIssue7741WrapStreamResultClosesOnCancellationDuringUpstreamStall(t *tes
 		false,
 		cliproxyexecutor.Options{},
 		1,
+		nil,
 	)
 
 	go func() {

@@ -471,30 +471,33 @@ func (s *issue8523BlockingStore) Delete(context.Context, string) error { return 
 
 type issue8523FailingRefreshExecutor struct {
 	issue7756DummyExecutor
-	err error
+	err     error
+	started chan struct{}
 }
 
 func (e *issue8523FailingRefreshExecutor) Refresh(context.Context, *Auth) (*Auth, error) {
+	close(e.started)
 	return nil, e.err
 }
 
-func TestReenableNotOverwrittenByConcurrentDisabledRefreshFailureDuringPersist_Issue8523(t *testing.T) {
+func TestReenableSerializesConcurrentRefreshFailureDuringPersist_Issue8523(t *testing.T) {
 	ctx := context.Background()
 	store := &issue8523BlockingStore{
 		saveStarted: make(chan struct{}),
 		releaseSave: make(chan struct{}),
 	}
 	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	refreshStarted := make(chan struct{})
 	manager.RegisterExecutor(&issue8523FailingRefreshExecutor{
 		issue7756DummyExecutor: issue7756DummyExecutor{id: "codex"},
 		err:                    &Error{Code: "upstream_503", Message: "temporary refresh failure", HTTPStatus: http.StatusServiceUnavailable},
+		started:                refreshStarted,
 	})
 
 	authID := "issue8523-persist-race.json"
 	validExp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
 
-	// Start with disabled=true, unavailable=false so a concurrent refresh failure
-	// during persistLocked flips existing.Unavailable false->true while existing.Status stays disabled.
+	// Begin disabled; the operator update and refresh outcome share the mutation gate.
 	if _, errReg := manager.Register(ctx, &Auth{
 		ID:          authID,
 		Provider:    "codex",
@@ -533,13 +536,18 @@ func TestReenableNotOverwrittenByConcurrentDisabledRefreshFailureDuringPersist_I
 	// Wait until Modify has entered persistLocked and released m.mu.
 	<-store.saveStarted
 
-	// Run a transient refresh failure while existing in m.auths is still disabled.
-	manager.refreshAuth(ctx, authID)
+	// Refresh can finish upstream while publication waits for the operator save.
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, errRefresh := manager.refreshAuthForRequest(ctx, authID, "")
+		refreshDone <- errRefresh
+	}()
+	<-refreshStarted
 
-	// Verify existing in m.auths was flipped to Unavailable=true while still disabled.
+	// The stored runtime snapshot remains unchanged until the save completes.
 	midSnap, _ := manager.GetByID(authID)
-	if !midSnap.Disabled || !midSnap.Unavailable {
-		t.Fatalf("expected concurrent refresh to mark still-disabled auth Unavailable=true, got disabled=%v unavailable=%v",
+	if !midSnap.Disabled || midSnap.Unavailable {
+		t.Fatalf("expected disabled=true and unavailable=false during save, got disabled=%v unavailable=%v",
 			midSnap.Disabled, midSnap.Unavailable)
 	}
 
@@ -547,6 +555,9 @@ func TestReenableNotOverwrittenByConcurrentDisabledRefreshFailureDuringPersist_I
 	close(store.releaseSave)
 	if errMod := <-modifyDone; errMod != nil {
 		t.Fatalf("Modify(re-enable) error = %v", errMod)
+	}
+	if errRefresh := <-refreshDone; errRefresh == nil {
+		t.Fatal("expected the upstream refresh failure")
 	}
 
 	got, _ := manager.GetByID(authID)

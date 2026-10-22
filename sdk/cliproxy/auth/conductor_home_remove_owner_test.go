@@ -65,73 +65,21 @@ func TestRemoveIfCleansHomeRuntimeAuthOwners(t *testing.T) {
 		t.Fatalf("homeRuntimeAuthOwners[session-shared][auth-2] = %p, want %p", sharedOwner2, sel2)
 	}
 
-	manager.replaceHomeSelectionAuth(sel1, &Auth{
-		ID:       "auth-1",
-		Provider: "codex",
-		Metadata: map[string]any{"access_token": "refreshed-1"},
-	})
-
-	manager.mu.RLock()
-	_, resurrectedShared := manager.homeRuntimeAuths["session-shared"]["auth-1"]
-	_, resurrectedSolo := manager.homeRuntimeAuths["session-solo"]
-	stillAuth2 := manager.homeRuntimeAuths["session-shared"]["auth-2"]
-	manager.mu.RUnlock()
-
-	if resurrectedShared {
-		t.Fatal("replaceHomeSelectionAuth resurrected auth-1 in homeRuntimeAuths[session-shared]")
-	}
-	if resurrectedSolo {
-		t.Fatal("replaceHomeSelectionAuth resurrected session-solo in homeRuntimeAuths")
-	}
-	if stillAuth2 == nil || stillAuth2.ID != "auth-2" {
-		t.Fatalf("homeRuntimeAuths[session-shared][auth-2] after replace = %#v, want auth-2", stillAuth2)
-	}
 }
 
-func TestReplaceHomeSelectionAuthDoesNotResurrectRemovedAuth(t *testing.T) {
-	staleSel := &HomeDispatchSelection{Auth: &Auth{
-		ID:       "auth-1",
-		Provider: "codex",
-		Metadata: map[string]any{"access_token": "old-1"},
-	}}
-	activeSel := &HomeDispatchSelection{Auth: &Auth{
-		ID:       "auth-2",
-		Provider: "codex",
-		Metadata: map[string]any{"access_token": "old-2"},
-	}}
-
-	manager := &Manager{
-		homeRuntimeAuths: map[string]map[string]*Auth{
-			"session-shared": {
-				"auth-2": activeSel.Auth.Clone(),
-			},
-		},
-		homeRuntimeAuthOwners: map[string]map[string]*HomeDispatchSelection{
-			"session-shared": {
-				"auth-1": staleSel,
-				"auth-2": activeSel,
-			},
-		},
+func TestHomeRuntimeAuthSnapshotFollowsSelectionLifecycle(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	selection := &HomeDispatchSelection{Auth: &Auth{ID: "auth-1", Provider: "codex"}}
+	manager.rememberHomeSelectionRuntimeAuth("session-1", selection)
+	if manager.homeRuntimeAuthOwners["session-1"]["auth-1"] != selection {
+		t.Fatal("active snapshot must belong to its selection")
 	}
 
-	manager.replaceHomeSelectionAuth(staleSel, &Auth{
-		ID:       "auth-1",
-		Provider: "codex",
-		Metadata: map[string]any{"access_token": "refreshed-1"},
-	})
-
-	if _, resurrected := manager.homeRuntimeAuths["session-shared"]["auth-1"]; resurrected {
-		t.Fatal("replaceHomeSelectionAuth resurrected missing auth-1 into homeRuntimeAuths[session-shared]")
-	}
-
-	manager.replaceHomeSelectionAuth(activeSel, &Auth{
-		ID:       "auth-2",
-		Provider: "codex",
-		Metadata: map[string]any{"access_token": "refreshed-2"},
-	})
-
-	retained := manager.homeRuntimeAuths["session-shared"]["auth-2"]
-	if retained == nil || retained.Metadata["access_token"] != "refreshed-2" {
-		t.Fatalf("retained auth-2 = %#v, want refreshed-2", retained)
+	selection.End("upstream_disconnected")
+	manager.forgetHomeRuntimeAuth("session-1", "auth-1", selection)
+	// A retention attempt may reach publication after End has completed cleanup.
+	manager.rememberHomeSelectionRuntimeAuth("session-1", selection)
+	if len(manager.homeRuntimeAuths) != 0 || len(manager.homeRuntimeAuthOwners) != 0 {
+		t.Fatal("ended selection republished its runtime credentials")
 	}
 }

@@ -83,7 +83,8 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 	merged.CodexRefreshPatch = updated.CodexRefreshPatch
 
 	// 1. Refresh Lifecycle Timestamps
-	applyPreservedRejectedTokens(current, merged, true)
+	activeRefreshed := activeCredentialRefreshed(current, merged)
+	applyPreservedRejectedTokens(current, merged, activeRefreshed)
 	if !updated.LastRefreshedAt.IsZero() {
 		merged.LastRefreshedAt = updated.LastRefreshedAt
 	}
@@ -142,8 +143,8 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 			merged.Unavailable = current.Unavailable
 			merged.Status = current.Status
 			merged.StatusMessage = current.StatusMessage
-		} else if (updated.Status == StatusActive || updated.Status == "" || (baseDisabled && !currentDisabled && updated.Status == StatusDisabled)) && (!merged.RequiresSignIn || merged.HasValidAccessToken(time.Now())) && (merged.RejectedAccessToken == "" || authAccessToken(merged) != merged.RejectedAccessToken) {
-			// Successful refresh clears previous auth error and restores active
+		} else if activeRefreshed && (updated.Status == StatusActive || updated.Status == "" || (baseDisabled && !currentDisabled && updated.Status == StatusDisabled)) && (!merged.RequiresSignIn || merged.HasValidAccessToken(time.Now())) && !authMatchesTokenPartition(merged, merged.RejectedAccessToken) {
+			// Successful refresh of the active credential clears previous auth error and restores active.
 			merged.Status = StatusActive
 			merged.Unavailable = false
 			merged.StatusMessage = ""

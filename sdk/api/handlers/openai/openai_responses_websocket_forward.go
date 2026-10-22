@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -24,15 +25,14 @@ import (
 )
 
 type responsesWebsocketForwardOptions struct {
-	preserveCompletionOutput func() bool
-	duplexStream             func() bool
-	toolCacheTurn            *responsesWebsocketToolCacheTurn
-	suppressError            func(*interfaces.ErrorMessage) bool
-	onDownstreamCommit       func()
-	localInterrupt           *responsesLocalInterrupt
-	// websocketOwned reports whether this turn runs on an upstream
-	// websocket. While true, no interrupt may claim the local HTTP path.
-	websocketOwned func() bool
+	duplexStream                      func() bool
+	preserveCompletionOutput          func() bool
+	toolCacheTurn                     *responsesWebsocketToolCacheTurn
+	suppressError                     func(*interfaces.ErrorMessage) bool
+	allowTranscriptReplayBeforeOutput bool
+	allowHTTPFallbackBeforeOutput     bool
+	completedResponse                 func(string)
+	localInterrupt                    *responsesLocalInterrupt
 }
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
@@ -41,304 +41,280 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	cancel handlers.APIHandlerCancelFunc,
 	data <-chan []byte,
 	errs <-chan *interfaces.ErrorMessage,
+	upstreamHeaders http.Header,
 	wsTimelineLog websocketTimelineAppender,
 	sessionID string,
 	options ...responsesWebsocketForwardOptions,
-) ([]byte, string, []string, *interfaces.ErrorMessage, error) {
+) ([]byte, *interfaces.ErrorMessage, bool, error) {
 	var opts responsesWebsocketForwardOptions
 	if len(options) > 0 {
 		opts = options[0]
 	}
 	toolCacheTurn := opts.toolCacheTurn
+	allowTranscriptReplayBeforeOutput := opts.allowTranscriptReplayBeforeOutput
+	codexClient := isCodexResponsesClientRequest(c)
 	completed := false
-	// turnEnded tracks every terminal outcome (success or failure) for the
-	// local-interrupt window; completed stays success-only for stream
-	// completion bookkeeping.
-	turnEnded := false
 	responseStarted := false
+	downstreamOutputSent := false
+	protocolMetadataHandled := false
 	completedOutput := []byte("[]")
-	completedResponseID := ""
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
-	pendingToolCallIDs := make(map[string]struct{})
+	var pendingProtocolPayloads [][]byte
 	downstreamSessionKey := ""
 	if c != nil && c.Request != nil {
 		downstreamSessionKey = websocketDownstreamSessionKey(c.Request)
 	}
 
-	markDownstreamCommitted := func() {
-		if opts.onDownstreamCommit != nil {
-			opts.onDownstreamCommit()
-		}
-	}
 	if opts.localInterrupt != nil {
-		websocketOwned := opts.websocketOwned != nil && opts.websocketOwned()
-		opts.localInterrupt.begin(websocketOwned)
-		if websocketOwned {
-			defer opts.localInterrupt.endWebsocketTurn()
+		defer opts.localInterrupt.end()
+	}
+	localInterrupts := opts.localInterrupt.interruptsChan()
+
+	writePayload := func(payload []byte) error {
+		markAPIResponseTimestamp(c)
+		if errWrite := writeResponsesWebsocketPayload(writer, wsTimelineLog, payload, time.Now()); errWrite != nil {
+			log.Warnf(
+				"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+				sessionID,
+				websocketPayloadEventType(payload),
+				errWrite,
+			)
+			return errWrite
 		}
-		defer func() {
-			opts.localInterrupt.end()
-			// The reader may have claimed a frame in the gap between the
-			// last loop iteration and this return. It already logged the
-			// frame as locally handled, so answer it here instead of
-			// dropping it; otherwise the client waits for a reply that
-			// never comes. Frames claimed while the socket or request is
-			// already gone need no answer.
-			if c.Request.Context().Err() == nil {
-				if claimed := opts.localInterrupt.takeClaimed(); claimed != nil {
-					markDownstreamCommitted()
-					_, _ = writeResponsesWebsocketError(writer, wsTimelineLog, &interfaces.ErrorMessage{
-						StatusCode: http.StatusBadRequest,
-						Error:      errors.New("no active response to interrupt"),
-					})
+		return nil
+	}
+	flushMetadataBeforePayload := func(nextPayload []byte) error {
+		if codexClient && !protocolMetadataHandled && (len(pendingProtocolPayloads) > 0 || len(nextPayload) > 0) {
+			protocolMetadataHandled = true
+			if metadataPayload := responsesWebsocketTurnStateMetadataPayload(upstreamHeaders, pendingProtocolPayloads, nextPayload); len(metadataPayload) > 0 {
+				if errWrite := writePayload(metadataPayload); errWrite != nil {
+					return errWrite
+				}
+				downstreamOutputSent = true
+			}
+		}
+		for _, payload := range pendingProtocolPayloads {
+			if errWrite := writePayload(payload); errWrite != nil {
+				return errWrite
+			}
+		}
+		if len(pendingProtocolPayloads) > 0 {
+			pendingProtocolPayloads = nil
+			downstreamOutputSent = true
+		}
+		return nil
+	}
+
+	handleError := func(errMsg *interfaces.ErrorMessage, terminalPayload []byte) ([]byte, *interfaces.ErrorMessage, bool, error) {
+		if errMsg != nil {
+			if opts.allowHTTPFallbackBeforeOutput && !downstreamOutputSent && shouldRetryResponsesWebsocketHTTPFallback(errMsg) {
+				cancel(errMsg.Error)
+				return completedOutput, errMsg, true, nil
+			}
+			if allowTranscriptReplayBeforeOutput && !downstreamOutputSent && shouldRetryResponsesWebsocketTranscriptReplay(errMsg) {
+				cancel(errMsg.Error)
+				return completedOutput, errMsg, true, nil
+			}
+			if !downstreamOutputSent && opts.suppressError != nil && opts.suppressError(errMsg) {
+				cancel(errMsg.Error)
+				return completedOutput, errMsg, false, nil
+			}
+			if responsesWebsocketErrorRequiresInternalReplay(errMsg) {
+				errMsg = responsesWebsocketTerminalReplayFailure(errMsg)
+			}
+			if h != nil {
+				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+			}
+			hadDownstreamOutput := downstreamOutputSent
+			if cliproxyexecutor.IsUpstreamWebsocketTurnError(errMsg.Error) {
+				if errFlush := flushMetadataBeforePayload(terminalPayload); errFlush != nil {
+					cancel(errFlush)
+					return completedOutput, errMsg, false, errFlush
+				}
+				markAPIResponseTimestamp(c)
+				_, errWrite := writeResponsesWebsocketError(writer, wsTimelineLog, errMsg)
+				cancel(errMsg.Error)
+				return completedOutput, errMsg, false, errWrite
+			}
+			if matched, errClose := writer.closeForUpstreamError(errMsg.Error); matched {
+				cancel(errMsg.Error)
+				if errClose != nil {
+					return completedOutput, errMsg, false, errClose
+				}
+				return completedOutput, errMsg, false, websocket.ErrCloseSent
+			}
+			exposePayload := shouldExposeResponsesUpstreamError(errMsg) || (hadDownstreamOutput && len(terminalPayload) > 0)
+			if exposePayload {
+				if errFlush := flushMetadataBeforePayload(terminalPayload); errFlush != nil {
+					cancel(errFlush)
+					return completedOutput, errMsg, false, errFlush
 				}
 			}
-		}()
-	}
-	localFrames := opts.localInterrupt.framesChan()
-
-	// handleErr ends the turn on a terminal stream error (non-nil errMsg).
-	handleErr := func(errMsg *interfaces.ErrorMessage) ([]byte, string, []string, *interfaces.ErrorMessage, error) {
-		h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-		if opts.suppressError != nil && opts.suppressError(errMsg) {
-			cancel(errMsg.Error)
-			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
-		}
-		markAPIResponseTimestamp(c)
-		if matched, errClose := writer.closeForUpstreamError(errMsg.Error); matched {
-			cancel(errMsg.Error)
-			if errClose != nil {
-				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errClose
+			markAPIResponseTimestamp(c)
+			errorPayload, wrote, errTerminate := writeResponsesWebsocketTerminalError(writer, wsTimelineLog, errMsg, terminalPayload, hadDownstreamOutput)
+			if wrote {
+				logResponsesWebsocketDownstreamError(sessionID, errorPayload)
 			}
-			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, websocket.ErrCloseSent
+			cancel(errMsg.Error)
+			return completedOutput, errMsg, false, errTerminate
 		}
-
-		errorPayload, wrote, errTerminate := writeResponsesWebsocketTerminalError(writer, wsTimelineLog, errMsg, nil)
-		if wrote {
-			log.Infof(
-				"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-				sessionID,
-				websocket.TextMessage,
-				websocketPayloadEventType(errorPayload),
-				websocketPayloadPreview(errorPayload),
-			)
-		}
-		cancel(errMsg.Error)
-		return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errTerminate
+		cancel(nil)
+		return completedOutput, errMsg, false, nil
 	}
 
 	for {
 		select {
-		case interruptPayload := <-localFrames:
-			if turnEnded {
-				// The frame was claimed before the terminal payload landed, so
-				// the reader already told the client it was handled locally.
-				// The response is over: reject instead of fabricating an
-				// incomplete event, and keep waiting for the turn to drain.
-				if _, errWrite := writeResponsesWebsocketError(writer, wsTimelineLog, &interfaces.ErrorMessage{
-					StatusCode: http.StatusBadRequest,
-					Error:      errors.New("no active response to interrupt"),
-				}); errWrite != nil {
-					cancel(errWrite)
-					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
-				}
-				continue
-			}
-			markDownstreamCommitted()
-			return completeResponsesWebsocketLocalInterrupt(writer, wsTimelineLog, cancel, interruptPayload, outputItemsByIndex, outputItemsFallback, pendingToolCallIDs)
+		case responseID := <-localInterrupts:
+			return completeResponsesWebsocketLocalInterrupt(writer, wsTimelineLog, cancel, responseID, outputItemsByIndex, outputItemsFallback)
+		default:
+		}
+		select {
+		case responseID := <-localInterrupts:
+			return completeResponsesWebsocketLocalInterrupt(writer, wsTimelineLog, cancel, responseID, outputItemsByIndex, outputItemsFallback)
 		case <-c.Request.Context().Done():
 			cause := context.Cause(c.Request.Context())
 			cancel(cause)
-			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, cause
+			return completedOutput, nil, false, cause
 		case errMsg, ok := <-errs:
 			if !ok {
 				errs = nil
 				continue
 			}
-			if errMsg == nil {
-				cancel(nil)
-				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, nil
-			}
-			return handleErr(errMsg)
+			return handleError(errMsg, nil)
 		case chunk, ok := <-data:
 			if !ok {
-				duplex := opts.duplexStream != nil && opts.duplexStream()
-				if duplex || !completed {
+				isDuplex := opts.duplexStream != nil && opts.duplexStream()
+				if isDuplex || !completed {
 					// The stream producers send a terminal error before they close errs and then
 					// data, so it is already buffered here. The select picks between the closed
 					// data channel and that error at random; take the error. Otherwise a pinned-auth
 					// failure that needs a replay close (1012) ends as a plain disconnect (1006),
 					// and a duplex stream loses the error its executor reported.
 					if pendingErrMsg, hasPending := handlers.PendingStreamError(errs); hasPending {
-						return handleErr(pendingErrMsg)
+						return handleError(pendingErrMsg, nil)
 					}
 				}
-				if duplex {
+				if isDuplex {
 					// A duplex stream ends with its socket, not an individual response.
 					// The data channel may close before select observes its final error.
 					_, errClose := writer.closeWithoutError()
 					cancel(nil)
 					if errClose != nil {
-						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errClose
+						return completedOutput, nil, false, errClose
 					}
-					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, websocket.ErrCloseSent
+					return completedOutput, nil, false, websocket.ErrCloseSent
 				}
 				if !completed {
 					errMsg := &interfaces.ErrorMessage{
 						StatusCode: http.StatusRequestTimeout,
 						Error:      fmt.Errorf("stream closed before response.completed"),
 					}
-					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-					markAPIResponseTimestamp(c)
-					_, errClose := writer.closeWithoutError()
-					cancel(errMsg.Error)
-					if errClose != nil {
-						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errClose
-					}
-					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, websocket.ErrCloseSent
+					return handleError(errMsg, nil)
 				}
 				cancel(nil)
-				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, nil
-			}
-
-			// A queued local interrupt belongs to an in-flight HTTP turn:
-			// consume it before forwarding more upstream payload. Once the
-			// turn ended the frame can only be stale, so reject it.
-			if opts.localInterrupt != nil {
-				if interruptPayload := opts.localInterrupt.takeClaimed(); interruptPayload != nil {
-					if !turnEnded {
-						markDownstreamCommitted()
-						return completeResponsesWebsocketLocalInterrupt(writer, wsTimelineLog, cancel, interruptPayload, outputItemsByIndex, outputItemsFallback, pendingToolCallIDs)
-					}
-					// The response is over: reject instead of fabricating an
-					// incomplete event, then keep forwarding this chunk.
-					markDownstreamCommitted()
-					if _, errWrite := writeResponsesWebsocketError(writer, wsTimelineLog, &interfaces.ErrorMessage{
-						StatusCode: http.StatusBadRequest,
-						Error:      errors.New("no active response to interrupt"),
-					}); errWrite != nil {
-						cancel(errWrite)
-						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
-					}
-				}
+				return completedOutput, nil, false, nil
 			}
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
-				eventType := ojson.GetBytesNoCopy(payloads[i], "type").String()
+				eventType := helps.CodexResponseEventType(payloads[i])
+				if eventType == wsEventTypeError && strings.TrimSpace(ojson.GetBytesNoCopy(payloads[i], "type").String()) == "" {
+					doc := ojson.NewDoc(payloads[i])
+					_ = doc.Set("type", eventType)
+					payloads[i] = doc.Bytes()
+				}
 				if eventType == "response.subscription_usage" ||
-					(eventType == "response.metadata" && !isCodexResponsesClientRequest(c)) {
+					(eventType == "response.metadata" && !codexClient) {
 					continue
 				}
+				isDuplex := opts.duplexStream != nil && opts.duplexStream()
 				if eventType == "response.created" {
+					opts.localInterrupt.begin(strings.Clone(ojson.GetBytesNoCopy(payloads[i], "response.id").String()))
 					responseStarted = true
-					markDownstreamCommitted()
 					completed = false
-					turnEnded = false
-					if opts.localInterrupt != nil {
-						opts.localInterrupt.reactivate()
-					}
 					outputItemsByIndex = make(map[int64][]byte)
 					outputItemsFallback = nil
-					pendingToolCallIDs = make(map[string]struct{})
 				}
-				collectResponsesWebsocketOutputItem(payloads[i], outputItemsByIndex, &outputItemsFallback)
-				if isResponsesWebsocketCompletionEvent(eventType) && (opts.preserveCompletionOutput == nil || !opts.preserveCompletionOutput()) {
-					payloads[i] = restoreResponsesWebsocketCompletionOutput(payloads[i], outputItemsByIndex, outputItemsFallback)
+				interrupted := eventType == wsEventTypeIncomplete && ojson.GetBytesNoCopy(payloads[i], "response.incomplete_details.reason").String() == "interrupted"
+				if eventType == "response.output_item.done" {
+					collectResponsesWebsocketOutputItemDone(payloads[i], outputItemsByIndex, &outputItemsFallback)
 				}
-				if toolCacheTurn != nil {
-					toolCacheTurn.recordResponse(payloads[i])
-				} else {
-					recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
+				statePayload := payloads[i]
+				if isResponsesWebsocketCompletionEvent(eventType) {
+					statePayload = restoreResponsesWebsocketCompletionOutput(statePayload, outputItemsByIndex, outputItemsFallback)
+					if opts.preserveCompletionOutput == nil || !opts.preserveCompletionOutput() {
+						payloads[i] = statePayload
+					}
 				}
-				recordPendingToolCallIDsFromPayload(pendingToolCallIDs, payloads[i])
+				// Single-response recovery uses the repair cache. Duplex continuations
+				// are owned by the upstream socket for its entire lifetime.
+				if !isDuplex {
+					if toolCacheTurn != nil {
+						toolCacheTurn.recordResponse(statePayload)
+					} else {
+						recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, statePayload)
+					}
+				}
 				var payloadErrMsg *interfaces.ErrorMessage
-				// In Codex duplex mode the executor owns connection termination:
-				// payload errors after response.created are recoverable events;
-				// StreamChunk.Err still arrives through errs and closes the socket.
-				// Known credential quota/cooldown errors are not recoverable on the
-				// same socket and must still consult the replay guard.
-				if eventType == wsEventTypeError {
+				// Duplex request errors remain recoverable on the current socket.
+				// Credential quota failures enter terminal handling, whose replay
+				// guard preserves every response already delivered downstream.
+				keepDuplexErrorInBand := responseStarted && isDuplex
+				if eventType == wsEventTypeError || eventType == wsEventTypeFailed {
 					errMsg := responsesWebsocketErrorMessageFromPayload(payloads[i])
-					preserveErrorEvent := responseStarted && opts.duplexStream != nil && opts.duplexStream() &&
-						(errMsg == nil || !isResponsesWebsocketQuotaOrCooldownError(errMsg.Error))
-					if preserveErrorEvent {
-						turnEnded = true
+					if errMsg != nil && isResponsesWebsocketQuotaOrCooldownError(errMsg.Error) {
+						keepDuplexErrorInBand = false
+					}
+					if keepDuplexErrorInBand {
 						if errMsg != nil && h != nil {
 							h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 						}
 					} else {
 						payloadErrMsg = errMsg
-						if h != nil {
-							h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)
-						}
-						if opts.suppressError != nil && opts.suppressError(payloadErrMsg) {
-							cancel(payloadErrMsg.Error)
-							return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, nil
-						}
 					}
-				} else if isResponsesWebsocketCompletionEvent(eventType) || eventType == "response.incomplete" {
-					// response.incomplete ends the turn too. Codex uses it, with
-					// reason "interrupted", to acknowledge response.interrupt. Closing
-					// the client socket here would block the follow-up request.
+				} else if eventType == wsEventTypeIncomplete && !interrupted && !keepDuplexErrorInBand {
+					payloadErrMsg = responsesWebsocketIncompleteErrorMessageFromPayload(payloads[i])
+				} else if isResponsesWebsocketCompletionEvent(eventType) {
 					completed = true
-					turnEnded = true
-					completedOutput = responseCompletedOutputFromPayload(payloads[i], outputItemsByIndex, outputItemsFallback)
-					completedResponseID = responseCompletedIDFromPayload(payloads[i])
-				} else if eventType == "response.failed" {
-					// A failed response ends the turn without a completion
-					// identity; only its local-interrupt window closes.
-					turnEnded = true
-				}
-				markAPIResponseTimestamp(c)
-				if payloadErrMsg != nil {
-					if matched, errClose := writer.closeForUpstreamError(payloadErrMsg.Error); matched {
-						cancel(payloadErrMsg.Error)
-						if errClose != nil {
-							return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, errClose
-						}
-						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, websocket.ErrCloseSent
+					if opts.completedResponse != nil {
+						opts.completedResponse(strings.Clone(ojson.GetBytesNoCopy(statePayload, "response.id").String()))
 					}
-					errorPayload, wrote, errTerminate := writeResponsesWebsocketTerminalError(writer, wsTimelineLog, payloadErrMsg, payloads[i])
-					if wrote {
-						log.Infof(
-							"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-							sessionID,
-							websocket.TextMessage,
-							websocketPayloadEventType(errorPayload),
-							websocketPayloadPreview(errorPayload),
-						)
+					completedOutput = responseCompletedOutputFromPayload(statePayload, outputItemsByIndex, outputItemsFallback)
+				} else if interrupted {
+					completed = true
+					completedOutput = responseCompletedOutputFromPayload(statePayload, outputItemsByIndex, outputItemsFallback)
+				}
+				if payloadErrMsg != nil && eventType != wsEventTypeIncomplete {
+					return handleError(payloadErrMsg, payloads[i])
+				}
+				establishesReplayBoundary := responsesWebsocketPayloadEstablishesReplayBoundary(payloads[i])
+				awaitsReplayBoundary := eventType == "codex.response.metadata" || responsesWebsocketTurnStateOnlyMetadata(payloads[i])
+				if allowTranscriptReplayBeforeOutput && !downstreamOutputSent &&
+					(awaitsReplayBoundary || len(pendingProtocolPayloads) > 0 && !establishesReplayBoundary) {
+					pendingProtocolPayloads = append(pendingProtocolPayloads, payloads[i])
+					continue
+				}
+				if establishesReplayBoundary {
+					if errFlush := flushMetadataBeforePayload(payloads[i]); errFlush != nil {
+						cancel(errFlush)
+						return completedOutput, nil, false, errFlush
 					}
-					cancel(payloadErrMsg.Error)
-					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, errTerminate
 				}
-				// log.Infof(
-				// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-				// 	sessionID,
-				// 	websocket.TextMessage,
-				// 	websocketPayloadEventType(payloads[i]),
-				// 	websocketPayloadPreview(payloads[i]),
-				// )
-				if turnEnded && opts.localInterrupt != nil && opts.localInterrupt.isActive() {
-					// Stop claiming local interrupts before the client can see
-					// the terminal event; a later frame is then rejected by
-					// the reader instead of being answered or dropped here.
-					// The isActive guard keeps multi-payload chunks from
-					// toggling the state back off after response.created
-					// reactivated it.
-					opts.localInterrupt.deactivate()
-				}
-				markDownstreamCommitted()
-				if errWrite := writeResponsesWebsocketPayload(writer, wsTimelineLog, payloads[i], time.Now()); errWrite != nil {
-					log.Warnf(
-						"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-						sessionID,
-						websocketPayloadEventType(payloads[i]),
-						errWrite,
-					)
+				if errWrite := writePayload(payloads[i]); errWrite != nil {
 					cancel(errWrite)
-					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
+					return completedOutput, nil, false, errWrite
+				}
+				if payloadErrMsg != nil {
+					cancel(payloadErrMsg.Error)
+					return completedOutput, payloadErrMsg, false, nil
+				}
+				if establishesReplayBoundary {
+					downstreamOutputSent = true
+				}
+				if !isDuplex && (isResponsesWebsocketCompletionEvent(eventType) || interrupted) {
+					cancel(nil)
+					return completedOutput, nil, false, nil
 				}
 			}
 		}
@@ -349,27 +325,85 @@ func completeResponsesWebsocketLocalInterrupt(
 	writer *responsesWebsocketWriter,
 	wsTimelineLog websocketTimelineAppender,
 	cancel handlers.APIHandlerCancelFunc,
-	payload []byte,
+	responseID string,
 	outputItemsByIndex map[int64][]byte,
 	outputItemsFallback [][]byte,
-	pendingToolCallIDs map[string]struct{},
-) ([]byte, string, []string, *interfaces.ErrorMessage, error) {
-	responseID := strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(payload, "response_id").String()))
+) ([]byte, *interfaces.ErrorMessage, bool, error) {
 	output := responseCompletedOutputFromPayload([]byte(`{"response":{"output":[]}}`), outputItemsByIndex, outputItemsFallback)
 	incompleteDoc := ojson.NewDoc([]byte(`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"interrupted"}}}`))
 	if errSet := incompleteDoc.Set("response.id", responseID); errSet != nil {
 		cancel(errSet)
-		return output, responseID, sortedStringSet(pendingToolCallIDs), nil, errSet
+		return output, nil, false, errSet
 	}
 	if errSet := incompleteDoc.SetRawBytes("response.output", output); errSet != nil {
 		cancel(errSet)
-		return output, responseID, sortedStringSet(pendingToolCallIDs), nil, errSet
+		return output, nil, false, errSet
 	}
 	cancel(context.Canceled)
 	if errWrite := writeResponsesWebsocketPayload(writer, wsTimelineLog, incompleteDoc.Bytes(), time.Now()); errWrite != nil {
-		return output, responseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
+		return output, nil, false, errWrite
 	}
-	return output, responseID, sortedStringSet(pendingToolCallIDs), nil, nil
+	return output, nil, false, nil
+}
+
+func responsesWebsocketTurnStateMetadataPayload(headers http.Header, pendingPayloads [][]byte, nextPayload []byte) []byte {
+	turnState := strings.TrimSpace(headers.Get(wsTurnStateHeader))
+	if turnState == "" {
+		return nil
+	}
+	hasTurnState := func(payload []byte) bool {
+		return len(payload) > 0 &&
+			strings.TrimSpace(ojson.GetBytesNoCopy(payload, "type").String()) == "response.metadata" &&
+			strings.TrimSpace(ojson.GetBytesNoCopy(payload, "headers").Get(wsTurnStateHeader).String()) == turnState
+	}
+	for _, pending := range pendingPayloads {
+		if hasTurnState(pending) {
+			return nil
+		}
+	}
+	if hasTurnState(nextPayload) {
+		return nil
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"type": "response.metadata",
+		"headers": map[string]string{
+			wsTurnStateHeader: turnState,
+		},
+	})
+	return payload
+}
+
+func responsesWebsocketTurnStateOnlyMetadata(payload []byte) bool {
+	root := ojson.ParseBytes(payload)
+	if !root.IsObject() {
+		return false
+	}
+	fields := root.Map()
+	if len(fields) != 2 || strings.TrimSpace(fields["type"].String()) != "response.metadata" {
+		return false
+	}
+	headers := fields["headers"]
+	if !headers.IsObject() {
+		return false
+	}
+	headerFields := headers.Map()
+	if len(headerFields) != 1 {
+		return false
+	}
+	for key, value := range headerFields {
+		return strings.EqualFold(key, wsTurnStateHeader) && strings.TrimSpace(value.String()) != ""
+	}
+	return false
+}
+
+func responsesWebsocketPayloadEstablishesReplayBoundary(payload []byte) bool {
+	eventType := strings.TrimSpace(ojson.GetBytes(payload, "type").String())
+	switch eventType {
+	case "codex.rate_limits", "codex.response.metadata":
+		return false
+	default:
+		return true
+	}
 }
 
 func responsesWebsocketErrorStatus(errMsg *interfaces.ErrorMessage) int {
@@ -450,8 +484,10 @@ func writeResponsesWebsocketTerminalError(
 	wsTimelineLog websocketTimelineAppender,
 	errMsg *interfaces.ErrorMessage,
 	payload []byte,
+	preservePayload bool,
 ) ([]byte, bool, error) {
-	if !shouldExposeResponsesUpstreamError(errMsg) {
+	exposePayload := shouldExposeResponsesUpstreamError(errMsg) || preservePayload && len(payload) > 0
+	if !exposePayload {
 		// Keep the upstream reason in the request-log timeline even though the client
 		// only observes a closed connection, otherwise silent failures are
 		// undiagnosable after the fact.
@@ -494,7 +530,11 @@ func shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg *interfaces.ErrorMes
 }
 
 func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) bool {
-	if errMsg == nil {
+	if errMsg == nil || cliproxyexecutor.IsUpstreamWebsocketTurnError(errMsg.Error) {
+		return false
+	}
+	var terminalReplay responsesWebsocketTerminalReplayError
+	if errMsg.Error != nil && errors.As(errMsg.Error, &terminalReplay) {
 		return false
 	}
 	switch responsesWebsocketErrorStatus(errMsg) {
@@ -510,10 +550,12 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 	default:
 	}
 	if errMsg.Error != nil {
+		if clienterror.ClassifyCodexWebsocketError(errMsg.Error.Error()) == clienterror.CodexPreviousResponseNotFound {
+			return true
+		}
 		msg := strings.ToLower(errMsg.Error.Error())
 		switch {
 		case strings.Contains(msg, "stream closed before response.completed"),
-			strings.Contains(msg, "previous_response_not_found"),
 			strings.Contains(msg, "ws_failed"),
 			strings.Contains(msg, "upstream stream closed before first payload"),
 			strings.Contains(msg, "empty_stream"):
@@ -523,22 +565,88 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 	return false
 }
 
-func collectResponsesWebsocketOutputItem(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
-	var fieldsBuf [3]ojson.Result
-	fields := ojson.GetManyBytesNoCopy(fieldsBuf[:0], payload, "type", "item", "output_index")
-	if fields[0].String() != "response.output_item.done" {
-		return
+func shouldRetryResponsesWebsocketTranscriptReplay(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil {
+		return false
 	}
-	item := fields[1]
-	if !item.Exists() || !item.IsObject() {
-		return
+	if responsesWebsocketErrorRequiresInternalReplay(errMsg) {
+		return true
 	}
-	outputIndex := fields[2]
-	if outputIndex.Exists() {
-		outputItemsByIndex[outputIndex.Int()] = bytes.Clone([]byte(item.Raw))
-		return
+	code := clienterror.ClassifyCodexWebsocketError(errMsg.Error.Error())
+	if code == clienterror.CodexWebsocketConnectionLimitReached {
+		return true
 	}
-	*outputItemsFallback = append(*outputItemsFallback, bytes.Clone([]byte(item.Raw)))
+	status := errMsg.StatusCode
+	if status <= 0 {
+		if se, ok := errMsg.Error.(interface{ StatusCode() int }); ok && se != nil {
+			status = se.StatusCode()
+		}
+	}
+	if status > 0 && status != http.StatusBadRequest {
+		return false
+	}
+	return code == clienterror.CodexPreviousResponseNotFound
+}
+
+func shouldRetryResponsesWebsocketHTTPFallback(errMsg *interfaces.ErrorMessage) bool {
+	return responsesWebsocketErrorStatus(errMsg) == http.StatusUpgradeRequired &&
+		!responsesWebsocketErrorRequiresInternalReplay(errMsg)
+}
+
+func responsesWebsocketErrorRequiresInternalReplay(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil {
+		return false
+	}
+	var terminalReplay responsesWebsocketTerminalReplayError
+	if errors.As(errMsg.Error, &terminalReplay) {
+		return false
+	}
+	if cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errMsg.Error) {
+		return true
+	}
+	var replayRequired interface {
+		CodexWebsocketReplayRequired() bool
+	}
+	return errors.As(errMsg.Error, &replayRequired) &&
+		replayRequired != nil &&
+		replayRequired.CodexWebsocketReplayRequired()
+}
+
+type responsesWebsocketTerminalReplayError struct {
+	cause error
+}
+
+func (e responsesWebsocketTerminalReplayError) Error() string {
+	return "upstream websocket reset before response completion"
+}
+
+func (e responsesWebsocketTerminalReplayError) Unwrap() error {
+	return e.cause
+}
+
+func responsesWebsocketTerminalReplayFailure(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	var cause error
+	var addon http.Header
+	if errMsg != nil {
+		cause = errMsg.Error
+		addon = errMsg.Addon
+	}
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadGateway,
+		Error:      responsesWebsocketTerminalReplayError{cause: cause},
+		Addon:      addon,
+	}
+}
+
+func responseCompletedOutputFromPayload(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+	output := ojson.GetBytes(payload, "response.output")
+	if output.Exists() && output.IsArray() && len(output.Array()) > 0 {
+		return bytes.Clone([]byte(output.Raw))
+	}
+	if collected := responsesWebsocketCollectedOutputItems(outputItemsByIndex, outputItemsFallback); len(collected) > 0 {
+		return collected
+	}
+	return []byte("[]")
 }
 
 func restoreResponsesWebsocketCompletionOutput(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
@@ -548,21 +656,21 @@ func restoreResponsesWebsocketCompletionOutput(payload []byte, outputItemsByInde
 		if !changed {
 			return payload
 		}
-		restored, errSet := ojson.SetRawBytes(payload, "response.output", reconciledOutput)
-		if errSet != nil {
+		doc := ojson.NewDoc(payload)
+		if errSet := doc.SetRawBytes("response.output", reconciledOutput); errSet != nil {
 			return payload
 		}
-		return restored
+		return doc.Bytes()
 	}
 	if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 {
 		return payload
 	}
-
-	restored, errSet := ojson.SetRawBytes(payload, "response.output", responseCompletedOutputFromPayload(payload, outputItemsByIndex, outputItemsFallback))
-	if errSet != nil {
+	restoredOutput := responseCompletedOutputFromPayload(payload, outputItemsByIndex, outputItemsFallback)
+	doc := ojson.NewDoc(payload)
+	if errSet := doc.SetRawBytes("response.output", restoredOutput); errSet != nil {
 		return payload
 	}
-	return restored
+	return doc.Bytes()
 }
 
 func reconcileResponsesWebsocketCompletionToolCalls(output ojson.Result, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) ([]byte, bool) {
@@ -640,96 +748,57 @@ func isCompleteResponsesWebsocketToolCall(item ojson.Result) bool {
 	}
 }
 
-func responseCompletedOutputFromPayload(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
-	output := ojson.GetBytesNoCopy(payload, "response.output")
-	if output.Exists() && output.IsArray() && len(output.Array()) > 0 {
-		return bytes.Clone([]byte(output.Raw))
+func collectResponsesWebsocketOutputItemDone(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
+	item := ojson.GetBytes(payload, "item")
+	if !item.Exists() || item.Type != ojson.JSON {
+		return
 	}
-	if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 {
-		return []byte("[]")
+	raw := bytes.Clone([]byte(item.Raw))
+	outputIndex := ojson.GetBytes(payload, "output_index")
+	if outputIndex.Exists() {
+		outputItemsByIndex[outputIndex.Int()] = raw
+		return
 	}
+	*outputItemsFallback = append(*outputItemsFallback, raw)
+}
 
+func responsesWebsocketCollectedOutputItems(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+	if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 {
+		return nil
+	}
+	items := make([]json.RawMessage, 0, len(outputItemsByIndex)+len(outputItemsFallback))
+	appendItem := func(raw []byte) {
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 {
+			return
+		}
+		item := util.ParseGJSONBytesNoCopy(trimmed)
+		if isResponsesToolCallType(item.Get("type").String()) && !isCompleteResponsesWebsocketToolCall(item) {
+			return
+		}
+		items = append(items, append(json.RawMessage(nil), trimmed...))
+	}
 	indexes := make([]int64, 0, len(outputItemsByIndex))
-	for index := range outputItemsByIndex {
-		indexes = append(indexes, index)
+	for idx := range outputItemsByIndex {
+		indexes = append(indexes, idx)
 	}
 	sort.Slice(indexes, func(i, j int) bool {
 		return indexes[i] < indexes[j]
 	})
-
-	items := make([]json.RawMessage, 0, len(outputItemsByIndex)+len(outputItemsFallback))
-	appendCollectedItem := func(raw []byte) {
-		item := util.ParseGJSONBytesNoCopy(raw)
-		if isResponsesToolCallType(item.Get("type").String()) && !isCompleteResponsesWebsocketToolCall(item) {
-			return
-		}
-		items = append(items, append(json.RawMessage(nil), raw...))
-	}
-	for _, index := range indexes {
-		appendCollectedItem(outputItemsByIndex[index])
+	for _, idx := range indexes {
+		appendItem(outputItemsByIndex[idx])
 	}
 	for _, item := range outputItemsFallback {
-		appendCollectedItem(item)
+		appendItem(item)
 	}
-
-	marshaledOutput, errMarshal := json.Marshal(items)
-	if errMarshal != nil {
-		return []byte("[]")
-	}
-	return marshaledOutput
-}
-
-func responseCompletedIDFromPayload(payload []byte) string {
-	return strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(payload, "response.id").String()))
-}
-
-func recordPendingToolCallIDsFromPayload(pending map[string]struct{}, payload []byte) {
-	if pending == nil || len(payload) == 0 {
-		return
-	}
-	var fieldsBuf [2]ojson.Result
-	fields := ojson.GetManyBytesNoCopy(fieldsBuf[:0], payload, "item", "response.output")
-	updatePendingToolCallIDsFromItem(pending, fields[0])
-	output := fields[1]
-	if output.IsArray() {
-		for _, item := range output.Array() {
-			updatePendingToolCallIDsFromItem(pending, item)
-		}
-	}
-}
-
-func updatePendingToolCallIDsFromItem(pending map[string]struct{}, item ojson.Result) {
-	if pending == nil || !item.Exists() {
-		return
-	}
-	switch strings.TrimSpace(item.Get("type").String()) {
-	case "function_call", "custom_tool_call":
-		if !isCompleteResponsesWebsocketToolCall(item) {
-			return
-		}
-		callID := strings.Clone(strings.TrimSpace(item.Get("call_id").String()))
-		pending[callID] = struct{}{}
-	case "function_call_output", "custom_tool_call_output":
-		callID := strings.TrimSpace(item.Get("call_id").String())
-		if callID != "" {
-			delete(pending, callID)
-		}
-	}
-}
-
-func sortedStringSet(values map[string]struct{}) []string {
-	if len(values) == 0 {
+	if len(items) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(values))
-	for value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			out = append(out, value)
-		}
+	marshaled, errMarshal := json.Marshal(items)
+	if errMarshal != nil {
+		return nil
 	}
-	sort.Strings(out)
-	return out
+	return marshaled
 }
 
 func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {

@@ -30,7 +30,7 @@ func TestPickNextViaHomeDoesNotReusePinnedWebsocketAuthWithoutSelection(t *testi
 		Metadata: map[string]any{"email": "home@example.com"},
 	}
 	auth.EnsureIndex()
-	manager.rememberHomeRuntimeAuth("session-1", auth)
+	manager.rememberHomeSelectionRuntimeAuth("session-1", &HomeDispatchSelection{Auth: auth})
 	cachedAuth, ok := manager.GetExecutionSessionAuthByID("session-1", "home-auth-1")
 	if !ok || cachedAuth == nil || !authWebsocketsEnabled(cachedAuth) {
 		t.Fatalf("GetExecutionSessionAuthByID() did not expose remembered websocket home auth: auth=%#v ok=%v", cachedAuth, ok)
@@ -59,7 +59,7 @@ func TestPickNextViaHomeRejectsSessionScopedAuthCache(t *testing.T) {
 	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
 	manager.RegisterExecutor(schedulerTestExecutor{})
 
-	manager.rememberHomeRuntimeAuth("session-1", &Auth{
+	manager.rememberHomeSelectionRuntimeAuth("session-1", &HomeDispatchSelection{Auth: &Auth{
 		ID:       "home-auth-1",
 		Provider: "test",
 		Status:   StatusActive,
@@ -67,8 +67,8 @@ func TestPickNextViaHomeRejectsSessionScopedAuthCache(t *testing.T) {
 			"websockets":                  "true",
 			homeUpstreamModelAttributeKey: "upstream-model-a",
 		},
-	})
-	manager.rememberHomeRuntimeAuth("session-2", &Auth{
+	}})
+	manager.rememberHomeSelectionRuntimeAuth("session-2", &HomeDispatchSelection{Auth: &Auth{
 		ID:       "home-auth-1",
 		Provider: "test",
 		Status:   StatusActive,
@@ -76,7 +76,7 @@ func TestPickNextViaHomeRejectsSessionScopedAuthCache(t *testing.T) {
 			"websockets":                  "true",
 			homeUpstreamModelAttributeKey: "upstream-model-b",
 		},
-	})
+	}})
 
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 	optsSession1 := cliproxyexecutor.Options{
@@ -113,7 +113,7 @@ func TestPickNextViaHomeDoesNotReuseTriedPinnedWebsocketAuth(t *testing.T) {
 			"websockets": "true",
 		},
 	}
-	manager.rememberHomeRuntimeAuth("session-1", auth)
+	manager.rememberHomeSelectionRuntimeAuth("session-1", &HomeDispatchSelection{Auth: auth})
 
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 	opts := cliproxyexecutor.Options{
@@ -150,7 +150,7 @@ func TestPickNextViaHomeDoesNotReusePinnedWebsocketAuthAfterFirstHomeAttempt(t *
 			"websockets": "true",
 		},
 	}
-	manager.rememberHomeRuntimeAuth("session-1", auth)
+	manager.rememberHomeSelectionRuntimeAuth("session-1", &HomeDispatchSelection{Auth: auth})
 
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 	opts := withHomeAuthCount(cliproxyexecutor.Options{
@@ -352,13 +352,13 @@ func TestPickNextViaHomeAbortsAmbiguousTransport(t *testing.T) {
 func TestHomeRuntimeAuthsClearWhenHomeDisabled(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.rememberHomeRuntimeAuth("session-1", &Auth{
+	manager.rememberHomeSelectionRuntimeAuth("session-1", &HomeDispatchSelection{Auth: &Auth{
 		ID:       "home-auth-1",
 		Provider: "test",
 		Attributes: map[string]string{
 			"websockets": "true",
 		},
-	})
+	}})
 
 	if _, ok := manager.GetExecutionSessionAuthByID("session-1", "home-auth-1"); !ok {
 		t.Fatal("expected remembered home auth before disabling home")
@@ -380,8 +380,8 @@ func TestCloseExecutionSessionClearsHomeRuntimeAuthForSession(t *testing.T) {
 		},
 	}
 
-	manager.rememberHomeRuntimeAuth("session-1", auth)
-	manager.rememberHomeRuntimeAuth("session-2", auth)
+	manager.rememberHomeSelectionRuntimeAuth("session-1", &HomeDispatchSelection{Auth: auth})
+	manager.rememberHomeSelectionRuntimeAuth("session-2", &HomeDispatchSelection{Auth: auth})
 
 	manager.CloseExecutionSession("session-1")
 	if _, ok := manager.GetExecutionSessionAuthByID("session-1", "home-auth-1"); ok {

@@ -169,6 +169,7 @@ func TestManager_ExecuteStream_ClearHeadersDoesNotRestoreCanonicalSession_Issue7
 
 		streamResult, errStream := m.executeStreamWithModelPool(
 			context.Background(),
+			context.Background(),
 			executor,
 			auth,
 			"codex",

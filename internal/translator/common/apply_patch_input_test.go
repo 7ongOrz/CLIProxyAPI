@@ -283,6 +283,23 @@ func TestApplyPatchInputDecoderRejectsFinalPrefixConflict(t *testing.T) {
 	}
 }
 
+func TestApplyPatchInputDecoderClosedValueRequiresMatchingSnapshot(t *testing.T) {
+	for _, source := range []string{`{"input":"patch"`, `{"input":"patch"}`, "{\"input\":\"patch\"} \n"} {
+		t.Run(source, func(t *testing.T) {
+			var decoder ApplyPatchInputDecoder
+			if _, errPush := decoder.Push(source); errPush != nil {
+				t.Fatal(errPush)
+			}
+			if tail, errFinish := decoder.Finish(`{"input":"patch extended"}`); errFinish == nil || tail != "" {
+				t.Fatalf("expected snapshot conflict, got tail %q, error %v", tail, errFinish)
+			}
+			if decoder.Input() != "patch" {
+				t.Fatalf("decoded input = %q, want patch", decoder.Input())
+			}
+		})
+	}
+}
+
 func TestApplyPatchInputDecoderErrorIsTerminal(t *testing.T) {
 	var decoder ApplyPatchInputDecoder
 	_, errInitialPush := decoder.Push(`{"input":"safe\uD83D\u0041`)

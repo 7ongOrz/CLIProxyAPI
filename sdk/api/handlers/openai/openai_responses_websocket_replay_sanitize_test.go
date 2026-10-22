@@ -28,7 +28,7 @@ func TestMergeResponsesWebsocketInputDropsReplayedContentTokenCount(t *testing.T
 	// The client-sent append item carries the field as well: client state is never rewritten.
 	raw := []byte(`{"type":"response.create","input":[{"type":"function_call_output","call_id":"call-1","id":"tool-out-1","internal_chat_message_metadata_passthrough":{"content_token_count":99}}]}`)
 
-	normalized, _, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+	normalized, _, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput, false)
 	if errMsg != nil {
 		t.Fatalf("unexpected error: %v", errMsg.Error)
 	}
@@ -156,11 +156,11 @@ func TestResponsesWebsocketToolCachePreservesClientItems(t *testing.T) {
 	callCache := newWebsocketToolOutputCache(time.Minute, 10)
 	sessionKey := "session-7146-client"
 
-	warmPayload := []byte(`{"input":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call-1","id":"fco-1","output":"ok","internal_chat_message_metadata_passthrough":{"content_token_count":42,"turn_id":"client"}}]}`)
-	repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache, sessionKey, warmPayload)
+	clientOutput := []byte(`{"type":"function_call_output","call_id":"call-1","id":"fco-1","output":"ok","internal_chat_message_metadata_passthrough":{"content_token_count":42,"turn_id":"client"}}`)
+	outputCache.record(sessionKey, "call-1", clientOutput)
 
 	raw := []byte(`{"input":[{"type":"function_call","id":"fc-next","call_id":"call-1","name":"lookup","arguments":"{}"}]}`)
-	repaired := repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache, sessionKey, raw)
+	repaired := repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache, sessionKey, raw, nil)
 
 	input := ojson.GetBytesNoCopy(repaired, "input").Array()
 	if len(input) != 2 {
@@ -180,7 +180,7 @@ func TestResponsesWebsocketToolCachePreservesTransactionalClientItems(t *testing
 	defer defaultWebsocketToolOutputCache.deleteSession(sessionKey)
 	defer defaultWebsocketToolCallCache.deleteSession(sessionKey)
 
-	_, turn := prepareResponsesWebsocketFallbackTurn(sessionKey, []byte(`{"input":[{"type":"function_call_output","call_id":"call-1","id":"fco-1","output":"ok","internal_chat_message_metadata_passthrough":{"content_token_count":42,"turn_id":"client"}}]}`))
+	_, turn := prepareResponsesWebsocketFallbackTurn(sessionKey, []byte(`{"input":[{"type":"function_call_output","call_id":"call-1","id":"fco-1","output":"ok","internal_chat_message_metadata_passthrough":{"content_token_count":42,"turn_id":"client"}}]}`), false)
 	turn.commit()
 
 	repaired := repairResponsesWebsocketToolCallsWithoutRecording(sessionKey, []byte(`{"input":[{"type":"function_call","id":"fc-next","call_id":"call-1","name":"lookup","arguments":"{}"}]}`))
@@ -221,7 +221,7 @@ func TestResponsesWebsocketToolCacheStripsContentTokenCount(t *testing.T) {
 	recordResponsesWebsocketToolCallsFromPayloadWithCache(callCache, sessionKey, []byte(`{"type":"response.completed","response":{"output":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1","content_token_count":9}},{"type":"function_call","id":"fc-2","call_id":"call-2","name":"grep","arguments":"{}","internal_chat_message_metadata_passthrough":{"content_token_count":2}}]}}`))
 
 	raw := []byte(`{"input":[{"type":"function_call_output","call_id":"call-1","output":"ok"},{"type":"function_call_output","call_id":"call-2","output":"ok"}]}`)
-	repaired := repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache, sessionKey, raw)
+	repaired := repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache, sessionKey, raw, nil)
 
 	input := ojson.GetBytesNoCopy(repaired, "input").Array()
 	if len(input) != 4 {

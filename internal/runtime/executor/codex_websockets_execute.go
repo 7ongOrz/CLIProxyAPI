@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -88,8 +90,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	_ = doc.Delete("prompt_cache_retention")
 	_ = doc.Delete("safety_identifier")
 	ensureWebSearchToolForHistoryDoc(doc, opts.Headers)
+	responsesLite := normalizeCodexResponsesLiteRequestDoc(doc, opts.Headers)
 	if !useSIWC {
-		normalizeCodexInstructionsDoc(doc, nativeRequest)
+		if !responsesLite {
+			normalizeCodexInstructionsDoc(doc, nativeRequest)
+		}
 		if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 			checkModel := req.Model
 			if strings.TrimSpace(checkModel) == "" {
@@ -101,7 +106,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 		}
 	}
-	normalizeCodexWebsocketParallelToolCallsDoc(doc, opts.Headers)
 	helps.NormalizeCodexToolSchemasDoc(doc)
 	multiAgentV2Conflict := helps.HasCodexMultiAgentV2NamespaceConflictDoc(doc)
 	optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2RequestForAuthDoc(doc, ctx, opts.Headers, e.cfg, auth, isCompat)
@@ -117,7 +121,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	wsHeaders, _, errPromptCache := applyCodexPromptCacheHeadersWithContextDoc(ctx, from, req, doc, opts.Headers)
+	wsHeaders, errPromptCache := applyCodexPromptCacheHeadersWithContextDoc(ctx, from, req, doc, opts.Headers)
 	if errPromptCache != nil {
 		return resp, errPromptCache
 	}
@@ -130,7 +134,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	isEphemeralSession := false
 	sessionLocked := false
 	unlockSession := func() {
-		if sess != nil && sessionLocked {
+		if sessionLocked {
 			sess.reqMu.Unlock()
 			sessionLocked = false
 		}
@@ -164,7 +168,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, nativeRequest, opts.Headers)
 	applyCodexRoutingHint(ctx, wsHeaders, auth, upstreamModel, body, opts.Headers)
-	applyModelHeaderOverrides(wsHeaders, upstreamModel)
+	clientHeaders := util.ResolveClientHeaders((&http.Request{}).WithContext(ctx), opts.Headers)
+	finalizeCodexWebsocketHeaders(ctx, wsHeaders, auth, useSIWC, body, upstreamModel, clientHeaders)
 	if errValidate := helps.ValidateCodexHostedImageGenerationDoc(doc, wsHeaders, e.cfg, !useSIWC && !codexAuthUsesAPIKey(auth)); errValidate != nil {
 		return resp, errValidate
 	}
@@ -193,19 +198,18 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	var conn *websocket.Conn
 	var closer *websocketConnectionCloser
 	var respHS *http.Response
+	var upstreamCreated bool
 	var errDial error
 	dialCtx := ctx
-	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || sessionInstructions.ConnectionBound() {
+	requiresConnection := cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || sessionInstructions.ConnectionBound()
+	if requiresConnection {
 		conn, closer = existingWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), useSIWC)
 		if conn == nil {
-			if errConn := sessionInstructions.OnConnection(nil); errConn != nil {
-				return resp, errConn
-			}
-			return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+			return resp, codexMissingRequiredWebsocketError(sessionInstructions)
 		}
 	} else {
 		dialCtx = cliproxyexecutor.WithUpstreamAttemptTracker(ctx)
-		conn, closer, respHS, errDial = e.ensureUpstreamConnWithSIWC(dialCtx, auth, sess, authID, wsURL, wsHeaders, useSIWC)
+		conn, closer, respHS, upstreamCreated, errDial = e.ensureUpstreamConn(dialCtx, auth, sess, authID, wsURL, wsHeaders, useSIWC)
 	}
 	if errDial != nil {
 		bodyErr := recordWebsocketDialFailure(ctx, e.cfg, wsReqLog, respHS, errDial)
@@ -236,6 +240,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 	reporter.StartResponseTTFT()
+	if !isEphemeralSession && cliproxyexecutor.DownstreamWebsocket(ctx) && upstreamCreated && codexWebsocketRequestNeedsTranscriptReplayOnReset(wsReqBody) {
+		errReplay := codexWebsocketTranscriptReplayRequiredError{reason: "upstream_recreated"}
+		helps.RecordAPIWebsocketError(ctx, e.cfg, "replay_required", errReplay)
+		return resp, errReplay
+	}
 	if isEphemeralSession {
 		defer func() {
 			reason := "completed"
@@ -246,90 +255,87 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}()
 	}
 
-	var readCh chan codexWebsocketRead
-	if sess != nil {
-		readCh = sess.activate(conn)
-		defer func() {
-			sess.clearActive(conn, readCh)
-		}()
-	}
+	readCh := sess.activateCodex(conn)
+	defer func() {
+		sess.clearActive(conn, readCh)
+	}()
 	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 
 	sessionReceipt := sess.sessionInstructions.Sent(conn, sessionInstructions)
 	cliproxyexecutor.MarkUpstreamAttempt(ctx)
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
-		if sess != nil && !isEphemeralSession {
-			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
-				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", errSend)
-				if !shouldRetryCodexWebsocketSend(errSend) {
-					helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
-					return resp, errSend
-				}
-				return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
-			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+		if !isEphemeralSession {
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
+				mode := codexDropNotifyDownstream
+				if requiresConnection {
+					mode = codexDropQuiet
+				}
+				e.dropUpstreamConn(sess, conn, "send_error", errSend, mode)
 				return resp, errSend
 			}
-
-			if errConn := sessionInstructions.OnConnection(nil); errConn != nil {
-				return resp, errConn
+			e.dropUpstreamConn(sess, conn, "send_error", errSend, codexDropForRecovery)
+			if requiresConnection {
+				return resp, codexMissingRequiredWebsocketError(sessionInstructions)
+			}
+			sess.clearActive(conn, readCh)
+			if codexWebsocketRequestNeedsTranscriptReplayOnReset(wsReqBody) {
+				errReplay := codexWebsocketTranscriptReplayRequiredError{reason: "send_error", cause: errSend}
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "replay_required", errReplay)
+				return resp, errReplay
 			}
 
 			// Retry once with a fresh websocket connection. This is mainly to handle
 			// upstream closing the socket between sequential requests within the same
 			// execution session.
-			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithSIWC(ctx, auth, sess, authID, wsURL, wsHeaders, useSIWC)
-			if errDialRetry == nil && connRetry != nil {
-				previousConn, previousReadCh := conn, readCh
-				conn = connRetry
-				closer = closerRetry
-				if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
-					clearRetryActiveState(sess, previousConn, previousReadCh)
-					unlockSession()
-					closeWebsocketAfterBindFailure(sess, conn, closer)
-					return resp, errBind
+			connRetry, closerRetry, respHSRetry, _, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders, useSIWC)
+			if errDialRetry != nil || connRetry == nil {
+				bodyErrRetry := recordWebsocketDialRetryFailure(ctx, e.cfg, wsReqLog, respHSRetry, errDialRetry)
+				if respHSRetry != nil && respHSRetry.StatusCode > 0 {
+					errDialRetry = newCodexStatusErrWithHeadersAndCooling(respHSRetry.StatusCode, respHSRetry.Header, bodyErrRetry, e.modelLevelCooling())
 				}
-				readCh = sess.activate(conn)
-				restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
-				wsReqBodyRetry := frameCodexWebsocketRequestBody(body)
-				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-					URL:       wsURL,
-					Method:    "WEBSOCKET",
-					Headers:   wsHeaders.Clone(),
-					Body:      sessionInstructions.LogBody(wsReqBodyRetry),
-					Provider:  e.Identifier(),
-					AuthID:    authID,
-					AuthLabel: authLabel,
-					AuthType:  authType,
-					AuthValue: authValue,
-				})
-				recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
-				reporter.StartResponseTTFT()
-				sessionReceipt = sess.sessionInstructions.Sent(conn, sessionInstructions)
-				cliproxyexecutor.MarkUpstreamAttempt(ctx)
-				if errSendRetry := writeCodexWebsocketMessage(sess, conn, wsReqBodyRetry); errSendRetry == nil {
-					wsReqBody = wsReqBodyRetry
-				} else {
-					errSendRetry = mapCodexWebsocketWriteError(sess, connRetry, errSendRetry)
-					e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
-					helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
-					return resp, errSendRetry
-				}
-			} else {
-				_ = recordWebsocketDialRetryFailure(ctx, e.cfg, wsReqLog, respHSRetry, errDialRetry)
 				return resp, errDialRetry
 			}
-		} else {
-			if sess != nil {
-				e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
-				sess.clearActive(conn, readCh)
-				if isEphemeralSession {
-					closeCodexWebsocketSession(sess, "send_error")
-				}
+			conn = connRetry
+			closer = closerRetry
+			if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
+				unlockSession()
+				closeWebsocketAfterBindFailure(sess, conn, closer)
+				return resp, errBind
 			}
+			readCh = sess.activateCodex(conn)
+			restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
+			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+				URL:       wsURL,
+				Method:    "WEBSOCKET",
+				Headers:   wsHeaders.Clone(),
+				Body:      sessionInstructions.LogBody(wsReqBody),
+				Provider:  e.Identifier(),
+				AuthID:    authID,
+				AuthLabel: authLabel,
+				AuthType:  authType,
+				AuthValue: authValue,
+			})
+			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
+			reporter.StartResponseTTFT()
+			sessionReceipt = sess.sessionInstructions.Sent(conn, sessionInstructions)
+			cliproxyexecutor.MarkUpstreamAttempt(ctx)
+			if errSendRetry := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSendRetry != nil {
+				errSendRetry = mapCodexWebsocketWriteError(sess, conn, errSendRetry)
+				mode := codexDropNotifyDownstream
+				if cliproxyexecutor.DownstreamWebsocket(ctx) {
+					mode = codexDropQuiet
+				}
+				e.dropUpstreamConn(sess, conn, "send_error", errSendRetry, mode)
+				sess.clearActive(conn, readCh)
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
+				return resp, errSendRetry
+			}
+		} else {
+			e.dropUpstreamConn(sess, conn, "send_error", errSend, codexDropNotifyDownstream)
+			sess.clearActive(conn, readCh)
+			closeCodexWebsocketSession(sess, "send_error")
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 			return resp, errSend
 		}
@@ -339,6 +345,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		sess.setMultiAgentV2Optimized(conn, optimizeMultiAgentV2 && !multiAgentV2Conflict)
 	}
 
+	replayableRead := cliproxyexecutor.DownstreamWebsocket(ctx) || codexWebsocketRequestNeedsTranscriptReplayOnReset(wsReqBody)
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 	sawOutputDelta := false
@@ -348,16 +355,29 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 		if errRead != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return resp, ctx.Err()
+			}
+			if errReset := codexWebsocketReadResetError(errRead, replayableRead, sessionInstructions); errReset != nil {
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "read_reset", errReset)
+				return resp, errReset
+			}
 			mappedErr := mapCodexWebsocketReadError(errRead)
+			var upstreamReset codexWebsocketUpstreamResetError
+			if !errors.As(errRead, &upstreamReset) {
+				mode := codexDropNotifyDownstream
+				if cliproxyexecutor.DownstreamWebsocket(ctx) {
+					mode = codexDropQuiet
+				}
+				e.dropUpstreamConn(sess, conn, "read_error", mappedErr, mode)
+			}
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
 			return resp, mappedErr
 		}
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				err = fmt.Errorf("codex websockets executor: unexpected binary message")
-				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", err)
-				}
+				e.dropUpstreamConn(sess, conn, "unexpected_binary", err, codexDropNotifyDownstream)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", err)
 				return resp, err
 			}
@@ -373,25 +393,27 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
 		payload = helps.RestoreCodexMultiAgentV2Response(payload, restoreMultiAgentV2)
 
-		if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
-			if sess != nil {
-				e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+		if failure, ok := parseCodexWebsocketTerminalFailure(ctx, payload, e.modelLevelCooling()); ok {
+			if failure.replayRequired {
+				e.dropUpstreamConn(sess, conn, "transcript_replay", failure.err, codexDropForRecovery)
+			} else if reason := codexWebsocketUpstreamErrorDropReason(payload, failure.rawErr); reason != "" {
+				e.dropUpstreamConn(sess, conn, reason, failure.rawErr, codexDropQuiet)
+			} else {
+				e.dropUpstreamConn(sess, conn, failure.reason, failure.rawErr, codexDropNotifyDownstream)
 			}
-			if errClearReplay := clearCodexReasoningReplayOnWebsocketError(ctx, replayScope, payload); errClearReplay != nil {
+			unlockSession()
+			var errClearReplay error
+			if failure.isWebsocketError {
+				errClearReplay = clearCodexReasoningReplayOnWebsocketError(ctx, replayScope, payload)
+			} else {
+				errClearReplay = clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, codexWebsocketErrorStatusCode(failure.rawErr), failure.body)
+			}
+			if errClearReplay != nil {
 				return resp, errClearReplay
 			}
-			helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
-			return resp, wsErr
-		}
-		if streamErr, terminalBody, ok := codexTerminalFailureErrWithCooling(payload, e.modelLevelCooling()); ok {
-			if sess != nil {
-				unlockSession()
-				e.invalidateUpstreamConn(sess, conn, "terminal_failure", streamErr)
-			}
-			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
-				return resp, errClearReplay
-			}
-			return resp, streamErr
+			helps.RecordAPIWebsocketError(ctx, e.cfg, failure.reason, failure.err)
+			reporter.PublishFailure(ctx, failure.err)
+			return resp, failure.err
 		}
 
 		sessionReceipt.Observe(payload)
@@ -405,10 +427,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed", "response.done", "response.incomplete":
 			if helps.IsCodexTerminalEmptyIncomplete(payload, len(outputItemsByIndex)+len(outputItemsFallback), sawOutputDelta) {
-				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "terminal_empty_incomplete", nil)
-					unlockSession()
+				mode := codexDropNotifyDownstream
+				if cliproxyexecutor.DownstreamWebsocket(ctx) {
+					mode = codexDropQuiet
 				}
+				e.dropUpstreamConn(sess, conn, "terminal_empty_incomplete", nil, mode)
+				unlockSession()
 				streamErr := newCodexEmptyIncompleteStreamError()
 				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 				reporter.PublishFailure(ctx, streamErr)

@@ -165,9 +165,10 @@ func (m *Manager) withExecutionAuthRefresh(ctx context.Context, opts executionAu
 				updated.NextRefreshAfter = exp
 			}
 		}
-		applyPreservedRejectedTokens(base, updated, true)
+		activeRefreshed := activeCredentialRefreshed(base, updated)
+		applyPreservedRejectedTokens(base, updated, activeRefreshed)
 		canServeWithAccessToken := !updated.RequiresSignIn || updated.HasValidAccessToken(now)
-		if canServeWithAccessToken && (updated.RejectedAccessToken == "" || authAccessToken(updated) != updated.RejectedAccessToken) {
+		if activeRefreshed && canServeWithAccessToken && !authMatchesTokenPartition(updated, updated.RejectedAccessToken) {
 			updated.LastError = nil
 			updated.StatusMessage = ""
 			updated.Unavailable = false

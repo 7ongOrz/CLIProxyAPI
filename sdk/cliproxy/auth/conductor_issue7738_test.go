@@ -88,7 +88,8 @@ func TestIssue7738WrapStreamResultDoesNotRebufferFinishTail(t *testing.T) {
 		OriginalAlias: "my-alias",
 	}
 
-	res := manager.wrapStreamResult(
+	res := manager.wrapStreamResultWithCancel(
+		context.Background(),
 		context.Background(),
 		auth,
 		"antigravity",
@@ -101,6 +102,7 @@ func TestIssue7738WrapStreamResultDoesNotRebufferFinishTail(t *testing.T) {
 		true,
 		cliproxyexecutor.Options{},
 		1,
+		nil,
 	)
 
 	got := string(collectIssue7738Stream(t, res))
@@ -147,7 +149,8 @@ func TestIssue7738WrapStreamResultFlushesUnterminatedFinalEvent(t *testing.T) {
 		OriginalAlias: "my-alias",
 	}
 
-	res := manager.wrapStreamResult(
+	res := manager.wrapStreamResultWithCancel(
+		context.Background(),
 		context.Background(),
 		auth,
 		"antigravity",
@@ -160,6 +163,7 @@ func TestIssue7738WrapStreamResultFlushesUnterminatedFinalEvent(t *testing.T) {
 		true,
 		cliproxyexecutor.Options{},
 		1,
+		nil,
 	)
 
 	got := string(collectIssue7738Stream(t, res))
@@ -214,7 +218,8 @@ func TestIssue7738WrapStreamResultFlushedGluedTailRecordsCompletion(t *testing.T
 		OriginalAlias: "my-alias",
 	}
 
-	res := manager.wrapStreamResult(
+	res := manager.wrapStreamResultWithCancel(
+		context.Background(),
 		context.Background(),
 		auth,
 		"antigravity",
@@ -227,6 +232,7 @@ func TestIssue7738WrapStreamResultFlushedGluedTailRecordsCompletion(t *testing.T
 		true,
 		cliproxyexecutor.Options{},
 		1,
+		nil,
 	)
 
 	got := string(collectIssue7738Stream(t, res))
@@ -278,7 +284,8 @@ func TestIssue7738WrapStreamResultTailRespectsContextCancellation(t *testing.T) 
 			OriginalAlias: "my-alias",
 		}
 
-		res := manager.wrapStreamResult(
+		res := manager.wrapStreamResultWithCancel(
+			ctx,
 			ctx,
 			auth,
 			"antigravity",
@@ -291,6 +298,7 @@ func TestIssue7738WrapStreamResultTailRespectsContextCancellation(t *testing.T) 
 			true,
 			cliproxyexecutor.Options{},
 			1,
+			nil,
 		)
 
 		// Read only the first emitted frame, then wait until the forwarder goroutine

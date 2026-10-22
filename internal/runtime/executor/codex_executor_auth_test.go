@@ -17,7 +17,6 @@ import (
 
 	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/json"
-
 	"github.com/gorilla/websocket"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -869,7 +868,7 @@ func TestCodexWebsocketsExecutorUseSIWCExecuteAndStream(t *testing.T) {
 	preparedDefault, errPrep := wsExecDefault.prepareCodexWebsocketStream(context.Background(), authDefaultURL, cliproxyexecutor.Request{
 		Model:   "gpt-5.4",
 		Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`),
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}, newEphemeralCodexWebsocketSession())
 	if errPrep != nil {
 		t.Fatalf("prepareCodexWebsocketStream (default URL) error: %v", errPrep)
 	}
@@ -918,8 +917,8 @@ func TestCodexWebsocketsExecutorUseSIWCExecuteAndStream(t *testing.T) {
 	if got := gotHeaders.Get("User-Agent"); got != codexSIWCUserAgent(cfgWithRules) {
 		t.Fatalf("User-Agent = %q, want %q", got, codexSIWCUserAgent(cfgWithRules))
 	}
-	if got := gotHeaders.Get("session_id"); got != "ws-sess-456" {
-		t.Fatalf("session_id = %q, want ws-sess-456", got)
+	if got := gotHeaders.Get("Session-Id"); got != "ws-sess-456" {
+		t.Fatalf("Session-Id = %q, want ws-sess-456", got)
 	}
 	if got := gotHeaders.Get("X-Client-Request-Id"); got != "ws-sess-456" {
 		t.Fatalf("X-Client-Request-Id = %q, want ws-sess-456", got)
@@ -1598,7 +1597,7 @@ func TestCodexExecutorCodexClientIgnoresUseSIWC(t *testing.T) {
 			}, cliproxyexecutor.Options{
 				SourceFormat: sdktranslator.FormatOpenAIResponse,
 				Headers:      headers,
-			})
+			}, newEphemeralCodexWebsocketSession())
 			if errPrepWS != nil {
 				t.Fatalf("prepareCodexWebsocketStream error: %v", errPrepWS)
 			}

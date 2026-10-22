@@ -37,6 +37,7 @@ type websocketToolOutputSession struct {
 
 type responsesWebsocketToolCacheTurn struct {
 	sessionKey  string
+	reset       bool
 	outputs     map[string]json.RawMessage
 	outputOrder []string
 	calls       map[string]json.RawMessage
@@ -247,6 +248,11 @@ func newResponsesWebsocketToolCacheTurn(sessionKey string) *responsesWebsocketTo
 	}
 }
 
+func (t *responsesWebsocketToolCacheTurn) resetOnCommit() {
+	if t != nil {
+		t.reset = true
+	}
+}
 func (t *responsesWebsocketToolCacheTurn) recordResponse(payload []byte) {
 	if t == nil || len(payload) == 0 {
 		return
@@ -323,62 +329,63 @@ func (t *responsesWebsocketToolCacheTurn) commit() {
 	defaultWebsocketToolCacheTransactionMu.Lock()
 	defer defaultWebsocketToolCacheTransactionMu.Unlock()
 	if defaultWebsocketToolOutputCache != nil {
+		if t.reset {
+			defaultWebsocketToolOutputCache.deleteSession(t.sessionKey)
+		}
 		for _, callID := range t.outputOrder {
 			defaultWebsocketToolOutputCache.record(t.sessionKey, callID, t.outputs[callID])
 		}
 	}
 	if defaultWebsocketToolCallCache != nil {
+		if t.reset {
+			defaultWebsocketToolCallCache.deleteSession(t.sessionKey)
+		}
 		for _, callID := range t.callOrder {
 			defaultWebsocketToolCallCache.record(t.sessionKey, callID, t.calls[callID])
 		}
 	}
 }
 
-func repairResponsesWebsocketToolCalls(sessionKey string, payload []byte) []byte {
-	return repairResponsesWebsocketToolCallsWithCaches(defaultWebsocketToolOutputCache, defaultWebsocketToolCallCache, sessionKey, payload)
-}
-
 func repairResponsesWebsocketToolCallsWithoutRecording(sessionKey string, payload []byte) []byte {
 	defaultWebsocketToolCacheTransactionMu.RLock()
 	defer defaultWebsocketToolCacheTransactionMu.RUnlock()
-	return repairResponsesWebsocketToolCallsWithCachesMode(defaultWebsocketToolOutputCache, defaultWebsocketToolCallCache, sessionKey, payload, false, nil)
+	return repairResponsesWebsocketToolCallsWithCaches(defaultWebsocketToolOutputCache, defaultWebsocketToolCallCache, sessionKey, payload, nil)
 }
 
-func prepareResponsesWebsocketFallbackTurn(sessionKey string, payload []byte) ([]byte, *responsesWebsocketToolCacheTurn) {
+func prepareResponsesWebsocketFallbackTurn(sessionKey string, payload []byte, reset bool) ([]byte, *responsesWebsocketToolCacheTurn) {
 	turn := newResponsesWebsocketToolCacheTurn(sessionKey)
+	if reset {
+		turn.resetOnCommit()
+	}
 	defaultWebsocketToolCacheTransactionMu.RLock()
 	defer defaultWebsocketToolCacheTransactionMu.RUnlock()
-	payload = repairResponsesWebsocketToolCallsWithCachesMode(
-		defaultWebsocketToolOutputCache,
-		defaultWebsocketToolCallCache,
+	outputCache := defaultWebsocketToolOutputCache
+	callCache := defaultWebsocketToolCallCache
+	if reset {
+		outputCache = nil
+		callCache = nil
+	}
+	payload = repairResponsesWebsocketToolCallsWithCaches(
+		outputCache,
+		callCache,
 		sessionKey,
 		payload,
-		false,
 		turn,
 	)
 	return payload, turn
 }
 
-func repairResponsesWebsocketToolCallsWithCache(cache *websocketToolOutputCache, sessionKey string, payload []byte) []byte {
-	return repairResponsesWebsocketToolCallsWithCaches(cache, nil, sessionKey, payload)
-}
-
-func repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache *websocketToolOutputCache, sessionKey string, payload []byte) []byte {
-	return repairResponsesWebsocketToolCallsWithCachesMode(outputCache, callCache, sessionKey, payload, true, nil)
-}
-
-func repairResponsesWebsocketToolCallsWithCachesMode(
+func repairResponsesWebsocketToolCallsWithCaches(
 	outputCache, callCache *websocketToolOutputCache,
 	sessionKey string,
 	payload []byte,
-	record bool,
 	turn *responsesWebsocketToolCacheTurn,
 ) []byte {
 	if len(payload) == 0 {
 		return payload
 	}
 
-	input, previousResponseID, ok := parseResponsesWebsocketRepairRequest(payload)
+	input, ok := parseResponsesWebsocketRepairRequest(payload)
 	if !ok {
 		return payload
 	}
@@ -394,8 +401,6 @@ func repairResponsesWebsocketToolCallsWithCachesMode(
 		callCache,
 		sessionKey,
 		items,
-		repairEnabled && responsesWebsocketMetadataString(previousResponseID) != "",
-		record && repairEnabled,
 		turn,
 		repairEnabled,
 	)
@@ -414,42 +419,33 @@ func repairResponsesWebsocketToolCallsWithCachesMode(
 	return updated
 }
 
-func parseResponsesWebsocketRepairRequest(payload []byte) (ojson.Result, json.RawMessage, bool) {
+func parseResponsesWebsocketRepairRequest(payload []byte) (ojson.Result, bool) {
 	if !json.Valid(payload) {
-		return ojson.Result{}, nil, false
+		return ojson.Result{}, false
 	}
 	root := util.ParseGJSONBytesNoCopy(payload)
 	if !root.IsObject() {
-		return ojson.Result{}, nil, false
+		return ojson.Result{}, false
 	}
 
 	var input ojson.Result
-	var previousResponseID json.RawMessage
 	inputFound := false
 	valid := true
 	root.ForEach(func(key, value ojson.Result) bool {
-		switch {
-		case strings.EqualFold(key.String(), "input"):
+		if strings.EqualFold(key.String(), "input") {
 			if !value.IsArray() && strings.TrimSpace(value.Raw) != "null" {
 				valid = false
 				return false
 			}
 			input = value
 			inputFound = true
-		case strings.EqualFold(key.String(), "previous_response_id"):
-			var ok bool
-			previousResponseID, ok = responsesWebsocketRawMessageForResult(payload, value)
-			if !ok {
-				valid = false
-				return false
-			}
 		}
 		return true
 	})
 	if !valid || !inputFound || !input.IsArray() {
-		return ojson.Result{}, nil, false
+		return ojson.Result{}, false
 	}
-	return input, previousResponseID, true
+	return input, true
 }
 
 func replaceResponsesWebsocketRawResult(payload []byte, result ojson.Result, replacement []byte) ([]byte, bool) {
@@ -495,43 +491,39 @@ func responsesWebsocketRawMessageForResult(payload []byte, result ojson.Result) 
 	return payload[result.Index : result.Index+len(result.Raw)], true
 }
 
+// repairResponsesToolCallItems repairs complete replay transcripts. Native
+// incremental requests use the separate passthrough path.
 func repairResponsesToolCallItems(
 	outputCache, callCache *websocketToolOutputCache,
 	sessionKey string,
 	items []responsesWebsocketInputItem,
-	allowOrphanOutputs bool,
-	record bool,
 	turn *responsesWebsocketToolCacheTurn,
 	repairEnabled bool,
 ) ([]responsesWebsocketInputItem, error) {
-	if !repairEnabled {
-		return dedupeResponsesWebsocketInputItems(items), nil
-	}
-
-	// First pass: record tool outputs and remember which call_ids have outputs in this payload.
-	outputPresent := make(map[string]struct{}, len(items))
-	callPresent := make(map[string]struct{}, len(items))
 	for _, item := range items {
 		if turn != nil {
 			turn.recordInputItem(item)
 		}
+	}
+	if !repairEnabled {
+		return dedupeResponsesWebsocketInputItems(items)
+	}
+
+	// Collect call IDs present in this payload before repairing pairs.
+	outputPresent := make(map[string]struct{}, len(items))
+	callPresent := make(map[string]struct{}, len(items))
+	for _, item := range items {
 		switch {
 		case isResponsesToolCallOutputType(item.itemType):
 			if item.callID == "" {
 				continue
 			}
 			outputPresent[item.callID] = struct{}{}
-			if record {
-				outputCache.record(sessionKey, item.callID, item.raw)
-			}
 		case isResponsesToolCallType(item.itemType):
 			if item.callID == "" {
 				continue
 			}
 			callPresent[item.callID] = struct{}{}
-			if record && callCache != nil {
-				callCache.record(sessionKey, item.callID, item.raw)
-			}
 		}
 	}
 
@@ -550,11 +542,6 @@ func repairResponsesToolCallItems(
 			}
 
 			if _, ok := callPresent[item.callID]; ok {
-				filtered = append(filtered, item)
-				continue
-			}
-
-			if allowOrphanOutputs {
 				filtered = append(filtered, item)
 				continue
 			}
@@ -593,11 +580,6 @@ func repairResponsesToolCallItems(
 			continue
 		}
 
-		if allowOrphanOutputs {
-			filtered = append(filtered, item)
-			continue
-		}
-
 		if cached, ok := outputCache.get(sessionKey, item.callID); ok {
 			cachedItem, errCached := parseResponsesWebsocketInputItem(cached)
 			if errCached != nil {
@@ -611,7 +593,7 @@ func repairResponsesToolCallItems(
 		// Drop orphaned function_call items; upstream rejects transcripts with missing outputs.
 	}
 
-	return dedupeResponsesWebsocketInputItems(filtered), nil
+	return dedupeResponsesWebsocketInputItems(filtered)
 }
 
 func responsesWebsocketInputItemsEqualRaw(items []responsesWebsocketInputItem, rawItems []json.RawMessage) bool {

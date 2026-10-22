@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -48,10 +49,7 @@ func rejectSyntheticCompactionPreviousResponseID(ctx context.Context, payload []
 		return nil
 	}
 	if cliproxyexecutor.DownstreamWebsocket(ctx) {
-		return &cliproxyexecutor.UpstreamWebsocketTurnError{
-			FullContextRequired: true,
-			EventID:             strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(payload, "event_id").String())),
-		}
+		return cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
 	return statusErr{
 		code: http.StatusBadRequest,
@@ -64,10 +62,7 @@ func validateCodexLocalCompactionSource(ctx context.Context, payload []byte) err
 	reqType := strings.TrimSpace(ojson.GetBytesNoCopy(payload, "type").String())
 	if prevID != "" || reqType == "response.append" {
 		if cliproxyexecutor.DownstreamWebsocket(ctx) {
-			return &cliproxyexecutor.UpstreamWebsocketTurnError{
-				FullContextRequired: true,
-				EventID:             strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(payload, "event_id").String())),
-			}
+			return cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 		}
 		return statusErr{
 			code: http.StatusBadRequest,
@@ -174,8 +169,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if !isCompactionSummary {
 		ensureWebSearchToolForHistoryDoc(doc, opts.Headers)
 	}
-	if !useSIWC {
-		normalizeCodexInstructionsDoc(doc, helps.IsNativeCodexRequest(req.Payload, opts))
+	responsesLite := normalizeCodexResponsesLiteRequestDoc(doc, opts.Headers)
+	if useSIWC {
+		applyCodexSIWCRequestBodyRulesDoc(doc, hasExplicitInstructions, cliproxyexecutor.Options{KeepTopLevelEffort: thinking.HasThinkingSuffix(req.Model)})
+	} else {
+		if !responsesLite {
+			normalizeCodexInstructionsDoc(doc, helps.IsNativeCodexRequest(req.Payload, opts))
+		}
 		if !isCompactionSummary && (e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff) {
 			checkModel := req.Model
 			if strings.TrimSpace(checkModel) == "" {
@@ -186,8 +186,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 				normalizeCodexImageGenerationToolsDoc(doc)
 			}
 		}
-	} else {
-		applyCodexSIWCRequestBodyRulesDoc(doc, hasExplicitInstructions, cliproxyexecutor.Options{KeepTopLevelEffort: thinking.HasThinkingSuffix(req.Model)})
 	}
 	normalizeCodexParallelToolCallsDoc(doc, opts.Headers)
 	helps.NormalizeCodexToolSchemasDoc(doc)
@@ -219,7 +217,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	prepareHeaders := func(request *http.Request) {
 		applyCodexHeaders(request, auth, apiKey, true, e.cfg, opts.Headers)
 		applyCodexRoutingHint(ctx, request.Header, auth, upstreamModel, upstreamBody, opts.Headers)
-		applyModelHeaderOverrides(request.Header, upstreamModel)
+		finalizeCodexHTTPHeaders(ctx, request.Header, auth, useSIWC, upstreamBody, upstreamModel, util.ResolveClientHeaders(request, opts.Headers))
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
@@ -476,19 +474,30 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 
-	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts))
+	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 	_ = doc.Delete("stream")
-	if !codexUseSIWCForRequest(ctx, auth, opts.Headers) {
-		normalizeCodexInstructionsDoc(doc, helps.IsNativeCodexRequest(req.Payload, opts))
-	} else {
+	useSIWC := codexUseSIWCForRequest(ctx, auth, opts.Headers)
+	ensureWebSearchToolForHistoryDoc(doc, opts.Headers)
+	responsesLite := isCodexResponsesLiteRequestDoc(doc, opts.Headers)
+	if responsesLite {
+		_ = doc.Delete("instructions")
+	}
+	if useSIWC {
 		instructionsResult := ojson.GetBytesNoCopy(req.Payload, "instructions")
 		hasExplicitInstructions := instructionsResult.Exists() && strings.TrimSpace(instructionsResult.String()) != ""
 		applyCodexSIWCCompactBodyRulesDoc(doc, hasExplicitInstructions, cliproxyexecutor.Options{KeepTopLevelEffort: thinking.HasThinkingSuffix(req.Model)})
+	} else if !responsesLite {
+		normalizeCodexInstructionsDoc(doc, helps.IsNativeCodexRequest(req.Payload, opts))
 	}
-	ensureWebSearchToolForHistoryDoc(doc, opts.Headers)
-	sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURLDoc(ctx, "codex executor", doc, isCompat, resolveResponsesSignatureTargetModel(baseModel, req, opts), baseURL)
-	normalizeCodexParallelToolCallsDoc(doc, opts.Headers)
+	sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURLDoc(ctx, "codex executor", doc, isCompat, targetModel, baseURL)
+	if responsesLite {
+		if doc.Get("parallel_tool_calls").Exists() {
+			helps.SetBoolIfDifferentDoc(doc, "parallel_tool_calls", false)
+		}
+	} else {
+		normalizeCodexParallelToolCallsForToolsDoc(doc)
+	}
 	helps.NormalizeCodexToolSchemasDoc(doc)
 	optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2RequestForAuthDoc(doc, ctx, opts.Headers, e.cfg, auth, isCompat)
 
@@ -500,10 +509,11 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}
 	body = upstreamBody
 	reporter.SetTranslatedReasoningEffort(upstreamBody, to.String())
+	upstreamModel := strings.TrimSpace(doc.Get("model").String())
 	prepareHeaders := func(request *http.Request) {
 		applyCodexHeaders(request, auth, apiKey, false, e.cfg, opts.Headers)
-		applyCodexRoutingHint(ctx, request.Header, auth, baseModel, upstreamBody, opts.Headers)
-		applyModelHeaderOverrides(request.Header, baseModel)
+		applyCodexRoutingHint(ctx, request.Header, auth, upstreamModel, upstreamBody, opts.Headers)
+		finalizeCodexHTTPHeaders(ctx, request.Header, auth, useSIWC, upstreamBody, upstreamModel, util.ResolveClientHeaders(request, opts.Headers))
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)

@@ -111,13 +111,24 @@ func TestApplyPatchRepairResponsesSourceTerminalHTTP(t *testing.T) {
 				}
 				var output []byte
 				for chunk := range stream.Chunks {
-					if chunk.Err != nil {
-						t.Error(chunk.Err)
+					if errChunk := errors.Join(chunk.Err, chunk.ResultErr); errChunk != nil {
+						t.Error(errChunk)
 					}
 					output = append(output, chunk.Payload...)
 				}
-				if bytes.Contains(output, []byte("response.failed")) || !bytes.Contains(output, []byte("valid patch")) || bytes.Count(output, []byte("[DONE]")) != 1 {
-					t.Fatalf("legal source terminal/first DONE lost: %s", output)
+				if bytes.Contains(output, []byte("response.failed")) || !bytes.Contains(output, []byte("valid patch")) {
+					t.Fatalf("expected a successful patch response: %s", output)
+				}
+				wantDone := 1
+				if provider == "xai" && (mode == "response.completed" || mode == "response.incomplete") {
+					// XAI finishes at the response terminal even while the upstream body remains open.
+					wantDone = 0
+					if !bytes.Contains(output, []byte(`"type":"`+mode+`"`)) {
+						t.Fatalf("expected %s terminal: %s", mode, output)
+					}
+				}
+				if got := bytes.Count(output, []byte("[DONE]")); got != wantDone {
+					t.Fatalf("DONE markers = %d, want %d: %s", got, wantDone, output)
 				}
 			})
 		}

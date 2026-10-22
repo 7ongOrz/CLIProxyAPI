@@ -24,7 +24,8 @@ import (
 // after the test releases the loss, mirroring disconnect teardown winning
 // the race against the handler's error delivery.
 type websocketLossInterruptExecutor struct {
-	lost chan struct{}
+	lost          chan struct{}
+	interruptSeen chan struct{}
 }
 
 func (*websocketLossInterruptExecutor) Identifier() string { return "codex" }
@@ -40,7 +41,11 @@ func (e *websocketLossInterruptExecutor) ExecuteStream(ctx context.Context, _ *c
 		chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.created","response":{"id":"r-ws"}}`)}
 		select {
 		case <-e.lost:
-			chunks <- coreexecutor.StreamChunk{Err: &coreexecutor.UpstreamWebsocketTurnError{Cause: errors.New("upstream websocket lost")}}
+			select {
+			case <-e.interruptSeen:
+				chunks <- coreexecutor.StreamChunk{Err: errors.New("upstream websocket lost")}
+			case <-ctx.Done():
+			}
 		case <-ctx.Done():
 		}
 	}()
@@ -62,6 +67,7 @@ func (*websocketLossInterruptExecutor) HttpRequest(context.Context, *coreauth.Au
 func (e *websocketLossInterruptExecutor) InterruptExecutionSession(context.Context, string, []byte) error {
 	select {
 	case <-e.lost:
+		close(e.interruptSeen)
 		return coreexecutor.ErrNoActiveUpstreamWebsocket
 	default:
 		return errors.New("interrupt reached a live websocket")
@@ -70,12 +76,14 @@ func (e *websocketLossInterruptExecutor) InterruptExecutionSession(context.Conte
 
 // When the upstream websocket dies mid-turn, an interrupt racing the loss
 // delivery must not be answered with a fabricated local incomplete: the turn
-// is websocket-owned, so the client only sees the loss result. The upstream
-// loss is detected through InterruptExecutionSession itself, which makes the
-// interleaving deterministic.
+// is websocket-owned, so the client reconnects after the transport closes.
+// Error delivery waits for InterruptExecutionSession to observe the lost
+// socket, making the interleaving deterministic.
 func TestResponsesInterruptRacingWebsocketLossIsNotAnsweredLocally(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	executor := &websocketLossInterruptExecutor{lost: make(chan struct{})}
+	executor := &websocketLossInterruptExecutor{
+		lost: make(chan struct{}), interruptSeen: make(chan struct{}),
+	}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.SetConfig(nil)
 	manager.RegisterExecutor(executor)
@@ -124,25 +132,19 @@ func TestResponsesInterruptRacingWebsocketLossIsNotAnsweredLocally(t *testing.T)
 	close(executor.lost)
 	send(`{"type":"response.interrupt","response_id":"r-ws"}`)
 
-	// The next downstream message must be the upstream-loss notice, never a
-	// locally fabricated incomplete for r-ws. If the interrupt had been
-	// claimed locally, the forward loop would have cancelled the executor
-	// context and written that incomplete before the loss terminal could
-	// be delivered, so observing the loss notice first also proves the
-	// frame was never locally answered.
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
+	// The fork closes a failed stream after response.created so the client
+	// can reconnect. An interrupt may be rejected first; it must leave the
+	// websocket turn under the executor's ownership until that close.
+	for {
 		_, payload, errNext := client.ReadMessage()
-		if errNext != nil {
-			t.Fatalf("waiting for upstream loss notice: %v", errNext)
-		}
-		eventType := gjson.GetBytes(payload, "type").String()
-		if eventType == "response.incomplete" {
-			t.Fatalf("fabricated local incomplete after websocket loss: %s", payload)
-		}
-		if eventType == "error" && gjson.GetBytes(payload, "error.event_id").String() == "evt-loss" {
+		if websocket.IsCloseError(errNext, websocket.CloseAbnormalClosure) {
 			return
 		}
+		if errNext != nil {
+			t.Fatalf("waiting for upstream loss close: %v", errNext)
+		}
+		if gjson.GetBytes(payload, "type").String() == "response.incomplete" {
+			t.Fatalf("fabricated local incomplete after websocket loss: %s", payload)
+		}
 	}
-	t.Fatal("upstream loss notice was not observed")
 }

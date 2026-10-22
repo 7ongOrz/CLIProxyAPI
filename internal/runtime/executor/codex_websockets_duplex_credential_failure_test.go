@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	auth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	core "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	translator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -21,9 +23,20 @@ import (
 
 func TestCodexDuplexLaterCredentialFailure(t *testing.T) {
 	for _, kind := range []string{"error", "response.failed"} {
-		for _, status := range []int{401, 403, 429} {
-			for _, queued := range []bool{false, true} {
-				t.Run(fmt.Sprintf("%s/%d/queued=%t", kind, status, queued), func(t *testing.T) {
+		for _, status := range []int{401, 402, 403, 429} {
+			for _, scenario := range []struct {
+				name      string
+				queued    bool
+				ambiguous bool
+			}{
+				{name: "current"},
+				{name: "queued", queued: true},
+				{name: "ambiguous", queued: true, ambiguous: true},
+			} {
+				t.Run(fmt.Sprintf("%s/%d/%s", kind, status, scenario.name), func(t *testing.T) {
+					queued := scenario.queued
+					// Native Codex cache keys stay stable across creates on the execution session.
+					wantKey := helps.ProviderSessionUUID("codex", map[string]any{core.ExecutionSessionMetadataKey: t.Name()})
 					var attempts atomic.Int32
 					done := make(chan struct{})
 					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,7 +49,8 @@ func TestCodexDuplexLaterCredentialFailure(t *testing.T) {
 						}
 						defer func() { _ = c.Close() }()
 						_ = c.SetReadDeadline(time.Now().Add(8 * time.Second))
-						if _, _, err = c.ReadMessage(); err != nil {
+						_, request, err := c.ReadMessage()
+						if err != nil {
 							t.Error(err)
 							return
 						}
@@ -46,26 +60,36 @@ func TestCodexDuplexLaterCredentialFailure(t *testing.T) {
 							}
 						}
 						write(`{"type":"response.created","response":{"id":"started","output":[]}}`)
+						failedID := "started"
 						if queued {
-							if _, _, err = c.ReadMessage(); err != nil {
+							_, request, err = c.ReadMessage()
+							if err != nil {
 								t.Error(err)
 								return
 							}
+							failedID = "queued"
 						} else {
 							write(`{"type":"response.completed","response":{"id":"started","output":[]}}`)
 						}
+						if scenario.ambiguous {
+							failedID = ""
+						}
 						errorType := "authentication_error"
+						if status == 402 {
+							errorType = "payment_required"
+						}
 						if status == 403 {
 							errorType = "permission_error"
 						}
 						if status == 429 {
 							errorType = "usage_limit_reached"
 						}
-						errorBody := fmt.Sprintf(`{"type":%q,"status":%d,"message":"credential rejected","resets_in_seconds":3600}`, errorType, status)
+						key := gjson.GetBytes(request, "prompt_cache_key").String()
+						errorBody := fmt.Sprintf(`{"type":%q,"status":%d,"message":%q,"resets_in_seconds":3600}`, errorType, status, "credential rejected for "+key)
 						if kind == "error" {
-							write(fmt.Sprintf(`{"type":"error","status":%d,"headers":{"X-Request-Id":"later-rejection"},"error":%s}`, status, errorBody))
+							write(fmt.Sprintf(`{"type":"error","response_id":%q,"status":%d,"headers":{"X-Request-Id":"later-rejection"},"error":%s}`, failedID, status, errorBody))
 						} else {
-							write(fmt.Sprintf(`{"type":"response.failed","response":{"id":"started","error":%s}}`, errorBody))
+							write(fmt.Sprintf(`{"type":"response.failed","response":{"id":%q,"error":%s}}`, failedID, errorBody))
 						}
 						// The proxy must terminate this still-open socket on its own.
 						_, _, _ = c.ReadMessage()
@@ -78,6 +102,7 @@ func TestCodexDuplexLaterCredentialFailure(t *testing.T) {
 					cfg := &config.Config{}
 					cfg.Codex.ResponseSteering = true
 					cfg.CodexResponseSteering = true
+					cfg.Routing.SessionAffinity = true
 					executor := NewCodexWebsocketsExecutor(cfg)
 					executor.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 					manager := auth.NewManager(nil, &auth.FillFirstSelector{}, nil)
@@ -94,7 +119,7 @@ func TestCodexDuplexLaterCredentialFailure(t *testing.T) {
 							t.Fatal(err)
 						}
 					}
-					req := core.Request{Model: model, Payload: []byte(`{"model":"later-credential-model","input":[]}`)}
+					req := core.Request{Model: model, Payload: []byte(`{"model":"later-credential-model","prompt_cache_key":"first-client-key","input":[]}`)}
 					opts := core.Options{SourceFormat: translator.FromString("codex"), Metadata: map[string]any{core.ExecutionSessionMetadataKey: t.Name()}}
 					before := time.Now()
 					result, err := manager.ExecuteStream(ctx, []string{"codex"}, req, opts)
@@ -116,14 +141,20 @@ func TestCodexDuplexLaterCredentialFailure(t *testing.T) {
 							if !payloadSeen {
 								t.Error("original failure not forwarded before terminal error")
 							}
+							if !strings.Contains(chunk.Err.Error(), "credential rejected for "+wantKey) {
+								t.Errorf("terminal failure lost request identity: %v", chunk.Err)
+							}
 							continue
 						}
 						event := gjson.GetBytes(chunk.Payload, "type").String()
 						if event == "response.created" && queued {
-							input <- core.WebsocketInput{Payload: []byte(`{"type":"response.create","input":[]}`)}
+							input <- core.WebsocketInput{Payload: []byte(`{"type":"response.create","prompt_cache_key":"queued-client-key","input":[]}`)}
 						}
 						if event == kind {
 							payloadSeen = true
+							if !scenario.ambiguous && !strings.Contains(string(chunk.Payload), "credential rejected for "+wantKey) {
+								t.Errorf("failure uses another request's identity: %s", chunk.Payload)
+							}
 						}
 					}
 					if !payloadSeen || !terminalSeen {

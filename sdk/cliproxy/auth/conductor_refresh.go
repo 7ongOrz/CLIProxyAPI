@@ -427,6 +427,19 @@ func authMatchesTokenPartition(auth *Auth, token string) bool {
 	return authAccessToken(auth) == token || authOuterAccessToken(auth) == token
 }
 
+// Recovery follows the rejected credential; use_siwc supplies the default partition.
+func credentialRecoveryUsesSIWC(existing, updated *Auth) bool {
+	if existing.RejectedAccessToken != "" && existing.RejectedAccessToken == authOuterAccessToken(existing) {
+		return false
+	}
+	return IsCodexUseSIWC(updated)
+}
+
+func activeCredentialRefreshed(existing, auth *Auth) bool {
+	return auth.CodexRefreshPatch == nil ||
+		auth.CodexRefreshPatch.RefreshedCredential(auth.Metadata, credentialRecoveryUsesSIWC(existing, auth))
+}
+
 func authRefreshToken(auth *Auth) string {
 	if token := authMetadataString(auth, "refresh_token"); token != "" {
 		return token
@@ -455,22 +468,32 @@ func CredentialsChanged(existing, incoming *Auth) bool {
 	if existing == nil || incoming == nil {
 		return false
 	}
-	if secretGrantChanged(existing, incoming) {
+	if outerCredentialsChanged(existing, incoming) || siwcCredentialsChanged(existing, incoming) ||
+		IsCodexUseSIWC(existing) != IsCodexUseSIWC(incoming) {
 		return true
 	}
 	existingUseSIWC, existingHasUseSIWC := parseBoolAny(existing.Metadata["use_siwc"])
 	incomingUseSIWC, incomingHasUseSIWC := parseBoolAny(incoming.Metadata["use_siwc"])
-	if existingHasUseSIWC != incomingHasUseSIWC || existingUseSIWC != incomingUseSIWC {
-		return true
-	}
-	return false
+	return existingHasUseSIWC != incomingHasUseSIWC || existingUseSIWC != incomingUseSIWC
 }
 
 func secretGrantChanged(existing, incoming *Auth) bool {
-	if existing == nil || incoming == nil {
-		return false
+	return outerCredentialsChanged(existing, incoming) || siwcCredentialsChanged(existing, incoming)
+}
+
+// activeCredentialsChanged reports changes to the credential selected for recovery.
+func activeCredentialsChanged(existing, incoming *Auth) bool {
+	if IsCodexUseSIWC(existing) != IsCodexUseSIWC(incoming) {
+		return true
 	}
-	if authAccessToken(existing) != authAccessToken(incoming) || authOuterAccessToken(existing) != authOuterAccessToken(incoming) {
+	if credentialRecoveryUsesSIWC(existing, incoming) {
+		return siwcCredentialsChanged(existing, incoming)
+	}
+	return outerCredentialsChanged(existing, incoming)
+}
+
+func outerCredentialsChanged(existing, incoming *Auth) bool {
+	if authOuterAccessToken(existing) != authOuterAccessToken(incoming) {
 		return true
 	}
 	if authRefreshToken(existing) != authRefreshToken(incoming) {
@@ -501,16 +524,14 @@ func secretGrantChanged(existing, incoming *Auth) bool {
 	if incomingKey == "" {
 		incomingKey = authMetadataString(incoming, "api_key")
 	}
-	if existingKey != incomingKey {
-		return true
-	}
-	if authSIWCTokenField(existing, "access_token") != authSIWCTokenField(incoming, "access_token") ||
+	return existingKey != incomingKey
+}
+
+func siwcCredentialsChanged(existing, incoming *Auth) bool {
+	return authSIWCTokenField(existing, "access_token") != authSIWCTokenField(incoming, "access_token") ||
 		authSIWCTokenField(existing, "refresh_token") != authSIWCTokenField(incoming, "refresh_token") ||
 		authSIWCTokenField(existing, "id_token") != authSIWCTokenField(incoming, "id_token") ||
-		authSIWCTokenField(existing, "client_id") != authSIWCTokenField(incoming, "client_id") {
-		return true
-	}
-	return false
+		authSIWCTokenField(existing, "client_id") != authSIWCTokenField(incoming, "client_id")
 }
 
 func isSIWCRefreshFailure(err error) bool {
@@ -1144,10 +1165,6 @@ func invalidGrantBackoffDuration(failures int) time.Duration {
 	return backoff
 }
 
-func (m *Manager) refreshAuth(ctx context.Context, id string) {
-	_, _ = m.refreshAuthForRequest(ctx, id, "")
-}
-
 // refreshAuthForRequest performs a synchronous credential refresh for the given auth.
 // failedAccessToken lets concurrent callers reuse a refresh that already replaced the
 // access token that produced the unauthorized response.
@@ -1307,22 +1324,6 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	base := auth.Clone()
 	updated, err := exec.Refresh(ctx, base.Clone())
 	now := time.Now()
-	if err != nil && errors.Is(err, context.Canceled) {
-		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
-		m.mu.Lock()
-		if current := m.auths[id]; current != nil {
-			if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
-				current.NextRefreshAfter = now.Add(time.Second)
-			}
-			m.auths[id] = current
-			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
-			}
-		}
-		m.mu.Unlock()
-		m.queueRefreshReschedule(id)
-		return nil, err
-	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	if err != nil {
 		unauthorized := isUnauthorizedError(err)
@@ -1330,10 +1331,26 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		shouldReschedule := false
 		isDisabled := false
 		shouldUnschedule := false
+		releaseMutation := m.lockAuthMutation(id)
+		defer releaseMutation()
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			if base != nil && (current.RegistrationEpoch != base.RegistrationEpoch || current.CredentialVersion != base.CredentialVersion || secretGrantChanged(base, current)) {
+			// Apply refresh outcomes to the credential that initiated the refresh.
+			if current.RegistrationEpoch != base.RegistrationEpoch ||
+				current.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, current) {
 				m.mu.Unlock()
+				return nil, err
+			}
+			if errors.Is(err, context.Canceled) {
+				if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
+					current.NextRefreshAfter = now.Add(time.Second)
+				}
+				m.auths[id] = current
+				if m.scheduler != nil {
+					m.scheduler.upsertAuth(current.Clone())
+				}
+				m.mu.Unlock()
+				m.queueRefreshReschedule(id)
 				return nil, err
 			}
 			if hasUnauthorizedAuthFailure(current) && !forceRefresh {
@@ -1524,8 +1541,8 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			updated.NextRefreshAfter = exp
 		}
 	}
-	applyPreservedRejectedTokens(base, updated, true)
-	if updated.RejectedAccessToken == "" || authAccessToken(updated) != updated.RejectedAccessToken {
+	applyPreservedRejectedTokens(auth, updated, true)
+	if activeCredentialRefreshed(auth, updated) && !authMatchesTokenPartition(updated, updated.RejectedAccessToken) {
 		updated.LastError = nil
 		updated.StatusMessage = ""
 		updated.Unavailable = false

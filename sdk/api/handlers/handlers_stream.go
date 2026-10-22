@@ -13,6 +13,7 @@ import (
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
 
@@ -196,7 +197,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 				errMsg := executionErrorMessage(chunk.Err)
 				completionOutcome = pluginapi.RequestCompletionFailed
 				completionStatus = errMsg.StatusCode
-				completionErr = chunk.Err
+				completionErr = errMsg.Error
 				select {
 				case errChan <- errMsg:
 				case <-done:
@@ -264,6 +265,9 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 				if streamInterceptorsActive && streamChunkPayloadIncludesHistory(interceptorHost) {
 					historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
 				}
+				if responseProtocol == "openai-response" && openAIResponseStreamCompleted(payload) {
+					return
+				}
 			case <-done:
 				completionOutcome = pluginapi.RequestCompletionCanceled
 				completionStatus = 0
@@ -290,6 +294,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		routeDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
 	}
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
+	singleResponseStream := coreexecutor.WebsocketInputFromContext(ctx) == nil || !coreexecutor.DownstreamWebsocket(ctx)
 	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
@@ -492,6 +497,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	var bootstrapHistoryChunks [][]byte
 	var bootstrapStreamErr error
 	var bootstrapErr *interfaces.ErrorMessage
+	bootstrapResultStatusCode := 0
 	readInitialStreamChunks := func() {
 		for {
 			chunk, ok, canceled := nextStreamChunk(ctx, nil, nil, chunks)
@@ -507,6 +513,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			if chunk.Err != nil {
 				bootstrapStreamErr = chunk.Err
 				return
+			}
+			if chunk.ResultStatusCode > 0 {
+				bootstrapResultStatusCode = chunk.ResultStatusCode
 			}
 			if len(chunk.Payload) == 0 {
 				continue
@@ -572,6 +581,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		streamClosedBeforeRead = false
 		bootstrapStreamErr = nil
 		bootstrapPayload = nil
+		bootstrapResultStatusCode = 0
 		bootstrapChunkIndex = 0
 		bootstrapHistoryChunks = nil
 		if responseSSEValidator != nil {
@@ -636,6 +646,16 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				return true
 			}
 		}
+		markCanceled := func() {
+			if completionOutcome != pluginapi.RequestCompletionSucceeded {
+				return
+			}
+			completionOutcome = pluginapi.RequestCompletionCanceled
+			completionStatus = 0
+			if ctx != nil {
+				completionErr = ctx.Err()
+			}
+		}
 
 		if bootstrapErr != nil {
 			completionOutcome = pluginapi.RequestCompletionFailed
@@ -647,30 +667,30 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			_ = sendErr(bootstrapErr)
 			return
 		}
+		if bootstrapResultStatusCode > 0 {
+			completionOutcome = pluginapi.RequestCompletionFailed
+			completionStatus = bootstrapResultStatusCode
+			completionErr = fmt.Errorf("provider stream failed with status %d", bootstrapResultStatusCode)
+		}
 
 		chunkIndex := bootstrapChunkIndex
 		historyChunks := bootstrapHistoryChunks
 		if bootstrapPayload != nil {
 			if okSendData := sendData(bootstrapPayload); !okSendData {
-				completionOutcome = pluginapi.RequestCompletionCanceled
-				completionStatus = 0
-				if ctx != nil {
-					completionErr = ctx.Err()
-				}
+				markCanceled()
 				return
 			}
 			if streamInterceptorsActive && streamChunkPayloadIncludesHistory(interceptorHost) {
 				historyChunks = appendStreamInterceptorHistory(historyChunks, bootstrapPayload)
 			}
+			if singleResponseStream && responseProtocol == "openai-response" && openAIResponseStreamCompleted(bootstrapPayload) {
+				return
+			}
 		}
 		for {
 			chunk, ok, canceled := nextStreamChunk(ctx, nil, &streamClosedBeforeRead, chunks)
 			if canceled {
-				completionOutcome = pluginapi.RequestCompletionCanceled
-				completionStatus = 0
-				if ctx != nil {
-					completionErr = ctx.Err()
-				}
+				markCanceled()
 				return
 			}
 			if !ok {
@@ -693,6 +713,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				_ = sendErr(errMsg)
 				return
 			}
+			if chunk.ResultStatusCode > 0 {
+				completionOutcome = pluginapi.RequestCompletionFailed
+				completionStatus = chunk.ResultStatusCode
+				completionErr = fmt.Errorf("provider stream failed with status %d", chunk.ResultStatusCode)
+			}
 			if len(chunk.Payload) == 0 {
 				continue
 			}
@@ -708,19 +733,32 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				continue
 			}
 			if okSendData := sendData(payload); !okSendData {
-				completionOutcome = pluginapi.RequestCompletionCanceled
-				completionStatus = 0
-				if ctx != nil {
-					completionErr = ctx.Err()
-				}
+				markCanceled()
 				return
 			}
 			if streamInterceptorsActive && streamChunkPayloadIncludesHistory(interceptorHost) {
 				historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
 			}
+			if singleResponseStream && responseProtocol == "openai-response" && openAIResponseStreamCompleted(payload) {
+				return
+			}
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
+}
+
+func openAIResponseStreamCompleted(chunk []byte) bool {
+	for _, frame := range bytes.Split(chunk, []byte("\n\n")) {
+		payload, hasData := sseJSONValidationDataPayload(frame)
+		if !hasData {
+			payload = frame
+		}
+		eventType := gjson.GetBytes(payload, "type").String()
+		if eventType == "response.completed" || eventType == "response.done" {
+			return true
+		}
+	}
+	return false
 }
 
 type sseJSONValidationState struct {
@@ -839,14 +877,6 @@ func validateSSEFrameDataJSON(frame []byte) error {
 		preview = preview[:max]
 	}
 	return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(payload), preview)
-}
-
-func validateSSEDataJSON(chunk []byte) error {
-	state := &sseJSONValidationState{}
-	if _, errAdd := state.AddChunk(chunk); errAdd != nil {
-		return errAdd
-	}
-	return state.Finish()
 }
 
 // streamDeliveryCompletion reconciles execution cleanup with the HTTP outcome.

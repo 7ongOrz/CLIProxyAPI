@@ -99,10 +99,6 @@ func providerCoolingOverrideForAuth(auth *Auth, cfg *internalconfig.Config) (boo
 	return *entry.DisableCooling, true
 }
 
-func nextTransientErrorRetryAfter(now time.Time) time.Time {
-	return recoverableFailureRetryAfterWithHint(now, nil, false)
-}
-
 func recoverableFailureRetryAfter(now time.Time, disableCooling bool) time.Time {
 	return recoverableFailureRetryAfterWithHint(now, nil, disableCooling)
 }
@@ -901,6 +897,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 	}
+	if !result.Success && statusCodeFromResult(result.Error) == http.StatusUpgradeRequired {
+		m.recordAvailabilityNeutralResult(ctx, result)
+		return
+	}
 	modelKey := canonicalModelKey(result.Model)
 
 	var authSnapshot *Auth
@@ -1671,56 +1671,6 @@ func isModelStateActiveCooldown(state *ModelState, now time.Time) bool {
 		return true
 	}
 	return false
-}
-
-func (m *Manager) registryModelsForAuthAndModel(auth *Auth, authID, modelKey string) []string {
-	authID = strings.TrimSpace(authID)
-	modelKey = strings.TrimSpace(modelKey)
-	if authID == "" && auth != nil {
-		authID = auth.ID
-	}
-	if auth == nil && m != nil && authID != "" {
-		m.mu.RLock()
-		auth = m.auths[authID]
-		m.mu.RUnlock()
-	}
-	if authID == "" || modelKey == "" {
-		return nil
-	}
-
-	targetCanonical := canonicalModelKey(modelKey)
-	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(authID)
-	if len(supportedModels) == 0 {
-		return nil
-	}
-
-	out := make([]string, 0, len(supportedModels))
-	seen := make(map[string]struct{}, len(supportedModels))
-
-	for _, model := range supportedModels {
-		if model == nil || strings.TrimSpace(model.ID) == "" {
-			continue
-		}
-		regModelID := strings.TrimSpace(model.ID)
-		stateKey := ""
-		if m != nil {
-			stateKey = m.selectionModelKeyForAuth(auth, regModelID)
-		}
-		if stateKey == "" {
-			stateKey = canonicalModelKey(regModelID)
-		}
-		if stateKey == targetCanonical {
-			if _, exists := seen[regModelID]; !exists {
-				seen[regModelID] = struct{}{}
-				out = append(out, regModelID)
-			}
-		}
-	}
-
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 func modelStateIsClean(state *ModelState) bool {

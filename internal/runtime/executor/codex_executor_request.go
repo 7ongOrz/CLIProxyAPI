@@ -29,18 +29,15 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
-	codexOriginator            = "codex-tui"
-	codexDefaultImageToolModel = "gpt-image-2"
-	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
+	codexUserAgent                = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
+	codexOriginator               = "codex-tui"
+	codexDefaultImageToolModel    = "gpt-image-2"
+	codexTurnStateHeader          = "X-Codex-Turn-State"
+	codexResponsesLiteHeader      = "X-OpenAI-Internal-Codex-Responses-Lite"
+	codexResponsesLiteMetadataKey = "ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
 var dataTag = []byte("data:")
-
-func translateCodexRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool, preserveEmptyThinkingBlocks ...bool) ([]byte, []byte) {
-	original, body, _, _ := translateCodexRequestPairWithUpdateIntent(from, to, model, originalPayload, payload, stream, preserveEmptyThinkingBlocks...)
-	return original, body
-}
 
 func translateCodexRequestPairWithUpdateIntent(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool, preserveEmptyThinkingBlocks ...bool) ([]byte, []byte, bool, error) {
 	isCompat := len(preserveEmptyThinkingBlocks) > 0 && preserveEmptyThinkingBlocks[0]
@@ -334,9 +331,6 @@ func applyModelHeaderOverrides(headers http.Header, modelName string) {
 	for key, value := range overrides {
 		headers.Set(key, value)
 	}
-	if strings.Contains(headers.Get("User-Agent"), "Mac OS") && codexSessionHeaderValue(headers) == "" {
-		headers.Set("Session_id", uuid.NewString())
-	}
 }
 
 // applyCodexDirectImageHeaders sets Codex upstream headers for direct /images/* calls.
@@ -437,18 +431,24 @@ func applyCodexHeadersWithSIWC(r *http.Request, auth *cliproxyauth.Auth, useSIWC
 	if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
 	}
+	misc.EnsureHeader(r.Header, ginHeaders, codexTurnStateHeader, "")
+	misc.EnsureHeader(r.Header, ginHeaders, codexResponsesLiteHeader, "")
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-State", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Parent-Thread-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Installation-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-OpenAI-Subagent", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "Session-Id", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Openai-Internal-Codex-Responses-Lite", "")
-
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 
+	if sessionID := codexSessionHeaderValue(ginHeaders); sessionID != "" {
+		setCodexSessionHeader(r.Header, sessionID)
+	}
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 	} else {
@@ -557,6 +557,72 @@ func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config, auth *cl
 	headers.Set("Originator", codexOriginator)
 }
 
+func applyCodexClientMetadataCompatibilityHeaders(headers http.Header, body []byte, clientHeaders http.Header) {
+	if headers == nil || len(body) == 0 {
+		return
+	}
+	clientMetadata := gjson.GetBytes(body, "client_metadata")
+	if !clientMetadata.IsObject() {
+		return
+	}
+	setMetadataHeader := func(metadataKey string, headerName string) {
+		if value := strings.TrimSpace(clientMetadata.Get(metadataKey).String()); value != "" {
+			headers.Set(headerName, value)
+		}
+	}
+	if turnMetadata := strings.TrimSpace(clientMetadata.Get("x-codex-turn-metadata").String()); turnMetadata != "" {
+		headers.Set("X-Codex-Turn-Metadata", codexCompatibilityTurnMetadata(turnMetadata))
+	}
+	setMetadataHeader("x-codex-window-id", "X-Codex-Window-Id")
+	setMetadataHeader("x-codex-parent-thread-id", "X-Codex-Parent-Thread-Id")
+	setMetadataHeader("x-openai-subagent", "X-OpenAI-Subagent")
+	// Root agents retain their explicit routing session, including fork overrides.
+	// Cache keys are independent; child and internal agents use their own identity.
+	sessionID := strings.TrimSpace(clientMetadata.Get("session_id").String())
+	if headers.Get("X-OpenAI-Subagent") == "" {
+		if routingSessionID := codexSessionHeaderValue(clientHeaders); routingSessionID != "" {
+			sessionID = routingSessionID
+		}
+	}
+	if sessionID != "" {
+		setCodexSessionHeader(headers, sessionID)
+	}
+	if threadID := strings.TrimSpace(clientMetadata.Get("thread_id").String()); threadID != "" {
+		headers.Set("Thread-Id", threadID)
+		headers.Set("X-Client-Request-Id", threadID)
+	}
+}
+
+func codexCompatibilityTurnMetadata(turnMetadata string) string {
+	if !gjson.Get(turnMetadata, "tool_namespaces_info").Exists() {
+		return turnMetadata
+	}
+	updated, errDelete := sjson.Delete(turnMetadata, "tool_namespaces_info")
+	if errDelete != nil {
+		return turnMetadata
+	}
+	return updated
+}
+
+func applyCodexHTTPClientMetadataHeaders(headers http.Header, body []byte, clientHeaders http.Header) {
+	applyCodexClientMetadataCompatibilityHeaders(headers, body, clientHeaders)
+	clientMetadata := gjson.GetBytes(body, "client_metadata")
+	if !clientMetadata.IsObject() {
+		return
+	}
+	if turnState := strings.TrimSpace(clientMetadata.Get("x-codex-turn-state").String()); turnState != "" {
+		headers.Set(codexTurnStateHeader, turnState)
+	}
+	if strings.EqualFold(strings.TrimSpace(clientMetadata.Get(codexResponsesLiteMetadataKey).String()), "true") {
+		headers.Set(codexResponsesLiteHeader, "true")
+	}
+}
+
+func finalizeCodexHTTPHeaders(headers http.Header, body []byte, modelName string, clientHeaders http.Header) {
+	applyCodexHTTPClientMetadataHeaders(headers, body, clientHeaders)
+	applyModelHeaderOverrides(headers, modelName)
+}
+
 func normalizeCodexInstructions(body []byte, nativeRequest ...bool) []byte {
 	if len(nativeRequest) > 0 && nativeRequest[0] {
 		return body
@@ -566,6 +632,16 @@ func normalizeCodexInstructions(body []byte, nativeRequest ...bool) []byte {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
 	return body
+}
+
+func normalizeCodexResponsesLiteRequest(body []byte, headers http.Header) ([]byte, bool) {
+	responsesLite := util.IsCodexResponsesLiteRequest(body, headers)
+	if !responsesLite {
+		return body, false
+	}
+	body, _ = sjson.DeleteBytes(body, "instructions")
+	body, _ = sjson.SetBytes(body, "parallel_tool_calls", false)
+	return body, true
 }
 
 var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
@@ -723,10 +799,6 @@ func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
 
 	body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
 	return body
-}
-
-func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {
-	publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, completedData, nil, nil)
 }
 
 func publishCodexImageToolUsageWithOutputItems(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte, itemsByIndex map[int64][]byte, fallback [][]byte) {

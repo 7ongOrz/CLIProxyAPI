@@ -7,9 +7,11 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
 )
 
 func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, metadata map[string]any) bool {
@@ -41,23 +43,17 @@ func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, met
 	return false
 }
 
-func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputForModel(modelName string) bool {
-	auths, _ := h.responsesWebsocketAvailableAuthsForModel(modelName)
-	for _, auth := range auths {
-		if responsesWebsocketAuthSupportsIncrementalInput(auth) {
-			return true
-		}
+func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsCompactionReplayForModel(modelName string, payload []byte) bool {
+	if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		return false
 	}
-	return false
-}
-
-func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsCompactionReplayForModel(modelName string) bool {
 	auths, _ := h.responsesWebsocketAvailableAuthsForModel(modelName)
 	if len(auths) == 0 {
 		return false
 	}
+	provider := strings.TrimSpace(auths[0].Provider)
 	for _, auth := range auths {
-		if !responsesWebsocketAuthSupportsCompactionReplay(auth) {
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), provider) || !responsesWebsocketAuthSupportsCompactionReplay(auth, payload) {
 			return false
 		}
 	}
@@ -85,10 +81,6 @@ func (h *OpenAIResponsesAPIHandler) responsesWebsocketAvailableAuthsForModel(mod
 		available = append(available, auth)
 	}
 	return available, modelKey
-}
-
-func (h *OpenAIResponsesAPIHandler) responsesWebsocketUsesCodexWebsocketPassthrough(modelName string) bool {
-	return h.responsesWebsocketUsesUpstreamWebsocketPassthrough(modelName)
 }
 
 func (h *OpenAIResponsesAPIHandler) responsesWebsocketUsesUpstreamWebsocketPassthrough(modelName string) bool {
@@ -136,18 +128,15 @@ func responsesWebsocketPinnedAuthMatchesModel(auth *coreauth.Auth, modelName str
 		return false
 	}
 	providerSet, modelKey := responsesWebsocketProviderSetForModel(responsesWebsocketResolvedModelName(modelName))
-	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if !homeRuntime || len(providerSet) > 0 {
-		if _, ok := providerSet[providerKey]; !ok {
-			return false
-		}
-	}
 	if !responsesWebsocketAuthAvailableForModel(auth, modelKey, time.Now()) {
 		return false
 	}
-
 	if homeRuntime {
 		return strings.EqualFold(strings.TrimSpace(pinnedModelKey), strings.TrimSpace(modelKey))
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if _, ok := providerSet[providerKey]; !ok {
+		return false
 	}
 	return registry.GetGlobalRegistry().ClientSupportsModel(auth.ID, modelKey)
 }
@@ -200,11 +189,33 @@ func responsesWebsocketAuthMatchesModel(auth *coreauth.Auth, providerSet map[str
 	return responsesWebsocketAuthAvailableForModel(auth, modelKey, now)
 }
 
-func responsesWebsocketAuthSupportsCompactionReplay(auth *coreauth.Auth) bool {
+func responsesWebsocketAuthSupportsCompactionReplay(auth *coreauth.Auth, payload []byte) bool {
 	if auth == nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
+	return responsesWebsocketProviderSupportsCompactionReplay(auth.Provider, payload)
+}
+
+func responsesWebsocketProviderSupportsCompactionReplay(provider string, payload []byte) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		return true
+	case "claude", "kimi", "meta":
+		// These executors expand CPA capsules into request history.
+		hasCapsule := false
+		for _, item := range gjson.GetBytes(payload, "input").Array() {
+			itemType := item.Get("type").String()
+			if isResponsesWebsocketCompactionReplayItemType(itemType) {
+				if itemType != "compaction" || !helps.RecognizedAntigravityCompactionCapsule(item.Get("encrypted_content").String()) {
+					return false
+				}
+				hasCapsule = true
+			}
+		}
+		return hasCapsule
+	default:
+		return false
+	}
 }
 
 func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {

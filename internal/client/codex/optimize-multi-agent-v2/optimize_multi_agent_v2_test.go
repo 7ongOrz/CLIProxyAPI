@@ -70,13 +70,23 @@ func TestIsCodexMultiAgentClient(t *testing.T) {
 	}
 }
 
-func TestCodexSpawnAgentModelsFromSourcesIncludesModelMetadata(t *testing.T) {
+func TestCodexSpawnAgentModelsFromTemplatesIncludesModelMetadata(t *testing.T) {
 	t.Parallel()
 
-	catalog := []byte(`{"models":[
-		{"slug":"model-template","display_name":"Template","description":"Template model.","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"}],"service_tiers":[{"id":"priority"}],"priority":1},
-		{"slug":"gpt-5.5","display_name":"Default","description":"Default model.","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}],"service_tiers":[{"id":"priority"}],"priority":2}
-	]}`)
+	templates := map[string]map[string]any{
+		"model-template": {
+			"slug": "model-template", "display_name": "Template", "description": "Template model.",
+			"default_reasoning_level": "low", "priority": 1,
+			"supported_reasoning_levels": []any{map[string]any{"effort": "low"}, map[string]any{"effort": "medium"}},
+			"service_tiers":              []any{map[string]any{"id": "priority"}},
+		},
+		"gpt-5.5": {
+			"slug": "gpt-5.5", "display_name": "Default", "description": "Default model.",
+			"default_reasoning_level": "medium", "priority": 2,
+			"supported_reasoning_levels": []any{map[string]any{"effort": "low"}, map[string]any{"effort": "medium"}, map[string]any{"effort": "high"}},
+			"service_tiers":              []any{map[string]any{"id": "priority"}},
+		},
+	}
 	available := []map[string]any{
 		{"id": "custom-model", "display_name": "Custom", "description": "Registry description."},
 		{"id": "model-template"},
@@ -94,7 +104,7 @@ func TestCodexSpawnAgentModelsFromSourcesIncludesModelMetadata(t *testing.T) {
 		}
 	}
 
-	models := codexSpawnAgentModelsFromSources(available, catalog, lookup)
+	models := codexSpawnAgentModelsFromTemplates(available, templates, templates["gpt-5.5"], lookup)
 	if len(models) != 2 {
 		t.Fatalf("model count = %d, want 2", len(models))
 	}
@@ -118,16 +128,18 @@ func TestCodexSpawnAgentModelsFromSourcesIncludesModelMetadata(t *testing.T) {
 		t.Fatalf("custom service tiers = %v, want none", custom.serviceTiers)
 	}
 
-	catalogWithoutGPT55 := []byte(`{"models":[
-		{"slug":"gpt-6.1-sol","display_name":"First Fallback","description":"First fallback model.","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"service_tiers":[{"id":"priority"}],"priority":1},
-		{"slug":"gpt-5.6-sol","display_name":"Second","description":"Second model.","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"medium"}],"priority":2}
-	]}`)
-	fallbackModels := codexSpawnAgentModelsFromSources([]map[string]any{{"id": "third-party-model"}}, catalogWithoutGPT55, nil)
+	fallbackTemplate := map[string]any{
+		"slug": "gpt-6.1-sol", "display_name": "Fallback", "description": "Fallback model.",
+		"default_reasoning_level": "high", "priority": 1,
+		"supported_reasoning_levels": []any{map[string]any{"effort": "low"}, map[string]any{"effort": "high"}},
+		"service_tiers":              []any{map[string]any{"id": "priority"}},
+	}
+	fallbackModels := codexSpawnAgentModelsFromTemplates([]map[string]any{{"id": "third-party-model"}}, nil, fallbackTemplate, nil)
 	if len(fallbackModels) != 1 {
 		t.Fatalf("fallback model count = %d, want 1", len(fallbackModels))
 	}
 	if fallbackModels[0].id != "third-party-model" || fallbackModels[0].defaultReasoningEffort != "high" {
-		t.Fatalf("fallback model = %+v, want defaultReasoningEffort=high from first template", fallbackModels[0])
+		t.Fatalf("fallback model = %+v, want defaultReasoningEffort=high from supplied template", fallbackModels[0])
 	}
 }
 
@@ -291,6 +303,74 @@ func TestOptimizeCodexCollaborationNamespaceWithoutModels(t *testing.T) {
 	}
 	if namespace := gjson.GetBytes(got, "tools.0.name").String(); namespace != codexOptimizedCollaborationNamespace {
 		t.Fatalf("namespace = %q, want collaboration-optimize", namespace)
+	}
+}
+
+func TestOptimizeCodexCollaborationNamespaceUpdatesToolMetadata(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent"}]}],
+		"client_metadata":{"x-codex-turn-metadata":"{\"sandbox_mode\":\"workspace-write\",\"tool_namespaces_info\":{\"collaboration\":{\"name\":\"collaboration\",\"functions\":{\"spawn_agent\":{\"name\":\"spawn_agent\",\"direct\":true,\"code_mode_name\":\"collaboration__spawn_agent\"}}},\"mcp__notes\":{\"name\":\"mcp__notes\",\"functions\":{}}}}"}
+	}`)
+	got, optimized := optimizeCodexCollaborationNamespace(payload, codexSpawnAgentToolPaths(payload))
+	if !optimized {
+		t.Fatal("collaboration namespace was not optimized")
+	}
+
+	turnMetadata := gjson.GetBytes(got, "client_metadata.x-codex-turn-metadata").String()
+	if gjson.Get(turnMetadata, "tool_namespaces_info.collaboration").Exists() {
+		t.Fatalf("original collaboration metadata was retained: %s", turnMetadata)
+	}
+	optimizedMetadata := gjson.Get(turnMetadata, "tool_namespaces_info.collaboration-optimize")
+	if optimizedMetadata.Get("name").String() != codexOptimizedCollaborationNamespace {
+		t.Fatalf("optimized namespace metadata = %s", optimizedMetadata.Raw)
+	}
+	if gotCodeModeName := optimizedMetadata.Get("functions.spawn_agent.code_mode_name").String(); gotCodeModeName != "collaboration-optimize__spawn_agent" {
+		t.Fatalf("code_mode_name = %q, want collaboration-optimize__spawn_agent", gotCodeModeName)
+	}
+	if !gjson.Get(turnMetadata, "tool_namespaces_info.mcp__notes").Exists() {
+		t.Fatalf("unrelated namespace metadata was removed: %s", turnMetadata)
+	}
+	if gotSandboxMode := gjson.Get(turnMetadata, "sandbox_mode").String(); gotSandboxMode != "workspace-write" {
+		t.Fatalf("sandbox_mode = %q, want workspace-write", gotSandboxMode)
+	}
+}
+
+func TestOptimizeCodexMultiAgentV2RequestRewritesReplayHistory(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent"}]}],
+		"input":[
+			{"type":"function_call","namespace":"collaboration","name":"spawn_agent","arguments":"{\"namespace\":\"collaboration\"}"},
+			{"type":"custom_tool_call","name":"collaboration__send_message","input":"collaboration__send_message"},
+			{"type":"function_call_output","output":"collaboration__send_message"}
+		]
+	}`)
+	headers := http.Header{"User-Agent": []string{"codex-tui/0.145.0"}}
+	cfg := &config.Config{SDKConfig: config.SDKConfig{Client: config.ClientConfig{Codex: config.CodexClientConfig{OptimizeMultiAgentV2: true}}}}
+	got, optimized := OptimizeCodexMultiAgentV2Request(context.Background(), headers, payload, cfg)
+	if !optimized {
+		t.Fatal("collaboration namespace was not optimized")
+	}
+	if namespace := gjson.GetBytes(got, "tools.0.name").String(); namespace != codexOptimizedCollaborationNamespace {
+		t.Fatalf("tool namespace = %q, want %q", namespace, codexOptimizedCollaborationNamespace)
+	}
+	if namespace := gjson.GetBytes(got, "input.0.namespace").String(); namespace != codexOptimizedCollaborationNamespace {
+		t.Fatalf("history namespace = %q, want %q", namespace, codexOptimizedCollaborationNamespace)
+	}
+	if name := gjson.GetBytes(got, "input.1.name").String(); name != "collaboration-optimize__send_message" {
+		t.Fatalf("history name = %q, want collaboration-optimize__send_message", name)
+	}
+	if arguments := gjson.GetBytes(got, "input.0.arguments").String(); arguments != `{"namespace":"collaboration"}` {
+		t.Fatalf("opaque arguments changed: %q", arguments)
+	}
+	if input := gjson.GetBytes(got, "input.1.input").String(); input != "collaboration__send_message" {
+		t.Fatalf("opaque custom tool input changed: %q", input)
+	}
+	if output := gjson.GetBytes(got, "input.2.output").String(); output != "collaboration__send_message" {
+		t.Fatalf("tool output changed: %q", output)
 	}
 }
 
@@ -1222,4 +1302,22 @@ func BenchmarkOptimizeCodexMultiAgentV2Request(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		OptimizeCodexMultiAgentV2Request(ctx, headers, payload, cfg)
 	}
+}
+
+func codexSpawnAgentModelsForRequest(ctx context.Context, headers http.Header, homeEnabled bool) []codexSpawnAgentModel {
+	models, _ := codexSpawnAgentModelsAndMarkdownForRequest(ctx, headers, homeEnabled)
+	return models
+}
+
+func formatCodexSpawnAgentModelsForRequest(ctx context.Context, headers http.Header, homeEnabled bool) string {
+	_, formatted := codexSpawnAgentModelsAndMarkdownForRequest(ctx, headers, homeEnabled)
+	return formatted
+}
+
+func rewriteCodexSpawnAgentDescription(payload []byte, models []codexSpawnAgentModel) []byte {
+	return rewriteCodexSpawnAgentTools(payload, codexSpawnAgentToolPaths(payload), models)
+}
+
+func rewriteCodexSpawnAgentTools(payload []byte, toolPaths []string, models []codexSpawnAgentModel) []byte {
+	return rewriteCodexCollaborationTools(payload, toolPaths, toolPaths, models, "")
 }

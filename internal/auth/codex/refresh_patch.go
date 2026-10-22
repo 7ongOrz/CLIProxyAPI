@@ -291,6 +291,17 @@ func (p *CredentialRefreshPatch) CanApplyTo(disk map[string]any) bool {
 	return false
 }
 
+// RefreshedCredential reports whether the selected credential matches a successful
+// refresh result, including refreshes that retain the same access token.
+func (p *CredentialRefreshPatch) RefreshedCredential(metadata map[string]any, useSIWC bool) bool {
+	after := p.outerAfter
+	if useSIWC {
+		metadata, _ = metadata["siwc"].(map[string]any)
+		after = p.siwcAfter
+	}
+	return after != nil && sameCredentialVersion(metadata, after)
+}
+
 // Apply overlays successful refreshes on the locked disk snapshot. A partition
 // rotated since refresh began is retained, without blocking the other partition.
 func (p *CredentialRefreshPatch) Apply(disk map[string]any) map[string]any {

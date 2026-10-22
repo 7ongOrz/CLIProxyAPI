@@ -18,11 +18,6 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header) {
-	body, headers, _ := applyCodexPromptCacheHeadersWithContext(context.Background(), from, req, rawJSON)
-	return body, headers
-}
-
 func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, headerSets ...http.Header) ([]byte, http.Header, error) {
 	headers := http.Header{}
 	if len(rawJSON) == 0 {
@@ -57,8 +52,7 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 
 	if cache.ID != "" {
 		rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", cache.ID)
-		setHeaderCasePreserved(headers, "session_id", cache.ID)
-		headers.Set("Conversation_id", cache.ID)
+		setCodexSessionHeader(headers, cache.ID)
 	}
 
 	return rawJSON, headers, nil
@@ -112,7 +106,11 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
+	misc.EnsureHeader(headers, ginHeaders, "x-codex-window-id", "")
+	misc.EnsureHeader(headers, ginHeaders, "x-codex-parent-thread-id", "")
+	misc.EnsureHeader(headers, ginHeaders, "x-openai-subagent", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
+	misc.EnsureHeader(headers, ginHeaders, "thread-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
 	if nativeRequest {
@@ -136,8 +134,8 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
 		sessionFallback = uuid.NewString()
 	}
-	ensureCodexWebsocketSessionHeader(headers, ginHeaders, sessionFallback)
 	if nativeRequest && isCodexCloakingDisabled(cfg, auth) {
+		sessionFallback = ""
 		deleteHeaderCaseInsensitive(headers, "session_id")
 		deleteHeaderCaseInsensitive(headers, "conversation_id")
 		for key, values := range ginHeaders {
@@ -170,8 +168,15 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	req := (&http.Request{Header: headers}).WithContext(ctx)
 	util.ApplyCustomHeadersFromAttrs(req, attrs, ginHeaders)
 	applyCodexCloakingHeaders(headers, cfg, auth)
+	ensureCodexWebsocketSessionHeader(headers, ginHeaders, sessionFallback)
 
 	return headers
+}
+
+func finalizeCodexWebsocketHeaders(headers http.Header, body []byte, modelName string, clientHeaders http.Header) {
+	applyCodexClientMetadataCompatibilityHeaders(headers, body, clientHeaders)
+	applyModelHeaderOverrides(headers, modelName)
+	ensureCodexWebsocketSessionHeader(headers, nil, "")
 }
 
 func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, fallbackValue string) {
@@ -185,14 +190,12 @@ func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, f
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(fallbackValue)
 	}
-	if sessionID != "" {
-		setHeaderCasePreserved(target, "session_id", sessionID)
-	}
-	deleteHeaderCaseInsensitive(target, "Session-Id")
+	setCodexSessionHeader(target, sessionID)
+	deleteHeaderCaseInsensitive(target, "Conversation_id")
 }
 
 func codexSessionHeaderValue(headers http.Header) string {
-	for _, key := range []string{"Session-Id", "Session_id", "session_id"} {
+	for _, key := range []string{"Session-Id", "Session_id"} {
 		if value := strings.TrimSpace(headerValueCaseInsensitive(headers, key)); value != "" {
 			return value
 		}
@@ -213,28 +216,6 @@ func codexAuthUsesAPIKey(auth *cliproxyauth.Auth) bool {
 	return false
 }
 
-func ensureHeaderCasePreserved(target http.Header, source http.Header, key, configValue, fallbackValue string) {
-	if target == nil {
-		return
-	}
-	if strings.TrimSpace(headerValueCaseInsensitive(target, key)) != "" {
-		return
-	}
-	if source != nil {
-		if val := strings.TrimSpace(headerValueCaseInsensitive(source, key)); val != "" {
-			setHeaderCasePreserved(target, key, val)
-			return
-		}
-	}
-	if val := strings.TrimSpace(configValue); val != "" {
-		setHeaderCasePreserved(target, key, val)
-		return
-	}
-	if val := strings.TrimSpace(fallbackValue); val != "" {
-		setHeaderCasePreserved(target, key, val)
-	}
-}
-
 func setHeaderCasePreserved(headers http.Header, key string, value string) {
 	if headers == nil {
 		return
@@ -248,45 +229,21 @@ func setHeaderCasePreserved(headers http.Header, key string, value string) {
 	headers[key] = []string{value}
 }
 
-func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string, value string) {
+func setCodexSessionHeader(headers http.Header, value string) {
 	if headers == nil {
 		return
 	}
-	fallbackKey = strings.TrimSpace(fallbackKey)
-	value = strings.TrimSpace(value)
-	if fallbackKey == "" || value == "" {
-		return
-	}
-
-	selectedKey := ""
-	if _, ok := headers[fallbackKey]; ok && codexSessionHeaderKeyUsesUnderscore(fallbackKey) {
-		selectedKey = fallbackKey
-	} else {
-		for existingKey := range headers {
-			if codexSessionHeaderKeyUsesUnderscore(existingKey) {
-				selectedKey = existingKey
-				break
-			}
-		}
-	}
-	if selectedKey == "" {
-		selectedKey = fallbackKey
-	}
 	for existingKey := range headers {
-		if codexSessionHeaderKey(existingKey) && existingKey != selectedKey {
+		if codexSessionHeaderKey(existingKey) {
 			delete(headers, existingKey)
 		}
 	}
-	headers[selectedKey] = []string{value}
+	setHeaderCasePreserved(headers, "Session-Id", value)
 }
 
 func codexSessionHeaderKey(key string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	return normalized == "session_id" || normalized == "session-id"
-}
-
-func codexSessionHeaderKeyUsesUnderscore(key string) bool {
-	return strings.ToLower(strings.TrimSpace(key)) == "session_id"
 }
 
 func headerValueCaseInsensitive(headers http.Header, key string) string {

@@ -29,12 +29,15 @@ func TestResponsesSteeringErrorRecoveryIntegration(t *testing.T) {
 		name                            string
 		enabled, initial, upstreamClose bool
 		staleOAuthScope                 bool
+		eventType                       string
 	}{
-		{"later_error_corrected_create", true, false, false, false},
-		{"initial_error_remains_terminal", true, true, false, false},
-		{"disabled_error_remains_terminal", false, false, false, false},
-		{"later_error_then_upstream_close", true, false, true, false},
-		{"stale_oauth_scope_does_not_disable_shared_api_key_steering", true, false, false, true},
+		{"later_error_corrected_create", true, false, false, false, "error"},
+		{"initial_error_remains_terminal", true, true, false, false, "error"},
+		{"disabled_error_remains_terminal", false, false, false, false, "error"},
+		{"later_error_then_upstream_close", true, false, true, false, "error"},
+		{"stale_oauth_scope_preserves_shared_api_key_steering", true, false, false, true, "error"},
+		{"later_failed_corrected_create", true, false, false, false, "response.failed"},
+		{"stale_oauth_scope_preserves_shared_api_key_failed_recovery", true, false, false, true, "response.failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var connections, frames atomic.Int32
@@ -42,6 +45,9 @@ func TestResponsesSteeringErrorRecoveryIntegration(t *testing.T) {
 			rejection := []byte(`{"type":"error","status":400,"event_id":"rejected-create","error":{"type":"invalid_request_error","message":"Correct the request"}}`)
 			effectiveSteering := tc.enabled
 			recoverable := effectiveSteering && !tc.initial && !tc.upstreamClose
+			if tc.eventType == "response.failed" {
+				rejection = []byte(`{"type":"response.failed","response":{"id":"rejected-create","error":{"type":"invalid_request_error","message":"Correct the request"}}}`)
+			}
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer close(done)
 				connections.Add(1)
@@ -141,7 +147,7 @@ func TestResponsesSteeringErrorRecoveryIntegration(t *testing.T) {
 						completed = gjson.GetBytes(p, "response.output.0.content.0.text").String() == "RECOVERED"
 						_ = c.Close()
 					}
-				case "error":
+				case "error", "response.failed":
 					errorsSeen++
 					if effectiveSteering && !tc.initial && !bytes.Equal(p, rejection) {
 						t.Errorf("recoverable error payload changed: %s", p)
@@ -175,43 +181,64 @@ func TestResponsesSteeringErrorRecoveryIntegration(t *testing.T) {
 	}
 }
 
-func TestResponsesWebsocketClosesOnIdleCodexDisconnect(t *testing.T) {
+func TestResponsesWebsocketIdleCodexDisconnect(t *testing.T) {
 	for _, tc := range []struct {
-		name, yaml string
-		oauth      bool
+		name, yaml    string
+		oauth, duplex bool
 	}{
-		{"legacy_disabled_api_key", "codex: {response-steering: false}\n", false},
-		{"legacy_enabled_api_key", "codex: {response-steering: true}\n", false},
-		{"v8_enabled_api_key", "oauth: {providers: {codex: {response-steering: true}}}\n", false},
-		{"v8_enabled_oauth", "oauth: {providers: {codex: {response-steering: true}}}\n", true},
-		{"upstream_enabled_api_key", "upstream: {codex: {response-steering: true}}\n", false},
-		{"upstream_enabled_oauth", "upstream: {codex: {response-steering: true}}\n", true},
+		{"legacy_disabled_api_key", "codex: {response-steering: false}\n", false, false},
+		{"legacy_enabled_api_key", "codex: {response-steering: true}\n", false, true},
+		{"v8_enabled_api_key", "oauth: {providers: {codex: {response-steering: true}}}\n", false, true},
+		{"v8_disabled_oauth", "oauth: {providers: {codex: {response-steering: false}}}\n", true, false},
+		{"v8_enabled_oauth", "oauth: {providers: {codex: {response-steering: true}}}\n", true, true},
+		{"upstream_enabled_api_key", "upstream: {codex: {response-steering: true}}\n", false, true},
+		{"upstream_enabled_oauth", "upstream: {codex: {response-steering: true}}\n", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			closeUpstream := make(chan struct{})
+			upstreamClosed := make(chan struct{})
+			var connections atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 				if err != nil {
 					t.Error(err)
 					return
 				}
+				connection := connections.Add(1)
 				defer func() {
 					if errClose := conn.Close(); errClose != nil {
 						t.Errorf("close upstream: %v", errClose)
 					}
+					if connection == 1 {
+						close(upstreamClosed)
+					}
 				}()
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				_, body, errRead := conn.ReadMessage()
+				if errRead != nil {
 					t.Errorf("read initial request: %v", errRead)
 					return
 				}
+				responseID := "first"
+				if connection > 1 {
+					responseID = "recovered"
+					if gjson.GetBytes(body, "previous_response_id").Exists() ||
+						gjson.GetBytes(body, "input.#").Int() != 2 ||
+						gjson.GetBytes(body, "input.0.content.0.text").String() != "first" ||
+						gjson.GetBytes(body, "input.1.content.0.text").String() != "next" {
+						t.Errorf("recreated upstream requires the full transcript: %s", body)
+					}
+				}
 				for _, payload := range []string{
-					`{"type":"response.created","response":{"id":"first","output":[]}}`,
-					`{"type":"response.completed","response":{"id":"first","output":[]}}`,
+					fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"output":[]}}`, responseID),
+					fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"output":[]}}`, responseID),
 				} {
 					if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(payload)); errWrite != nil {
 						t.Errorf("write response: %v", errWrite)
 						return
 					}
+				}
+				if connection > 1 {
+					return
 				}
 				// Close only after the client receives the completed response.
 				select {
@@ -266,7 +293,7 @@ func TestResponsesWebsocketClosesOnIdleCodexDisconnect(t *testing.T) {
 			if err = conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 				t.Fatal(err)
 			}
-			request := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model)
+			request := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"role":"user","content":[{"type":"input_text","text":"first"}]}]}`, model)
 			if err = conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 				t.Fatal(err)
 			}
@@ -280,6 +307,27 @@ func TestResponsesWebsocketClosesOnIdleCodexDisconnect(t *testing.T) {
 				}
 			}
 			close(closeUpstream)
+			<-upstreamClosed
+			if !tc.duplex {
+				// Ordinary sessions recover on the same downstream socket; the new
+				// upstream must receive a full replay with the old parent removed.
+				next := fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"first","input":[{"role":"user","content":[{"type":"input_text","text":"next"}]}]}`, model)
+				if err = conn.WriteMessage(websocket.TextMessage, []byte(next)); err != nil {
+					t.Fatal(err)
+				}
+				for {
+					_, payload, errRead := conn.ReadMessage()
+					if errRead != nil {
+						t.Fatalf("read recovered response: %v", errRead)
+					}
+					if gjson.GetBytes(payload, "type").String() == "response.completed" {
+						if gjson.GetBytes(payload, "response.id").String() != "recovered" || connections.Load() != 2 {
+							t.Fatalf("recovery response=%s connections=%d", payload, connections.Load())
+						}
+						return
+					}
+				}
+			}
 			_, _, err = conn.ReadMessage()
 			var closeErr *websocket.CloseError
 			if !errors.As(err, &closeErr) {

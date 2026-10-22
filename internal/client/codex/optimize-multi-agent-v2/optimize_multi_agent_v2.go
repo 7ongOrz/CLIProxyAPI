@@ -151,7 +151,35 @@ func OptimizeCodexMultiAgentV2Request(ctx context.Context, headers http.Header, 
 	if len(toolPaths) == 0 || hasCodexOptimizedCollaborationConflict(updated) {
 		return updated, false
 	}
-	return optimizeCodexCollaborationNamespace(updated, toolPaths)
+	updated, optimized := optimizeCodexCollaborationNamespace(updated, toolPaths)
+	if !optimized {
+		return updated, false
+	}
+	return optimizeCodexCollaborationHistory(updated), true
+}
+
+func optimizeCodexCollaborationHistory(payload []byte) []byte {
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return payload
+	}
+
+	updated := payload
+	for index, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType != "function_call" && itemType != "custom_tool_call" {
+			continue
+		}
+		itemPath := fmt.Sprintf("input.%d", index)
+		if strings.TrimSpace(item.Get("namespace").String()) == codexCollaborationNamespace {
+			updated, _ = sjson.SetBytes(updated, itemPath+".namespace", codexOptimizedCollaborationNamespace)
+		}
+		name := strings.TrimSpace(item.Get("name").String())
+		if strings.HasPrefix(name, codexCollaborationNamespace+"__") {
+			updated, _ = sjson.SetBytes(updated, itemPath+".name", codexOptimizedCollaborationNamePrefix+strings.TrimPrefix(name, codexCollaborationNamespace+"__"))
+		}
+	}
+	return updated
 }
 
 func codexMultiAgentV2Enabled(ctx context.Context, headers http.Header, cfg *config.Config) bool {
@@ -332,16 +360,6 @@ func codexSpawnAgentModelsAndMarkdownForRequest(ctx context.Context, headers htt
 	return models, formatted
 }
 
-func codexSpawnAgentModelsForRequest(ctx context.Context, headers http.Header, homeEnabled bool) []codexSpawnAgentModel {
-	models, _ := codexSpawnAgentModelsAndMarkdownForRequest(ctx, headers, homeEnabled)
-	return models
-}
-
-func formatCodexSpawnAgentModelsForRequest(ctx context.Context, headers http.Header, homeEnabled bool) string {
-	_, formatted := codexSpawnAgentModelsAndMarkdownForRequest(ctx, headers, homeEnabled)
-	return formatted
-}
-
 func codexHomeAvailableModels(ctx context.Context, headers http.Header) []map[string]any {
 	client := home.Current()
 	if client == nil {
@@ -401,31 +419,6 @@ func decodeCodexHomeAvailableModels(raw []byte) []map[string]any {
 		return mapString(models[i], "id") < mapString(models[j], "id")
 	})
 	return models
-}
-
-func codexSpawnAgentModelsFromSources(availableModels []map[string]any, catalogJSON []byte, lookupModel func(string) *registry.ModelInfo) []codexSpawnAgentModel {
-	var catalog codexClientModelsCatalog
-	if err := json.Unmarshal(catalogJSON, &catalog); err != nil || len(catalog.Models) == 0 {
-		return nil
-	}
-
-	templates := make(map[string]map[string]any, len(catalog.Models))
-	var defaultTemplate map[string]any
-	for _, model := range catalog.Models {
-		modelID := mapString(model, "slug")
-		if modelID == "" {
-			continue
-		}
-		templates[modelID] = model
-		if defaultTemplate == nil || modelID == "gpt-5.5" {
-			defaultTemplate = model
-		}
-	}
-	if defaultTemplate == nil {
-		return nil
-	}
-
-	return codexSpawnAgentModelsFromTemplates(availableModels, templates, defaultTemplate, lookupModel)
 }
 
 func codexSpawnAgentModelsFromTemplates(availableModels []map[string]any, templates map[string]map[string]any, defaultTemplate map[string]any, lookupModel func(string) *registry.ModelInfo) []codexSpawnAgentModel {
@@ -610,14 +603,6 @@ func mapInt(values map[string]any, key string) int {
 	}
 }
 
-func rewriteCodexSpawnAgentDescription(payload []byte, models []codexSpawnAgentModel) []byte {
-	return rewriteCodexSpawnAgentTools(payload, codexSpawnAgentToolPaths(payload), models)
-}
-
-func rewriteCodexSpawnAgentTools(payload []byte, toolPaths []string, models []codexSpawnAgentModel) []byte {
-	return rewriteCodexCollaborationTools(payload, toolPaths, toolPaths, models, "")
-}
-
 func rewriteCodexCollaborationTools(payload []byte, messageToolPaths, spawnAgentToolPaths []string, models []codexSpawnAgentModel, modelList string) []byte {
 	if len(messageToolPaths) == 0 && len(spawnAgentToolPaths) == 0 {
 		return payload
@@ -712,7 +697,53 @@ func optimizeCodexCollaborationNamespace(payload []byte, toolPaths []string) ([]
 		}
 		optimized = true
 	}
+	if optimized {
+		var errMetadata error
+		updated, errMetadata = optimizeCodexCollaborationToolMetadata(updated)
+		if errMetadata != nil {
+			return payload, false
+		}
+	}
 	return updated, optimized
+}
+
+func optimizeCodexCollaborationToolMetadata(payload []byte) ([]byte, error) {
+	turnMetadataResult := gjson.GetBytes(payload, "client_metadata.x-codex-turn-metadata")
+	if turnMetadataResult.Type != gjson.String {
+		return payload, nil
+	}
+	turnMetadata := turnMetadataResult.String()
+	namespacePath := "tool_namespaces_info." + codexCollaborationNamespace
+	namespace := gjson.Get(turnMetadata, namespacePath)
+	if !namespace.IsObject() {
+		return payload, nil
+	}
+
+	updatedNamespace, errSet := sjson.Set(namespace.Raw, "name", codexOptimizedCollaborationNamespace)
+	if errSet != nil {
+		return payload, errSet
+	}
+	for functionName, function := range namespace.Get("functions").Map() {
+		codeModeName := strings.TrimSpace(function.Get("code_mode_name").String())
+		if !strings.HasPrefix(codeModeName, codexCollaborationNamespace+"__") {
+			continue
+		}
+		codeModePath := "functions." + functionName + ".code_mode_name"
+		updatedNamespace, errSet = sjson.Set(updatedNamespace, codeModePath, codexOptimizedCollaborationNamePrefix+strings.TrimPrefix(codeModeName, codexCollaborationNamespace+"__"))
+		if errSet != nil {
+			return payload, errSet
+		}
+	}
+
+	updatedMetadata, errDelete := sjson.Delete(turnMetadata, namespacePath)
+	if errDelete != nil {
+		return payload, errDelete
+	}
+	updatedMetadata, errSet = sjson.SetRaw(updatedMetadata, "tool_namespaces_info."+codexOptimizedCollaborationNamespace, updatedNamespace)
+	if errSet != nil {
+		return payload, errSet
+	}
+	return sjson.SetBytes(payload, "client_metadata.x-codex-turn-metadata", updatedMetadata)
 }
 
 // RestoreCodexMultiAgentV2Response restores optimized collaboration namespace

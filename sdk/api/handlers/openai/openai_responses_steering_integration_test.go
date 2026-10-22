@@ -136,14 +136,15 @@ func TestResponsesSteeringFullDuplexIntegration(t *testing.T) {
 			for {
 				_, b, err := c.ReadMessage()
 				if err != nil {
+					// The fork closes transport failures so the client reconnects with its transcript.
+					if strings.HasPrefix(scenario, "disconnect_") && websocket.IsCloseError(err, websocket.CloseAbnormalClosure) {
+						break
+					}
 					t.Fatalf("downstream read before expected terminal event: %v", err)
 				}
 				kind := gjson.GetBytes(b, "type").String()
 				if kind == "error" {
-					if !strings.HasPrefix(scenario, "disconnect_") || gjson.GetBytes(b, "error.code").String() != "upstream_websocket_lost" {
-						t.Fatalf("unexpected downstream error: %s", b)
-					}
-					break
+					t.Fatalf("unexpected downstream error: %s", b)
 				}
 				if kind == "response.created" && gjson.GetBytes(b, "response.id").String() == "r1" {
 					send(control1)
@@ -184,7 +185,7 @@ func TestResponsesSteeringFullDuplexIntegration(t *testing.T) {
 			if connections.Load() != 1 {
 				t.Fatalf("unexpected reconnect/replay: %d", connections.Load())
 			}
-			// An upstream disconnect can leave the downstream ready for another turn.
+			// End successful scenarios too, then verify connection-scoped logging cleanup.
 			_ = c.Close()
 			select {
 			case n := <-deferredCount:

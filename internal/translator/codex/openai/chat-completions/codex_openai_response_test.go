@@ -95,16 +95,16 @@ func TestConvertCodexResponseToOpenAI_PreservesURLCitations(t *testing.T) {
 		if got := annotation.Get("type").String(); got != "url_citation" {
 			t.Fatalf("annotation type = %q, want url_citation; response=%s", got, out)
 		}
-		if got := annotation.Get("url").String(); got != "https://example.com" {
+		if got := annotation.Get("url_citation.url").String(); got != "https://example.com" {
 			t.Fatalf("annotation url = %q, want https://example.com; response=%s", got, out)
 		}
-		if got := annotation.Get("title").String(); got != "Example" {
+		if got := annotation.Get("url_citation.title").String(); got != "Example" {
 			t.Fatalf("annotation title = %q, want Example; response=%s", got, out)
 		}
-		if got := annotation.Get("start_index").Int(); got != 2 {
+		if got := annotation.Get("url_citation.start_index").Int(); got != 2 {
 			t.Fatalf("annotation start_index = %d, want 2; response=%s", got, out)
 		}
-		if got := annotation.Get("end_index").Int(); got != 4 {
+		if got := annotation.Get("url_citation.end_index").Int(); got != 4 {
 			t.Fatalf("annotation end_index = %d, want 4; response=%s", got, out)
 		}
 	})
@@ -127,11 +127,11 @@ func TestConvertCodexResponseToOpenAI_PreservesURLCitations(t *testing.T) {
 		if got := annotation.Get("type").String(); got != "url_citation" {
 			t.Fatalf("annotation type = %q, want url_citation; chunk=%s", got, out[0])
 		}
-		if got := annotation.Get("start_index").Int(); got != 2 {
-			t.Fatalf("annotation start_index = %d, want 2; chunk=%s", got, out[0])
+		if got := annotation.Get("url_citation.start_index").Int(); got != 0 {
+			t.Fatalf("annotation start_index = %d, want 0; chunk=%s", got, out[0])
 		}
-		if got := annotation.Get("end_index").Int(); got != 3 {
-			t.Fatalf("annotation end_index = %d, want 3; chunk=%s", got, out[0])
+		if got := annotation.Get("url_citation.end_index").Int(); got != 1 {
+			t.Fatalf("annotation end_index = %d, want 1; chunk=%s", got, out[0])
 		}
 
 		if out = ConvertCodexResponseToOpenAI(t.Context(), "gpt-5.5", nil, nil, []byte(`data: {"type":"response.output_text.delta","delta":"引用"}`), &param); len(out) != 1 {
@@ -157,20 +157,20 @@ func TestConvertCodexResponseToOpenAI_PreservesURLCitations(t *testing.T) {
 			t.Fatalf("expected citation completion chunk, got %d", len(out))
 		}
 		annotation := gjson.GetBytes(out[0], "choices.0.delta.annotations.0")
-		if got := annotation.Get("start_index").Int(); got != 4 {
-			t.Fatalf("annotation start_index = %d, want 4; chunk=%s", got, out[0])
+		if got := annotation.Get("url_citation.start_index").Int(); got != 0 {
+			t.Fatalf("annotation start_index = %d, want 0; chunk=%s", got, out[0])
 		}
-		if got := annotation.Get("end_index").Int(); got != 6 {
-			t.Fatalf("annotation end_index = %d, want 6; chunk=%s", got, out[0])
+		if got := annotation.Get("url_citation.end_index").Int(); got != 2 {
+			t.Fatalf("annotation end_index = %d, want 2; chunk=%s", got, out[0])
 		}
 
 		contentPartDoneEvent := []byte(`data: {"type":"response.content_part.done","part":{"type":"output_text","text":"前🙂引用","annotations":[{"type":"url_citation","url":"https://other.example","title":"Other","start_index":0,"end_index":1}]}}`)
 		out = ConvertCodexResponseToOpenAI(t.Context(), "gpt-5.5", nil, nil, contentPartDoneEvent, &param)
-		if len(out) != 1 || gjson.GetBytes(out[0], "choices.0.delta.annotations.0.url").String() != "https://other.example" {
+		if len(out) != 1 || gjson.GetBytes(out[0], "choices.0.delta.annotations.0.url_citation.url").String() != "https://other.example" {
 			t.Fatalf("expected content-part citation chunk, got %d: %s", len(out), out)
 		}
-		if got := gjson.GetBytes(out[0], "choices.0.delta.annotations.0.start_index").Int(); got != 4 {
-			t.Fatalf("content-part annotation start_index = %d, want 4; chunk=%s", got, out[0])
+		if got := gjson.GetBytes(out[0], "choices.0.delta.annotations.0.url_citation.start_index").Int(); got != 0 {
+			t.Fatalf("content-part annotation start_index = %d, want 0; chunk=%s", got, out[0])
 		}
 
 		itemDoneEvent := []byte(`data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"前🙂引用","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":2}]}]}}`)

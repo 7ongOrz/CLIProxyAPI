@@ -241,6 +241,11 @@ func TestCodexExecutor_CompressionRejectedFallback(t *testing.T) {
 				var encodings []string
 				var firstPlain []byte
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					for name, want := range map[string]string{"Session-Id": "compression-session", "Thread-Id": "compression-thread"} {
+						if got := r.Header.Get(name); got != want {
+							t.Errorf("%s = %q, want %q", name, got, want)
+						}
+					}
 					encoding := r.Header.Get("Content-Encoding")
 					encodings = append(encodings, encoding)
 					wire, errRead := io.ReadAll(r.Body)
@@ -293,7 +298,11 @@ func TestCodexExecutor_CompressionRejectedFallback(t *testing.T) {
 				})
 				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", transport)
 				cfg := codexCompressionConfig()
-				cfg.Payload.Override = []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "*"}}, Params: map[string]any{"audit.-1": "once"}}}
+				cfg.Payload.Override = []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "*"}}, Params: map[string]any{
+					"audit.-1":                   "once",
+					"client_metadata.session_id": "compression-session",
+					"client_metadata.thread_id":  "compression-thread",
+				}}}
 				executor := NewCodexExecutor(cfg)
 				req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: codexCompressionPayload()}
 				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}

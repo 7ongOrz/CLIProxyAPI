@@ -1159,17 +1159,18 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 }
 
-// isCodexResponsesClientRequest limits the alternate terminal event to official Codex clients.
+// isCodexResponsesClientRequest identifies clients that support Codex Responses extensions.
 func isCodexResponsesClientRequest(c *gin.Context) bool {
 	if c == nil || c.Request == nil {
 		return false
 	}
-	if multiagentv2.IsCodexClientUserAgent(c.GetHeader("User-Agent")) {
+	userAgent := strings.TrimSpace(c.GetHeader("User-Agent"))
+	if multiagentv2.IsCodexClientUserAgent(userAgent) || strings.HasPrefix(userAgent, "codex_vscode/") {
 		return true
 	}
 
 	switch originator := strings.ToLower(strings.TrimSpace(c.GetHeader("Originator"))); originator {
-	case "codex desktop", "codex-tui", "codex_cli_rs":
+	case "codex desktop", "codex-tui", "codex_cli_rs", "codex_vscode":
 		return true
 	default:
 		return strings.HasPrefix(originator, "codex desktop/") || strings.HasPrefix(originator, "codex-tui/") || strings.HasPrefix(originator, "codex_cli_rs/")

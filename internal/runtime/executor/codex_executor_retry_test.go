@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func TestCodexQuotaErrorCredentialScope(t *testing.T) {
@@ -36,7 +39,7 @@ func TestCodexQuotaErrorCredentialScope(t *testing.T) {
 			case "http":
 				err = newCodexStatusErr(http.StatusTooManyRequests, []byte(test.body))
 			case "terminal":
-				terminalErr, _, ok := codexTerminalStreamErr([]byte(test.body))
+				terminalErr, _, ok := codexTerminalFailureErr([]byte(test.body))
 				if !ok {
 					t.Fatal("terminal error was not recognized")
 				}
@@ -86,7 +89,7 @@ func TestCodexQuotaErrorModelLevelCooling(t *testing.T) {
 			case "http":
 				err = newCodexStatusErrWithCooling(http.StatusTooManyRequests, []byte(test.body), true)
 			case "terminal":
-				terminalErr, _, ok := codexTerminalStreamErrWithCooling([]byte(test.body), true)
+				terminalErr, _, ok := codexTerminalFailureErrWithCooling([]byte(test.body), true)
 				if !ok {
 					t.Fatal("terminal error was not recognized")
 				}
@@ -107,6 +110,39 @@ func TestCodexQuotaErrorModelLevelCooling(t *testing.T) {
 				if !errors.As(err, &retry) || retry.RetryAfter() == nil || *retry.RetryAfter() != time.Hour {
 					t.Errorf("model-level quota error must still preserve its retry reset: %v", err)
 				}
+			}
+		})
+	}
+}
+
+func TestCodexTerminalQuotaCoolingScope(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","resets_in_seconds":3600}}}`)
+	for _, modelLevelCooling := range []bool{false, true} {
+		t.Run(strconv.FormatBool(modelLevelCooling), func(t *testing.T) {
+			for _, parse := range []struct {
+				name string
+				fn   func([]byte, bool) (statusErr, bool)
+			}{
+				{"response", parseCodexResponseFailed},
+				{"image", parseCodexOpenAIImageTerminalError},
+				{"terminal", func(payload []byte, cooling bool) (statusErr, bool) {
+					err, _, ok := codexTerminalFailureErrWithCooling(payload, cooling)
+					return err, ok
+				}},
+			} {
+				t.Run(parse.name, func(t *testing.T) {
+					err, ok := parse.fn(payload, modelLevelCooling)
+					if !ok || err.StatusCode() != http.StatusTooManyRequests {
+						t.Fatalf("quota result = %v, recognized = %t; want 429", err, ok)
+					}
+					wantCredentialScope := !modelLevelCooling
+					if err.IsCredentialScoped() != wantCredentialScope {
+						t.Fatalf("credential scope = %t, want %t", err.IsCredentialScoped(), wantCredentialScope)
+					}
+					if retry := err.RetryAfter(); retry == nil || *retry != time.Hour {
+						t.Fatalf("retry delay = %v, want one hour", retry)
+					}
+				})
 			}
 		})
 	}
@@ -303,6 +339,14 @@ func TestNewCodexStatusErrClassifiesKnownCodexFailures(t *testing.T) {
 			wantCode:   "previous_response_not_found",
 		},
 		{
+			name:       "previous response legacy message",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"message":"No response found for previous_response_id resp_123"}}`),
+			wantStatus: http.StatusBadRequest,
+			wantType:   "invalid_request_error",
+			wantCode:   "previous_response_not_found",
+		},
+		{
 			name:       "auth unavailable",
 			statusCode: http.StatusUnauthorized,
 			body:       []byte(`{"error":{"message":"invalid or expired token","type":"authentication_error","code":"invalid_api_key"}}`),
@@ -320,6 +364,31 @@ func TestNewCodexStatusErrClassifiesKnownCodexFailures(t *testing.T) {
 				t.Fatalf("status code = %d, want %d", got, tc.wantStatus)
 			}
 			assertCodexErrorCode(t, err.Error(), tc.wantType, tc.wantCode)
+		})
+	}
+}
+
+func TestNewCodexStatusErrPreservesExplicitPreviousResponseClassification(t *testing.T) {
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	for _, message := range []string{
+		"input mentioned previous_response_not_found",
+		"previous_response_id field not found in input",
+		"No response found for previous_response_id resp_123",
+	} {
+		t.Run(message, func(t *testing.T) {
+			body, errMarshal := json.Marshal(map[string]any{
+				"error": map[string]string{"code": "invalid_prompt", "message": message},
+			})
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			err := newCodexStatusErr(http.StatusBadRequest, body)
+			if got := err.Error(); got != string(body) {
+				t.Fatalf("error body = %s, want %s", got, body)
+			}
+			if _, replay := codexDownstreamWebsocketReplayError(ctx, []byte(err.Error()), err); replay {
+				t.Fatal("invalid_prompt must remain a request error")
+			}
 		})
 	}
 }

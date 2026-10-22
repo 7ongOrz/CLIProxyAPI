@@ -103,19 +103,6 @@ func (m *Manager) localExecutionAllowed() bool {
 	return m != nil && !m.HomeEnabled()
 }
 
-func (m *Manager) localFallbackAuth(authID string) *Auth {
-	if !m.localExecutionAllowed() {
-		return nil
-	}
-	m.mu.RLock()
-	auth := m.auths[strings.TrimSpace(authID)]
-	m.mu.RUnlock()
-	if auth == nil {
-		return nil
-	}
-	return auth.Clone()
-}
-
 type homeErrorEnvelope struct {
 	Error *homeErrorDetail `json:"error"`
 }
@@ -687,10 +674,6 @@ func (m *Manager) retainHomeWebsocketSelection(ctx context.Context, opts cliprox
 		return false
 	}
 	_ = m.endMismatchedHomeSessionSelections(ctx, sessionID, credentialID, routeModel, false)
-	m.rememberHomeRuntimeAuth(sessionID, selectionAuth)
-	if !selection.Active() {
-		return false
-	}
 	key := homeSessionSelectionKey{credentialID: credentialID, routeModel: routeModel}
 	m.mu.Lock()
 	if m.homeSessionSelections == nil {
@@ -704,6 +687,7 @@ func (m *Manager) retainHomeWebsocketSelection(ctx context.Context, opts cliprox
 	previous := selections[key]
 	selections[key] = selection
 	m.mu.Unlock()
+	m.rememberHomeRuntimeAuth(sessionID, selectionAuth)
 	if previous != nil && previous != selection {
 		previous.End("target_replaced")
 	}
@@ -793,9 +777,7 @@ func (m *Manager) bindHomeSelectionRuntimeAuth(ctx context.Context, opts cliprox
 	}
 	m.rememberHomeSelectionRuntimeAuth(sessionID, selection)
 	if errBind := selection.Bind(func() error {
-		if !selection.retained.Load() {
-			m.forgetHomeRuntimeAuth(sessionID, authID, selection)
-		}
+		m.forgetHomeRuntimeAuth(sessionID, authID, selection)
 		return nil
 	}); errBind != nil {
 		selection.runtimeAuthBound.Store(false)
@@ -833,28 +815,6 @@ func (m *Manager) rememberHomeSelectionRuntimeAuth(sessionID string, selection *
 	}
 	m.homeRuntimeAuths[sessionID][authID] = selectionAuth
 	m.homeRuntimeAuthOwners[sessionID][authID] = selection
-	m.mu.Unlock()
-}
-
-func (m *Manager) replaceHomeSelectionAuth(selection *HomeDispatchSelection, auth *Auth) {
-	if m == nil || selection == nil || auth == nil {
-		return
-	}
-	m.mu.Lock()
-	selection.ReplaceAuth(auth)
-	updated := selection.CloneAuth()
-	if updated == nil {
-		m.mu.Unlock()
-		return
-	}
-	for sessionID, owners := range m.homeRuntimeAuthOwners {
-		for authID, owner := range owners {
-			if owner != selection || m.homeRuntimeAuths[sessionID] == nil {
-				continue
-			}
-			m.homeRuntimeAuths[sessionID][authID] = updated.Clone()
-		}
-	}
 	m.mu.Unlock()
 }
 
@@ -902,34 +862,6 @@ func (m *Manager) rememberHomeRuntimeAuth(sessionID string, auth *Auth) {
 	}
 	sessionAuths[authID] = auth.Clone()
 	m.mu.Unlock()
-}
-
-func (m *Manager) homeRuntimeAuthByID(sessionID string, authID string) (*Auth, ProviderExecutor, string, bool) {
-	sessionID = strings.TrimSpace(sessionID)
-	authID = strings.TrimSpace(authID)
-	if m == nil || sessionID == "" || authID == "" {
-		return nil, nil, "", false
-	}
-	m.mu.RLock()
-	sessionAuths := m.homeRuntimeAuths[sessionID]
-	auth := sessionAuths[authID]
-	m.mu.RUnlock()
-	if auth == nil || !authWebsocketsEnabled(auth) {
-		return nil, nil, "", false
-	}
-	logicalProvider := strings.ToLower(strings.TrimSpace(auth.Provider))
-	executorKey := executorKeyFromAuth(auth)
-	if logicalProvider == "" || executorKey == "" {
-		return nil, nil, "", false
-	}
-	executor, ok := m.Executor(executorKey)
-	if !ok && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["base_url"]) != "" {
-		executor, ok = m.Executor("openai-compatibility")
-	}
-	if !ok {
-		return nil, nil, "", false
-	}
-	return auth.Clone(), executor, logicalProvider, true
 }
 
 func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
@@ -981,15 +913,7 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 	if retainedOK {
 		return retained, nil
 	}
-	if errLoss := cliproxyexecutor.WebsocketInputLossError(ctx); errLoss != nil {
-		return nil, errLoss
-	}
 	if sessionID := homeExecutionSessionIDFromMetadata(opts.Metadata); sessionID != "" {
-		if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && pinnedAuthID != "" {
-			if _, ok := m.GetExecutionSessionAuthByID(sessionID, pinnedAuthID); ok {
-				return nil, &cliproxyexecutor.UpstreamWebsocketTurnError{FullContextRequired: true}
-			}
-		}
 		if pinnedAuthID != "" {
 			if errEnd := m.endMismatchedHomeSessionSelections(ctx, sessionID, pinnedAuthID, requestedModel, true); errEnd != nil {
 				return nil, errEnd
@@ -1506,7 +1430,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 			continue
 		}
 		creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
-		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
+		result, errStream := m.executeStreamWithModelPool(creditsCtx, creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
 		if errStream != nil {
 			continue
 		}
